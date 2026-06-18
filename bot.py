@@ -679,11 +679,23 @@ LAG_REPORT_SECS    = int(os.environ.get("LAG_REPORT_SECS", "3600"))    # hourly 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/stream?streams=" + "/".join(
     f"{s}@trade" for s in ["btcusdt", "ethusdt", "solusdt", "dogeusdt", "bnbusdt", "xrpusdt"]
 )
-# NOTE: HYPE is intentionally absent - it is not listed on Binance spot, so there is
-# no Binance trade stream for it. HYPE still settles on Chainlink HYPE/USD, so it
-# trades fine on the Chainlink feed; it just has no Binance lag/cancel signal.
+# HYPE is handled separately via Binance FUTURES below (not on spot).
 BINANCE_SYMBOL_TO_ASSET = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL",
                            "DOGEUSDT": "DOGE", "BNBUSDT": "BNB", "XRPUSDT": "XRP"}
+
+# HYPE is not on Binance SPOT, but it IS on Binance USD-M FUTURES (HYPEUSDT perp).
+# Futures use a different host (fstream) so they need a separate connection. The
+# @trade payload shape is identical to spot, so it feeds the same _lag_ticks.
+# Caveat: futures price can carry a small funding/basis vs Chainlink HYPE/USD, so
+# HYPE's reversal signal is slightly noisier than the spot-based assets - still
+# far better than no protection.
+# Endpoint note: Binance decommissioned the legacy futures WS URLs
+# (fstream.binance.com/stream and /ws) on 2026-04-23. Post-migration, public
+# market streams like @trade must use the /public routed path.
+BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/public/stream?streams=" + "/".join(
+    f"{s}@trade" for s in ["hypeusdt"]
+)
+BINANCE_FUTURES_SYMBOL_TO_ASSET = {"HYPEUSDT": "HYPE"}
 
 prices_binance      = {}
 binance_last_update = {}
@@ -782,6 +794,43 @@ def binance_ws_worker():
         time.sleep(3)
 
 
+def binance_futures_ws_worker():
+    """Persistent Binance USD-M FUTURES stream for HYPE (not on spot). Feeds the
+    same _lag_ticks / binance_last_update as the spot worker, so HYPE gets the
+    same reversal-cancel protection as every other asset."""
+    while True:
+        ws = None
+        try:
+            ws = websocket.create_connection(BINANCE_FUTURES_WS_URL, timeout=10)
+            ws.settimeout(30)
+            log.info("[Binance Futures WS] Connected (HYPE)")
+            while True:
+                msg = ws.recv()
+                if not msg:
+                    continue
+                data = json.loads(msg)
+                d = data.get("data", {})
+                asset = BINANCE_FUTURES_SYMBOL_TO_ASSET.get(d.get("s", ""))
+                if not asset:
+                    continue
+                price = float(d.get("p", 0))
+                if price <= 0:
+                    continue
+                now = time.time()
+                prices_binance[asset] = price
+                binance_last_update[asset] = now
+                _lag_on_tick(asset, now, price)
+        except Exception as e:
+            log.warning(f"[Binance Futures WS] error: {e} - reconnecting in 3s")
+        finally:
+            try:
+                if ws:
+                    ws.close()
+            except:
+                pass
+        time.sleep(3)
+
+
 def lag_report_worker():
     """Hourly per-market lag summary to Telegram."""
     import statistics
@@ -832,6 +881,7 @@ def start_binance_feed():
         log.warning("[Binance WS] websocket-client missing - feed disabled")
         return False
     threading.Thread(target=binance_ws_worker, daemon=True).start()
+    threading.Thread(target=binance_futures_ws_worker, daemon=True).start()
     _binance_thread_started = True
     return True
 
@@ -878,10 +928,10 @@ _min_size_warned = False
 resting_lock = threading.Lock()
 
 
-# Assets that have NO Binance spot feed. For these, the Binance-based protections
-# (freshness gate, reversal cancel) can't apply - there's no stream. They still
-# trade on Chainlink; they just rely on the window-close cancel, not Binance.
-NO_BINANCE_ASSETS = {"HYPE"}
+# Assets that have NO Binance feed at all (neither spot nor futures). For these,
+# the Binance-based protections can't apply. Currently empty: HYPE is covered by
+# the Binance USD-M futures stream (HYPEUSDT perp), so it gets full protection.
+NO_BINANCE_ASSETS = set()
 
 
 def binance_fresh(asset):
