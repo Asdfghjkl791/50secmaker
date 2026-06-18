@@ -1538,7 +1538,7 @@ def process_tick():
             if w["traded"] or w["skipped"]:
                 continue
 
-            # Per-asset-per-tf entry window (ETH/BNB/SOL 5m are tighter)
+            # Per-asset-per-tf entry window (ETH/BNB/SOL/HYPE 5m can be tuned)
             entry_window = CONFIG["entry_window_seconds"]
             if tf == 5:
                 if asset == "ETH":
@@ -1547,6 +1547,9 @@ def process_tick():
                     entry_window = int(os.environ.get("ENTRY_SECS_BNB_5", "40"))
                 elif asset == "SOL":
                     entry_window = int(os.environ.get("ENTRY_SECS_SOL_5", "40"))
+                elif asset == "HYPE":
+                    # Defaults to the global ENTRY_SECS if ENTRY_SECS_HYPE_5 unset.
+                    entry_window = int(os.environ.get("ENTRY_SECS_HYPE_5", str(CONFIG["entry_window_seconds"])))
 
             if secs_left <= 0 or secs_left > entry_window:
                 continue
