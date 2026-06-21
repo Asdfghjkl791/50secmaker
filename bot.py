@@ -477,8 +477,7 @@ def init_clob():
         log.info(f"Connected. Balance: ${state['balance_usd']:.2f}")
         return True
     except Exception as e:
-        log.warning(f"[MAKER] ask check failed ({e}) - skipping (won't place blind)")
-        return {"status": "skipped", "error": f"ask check failed ({e}) - won't place blind"}
+        log.error(f"CLOB init failed: {e}")
         tg(f"❌ <b>Polymarket connection failed</b>\n<code>{str(e)[:200]}</code>")
         return False
 
