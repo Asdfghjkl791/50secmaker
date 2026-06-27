@@ -943,45 +943,37 @@ MAKER_BAILOUT_CENTS      = float(os.environ.get("MAKER_BAILOUT_CENTS", "96.0"))
 #
 # Each row: (max_secs_left, min_abs_move_pct), ascending max_secs.
 PER_ASSET_FRONTIER = {
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "HYPE": [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
+    "BTC":  [(20, 0.025), (40, 0.04), (70, 0.08), (120, 0.15)],
+    "ETH":  [(20, 0.03), (40, 0.07), (70, 0.11), (120, 0.16)],
+    "XRP":  [(20, 0.04), (40, 0.10), (70, 0.15), (120, 0.23)],
+    "DOGE": [(20, 0.05), (40, 0.10), (70, 0.15), (120, 0.22)],
+    "BNB":  [(20, 0.04), (40, 0.10), (70, 0.17), (120, 0.20)],
+    "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
+    "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
 }
 
-# ── VARIANT: PER-ASSET 15m frontier — MEASURED from the probe /grid ──────────
-# Now measured (replaces the old scaling GUESS). A 15m window has far more
-# elapsed time, so at long time-left a smaller current move is already "locked"
-# than the same time-left in a 5m window — which is why several 15m long-band
-# thresholds sit BELOW their 5m counterparts. Some 15m cells were still noisy
-# (non-monotonic), so these are smoothed to be monotonic-ascending and rounded
-# to bucket edges. Less battle-tested than the 5m table; revisit as 15m fills.
-PER_ASSET_FRONTIER_15M = {
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.20)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-}
-
-# Fallback for anything past 120s left, or an asset not in the tables.
-GLOBAL_FRONTIER = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
+# 15-MINUTE gate. We do NOT have a measured 15m frontier yet, and the few real
+# points show 15m needs MUCH bigger moves than 5m (e.g. HYPE15 +0.785% @116s;
+# BNB15 -0.235% @227s). The earlier you are in a 15m window, the bigger the move
+# must be. We build 15m off each asset's 5m 40-70s threshold (a mid, not the tiny
+# buzzer number) and scale UP steeply with time-left. Conservative on purpose -
+# this should SKIP small moves like ETH -0.058% @40s. Replace with the probe's
+# measured 15m surface when it has enough samples.
+def _frontier_15m(asset, secs_left):
+    bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
+    base = bands[2][1] if len(bands) >= 3 else bands[-1][1]
+    if secs_left <= 20:
+        return base * 1.3
+    if secs_left <= 70:
+        return base * 1.8
+    if secs_left <= 180:
+        return base * 2.3
+    return base * 3.0
+# Fallback table for any asset not listed above (mirrors the old global gate).
+GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
 FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
-# HYPE floor now redundant — HYPE's measured table is already strict. Off by
-# default (0.0); set HYPE_MIN_MOVE_PCT>0 to re-impose an extra hard floor.
-HYPE_MIN_MOVE_PCT     = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.0"))
-
-
-def _frontier_lookup(bands, secs_left):
-    for max_secs, min_move in bands:
-        if secs_left <= max_secs:
-            return min_move
-    return FRONTIER_FALLBACK_PCT
+# Optional hard floor for HYPE on top of its table (belt-and-suspenders).
+HYPE_MIN_MOVE_PCT     = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
 
 # ── VARIANT: stacking ────────────────────────────────────────────────────────
 # Re-enter the SAME window multiple times while the move stays above threshold
@@ -992,17 +984,21 @@ STACK_GAP_SECS   = float(os.environ.get("STACK_GAP_SECS", "12"))
 
 
 def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
-    """True if (move, time-left) clears THIS asset's MEASURED lock frontier for
-    this timeframe. Both 5m and 15m now use measured per-asset tables from the
-    probe /grid (no more guessing)."""
+    """True if (move, time-left) clears THIS asset's lock frontier for this
+    timeframe. 5m uses the measured per-asset table; 15m uses the conservative
+    time-scaled rule (see _frontier_15m)."""
     if secs_left <= 0:
         return False
     if tf == 15:
-        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER)
+        need = _frontier_15m(asset, secs_left)
     else:
         bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
-    need = _frontier_lookup(bands, secs_left)
-    if asset == "HYPE" and HYPE_MIN_MOVE_PCT > 0:
+        need = FRONTIER_FALLBACK_PCT
+        for max_secs, min_move in bands:
+            if secs_left <= max_secs:
+                need = min_move
+                break
+    if asset == "HYPE":
         need = max(need, HYPE_MIN_MOVE_PCT)
     return abs_move_pct >= need
 
