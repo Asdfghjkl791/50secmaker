@@ -73,12 +73,12 @@ MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "50"))
 MAX_VOLATILITY_PCT = float(os.environ.get("MAX_VOLATILITY_PCT", "0.0"))
 
 CONFIG = {
-    "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
+    "bet_size":             float(os.environ.get("BET_SIZE", "5.0")),
     # Time-based bet sizing (EST). Day = 6am-9pm, Night = 9pm-6am.
     # If TIME_BASED_BET is "true", these override bet_size based on the hour.
-    "time_based_bet":       os.environ.get("TIME_BASED_BET", "true").lower() == "true",
-    "bet_size_day":         float(os.environ.get("BET_SIZE_DAY", "2.0")),
-    "bet_size_night":       float(os.environ.get("BET_SIZE_NIGHT", "1.0")),
+    "time_based_bet":       os.environ.get("TIME_BASED_BET", "false").lower() == "true",
+    "bet_size_day":         float(os.environ.get("BET_SIZE_DAY", "5.0")),
+    "bet_size_night":       float(os.environ.get("BET_SIZE_NIGHT", "5.0")),
     "night_start_hour":     int(os.environ.get("NIGHT_START_HOUR", "21")),  # 9pm EST
     "night_end_hour":       int(os.environ.get("NIGHT_END_HOUR", "6")),     # 6am EST
     "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "50")),
@@ -211,7 +211,7 @@ def fmt_time_short(iso_str):
 
 # ─── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
-    conn = sqlite3.connect("trades_live.db")
+    conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,7 +228,7 @@ def init_db():
 
 
 def db_insert_trade(t):
-    conn = sqlite3.connect("trades_live.db")
+    conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
     c = conn.cursor()
     c.execute("""
         INSERT INTO trades (entered_at, asset, timeframe, direction, pct_move,
@@ -246,7 +246,7 @@ def db_insert_trade(t):
 
 def db_log_skip(asset, tf, direction, pct_move, open_price, entry_cents, reason, open_time, close_time, secs_left):
     """Log a skipped signal to the trades DB for history tracking (no money spent)."""
-    conn = sqlite3.connect("trades_live.db")
+    conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
     c = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     c.execute("""
@@ -262,7 +262,7 @@ def db_log_skip(asset, tf, direction, pct_move, open_price, entry_cents, reason,
 
 
 def db_settle(row_id, close_price, result, payout, pl, bal):
-    conn = sqlite3.connect("trades_live.db")
+    conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
     conn.execute("""
         UPDATE trades SET close_price=?, result=?, payout=?,
         profit_loss=?, balance_after=? WHERE id=?
@@ -272,7 +272,7 @@ def db_settle(row_id, close_price, result, payout, pl, bal):
 
 
 def db_stats():
-    conn = sqlite3.connect("trades_live.db")
+    conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
     c = conn.cursor()
     c.execute("""
         SELECT COUNT(*), SUM(CASE WHEN result='WON' THEN 1 ELSE 0 END), SUM(profit_loss)
@@ -284,7 +284,7 @@ def db_stats():
 
 
 def db_recent_trades(limit=10, offset=0):
-    conn = sqlite3.connect("trades_live.db")
+    conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
     c = conn.cursor()
     c.execute("""
         SELECT entered_at, asset, timeframe, direction, pct_move, result, profit_loss, real_entry_cents, window_close
@@ -353,7 +353,7 @@ def handle_commands():
             total, wins, pnl = db_stats()
             wr = f"{wins/total*100:.1f}%" if total > 0 else "—"
             # Count skipped signals
-            conn = sqlite3.connect("trades_live.db")
+            conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
             c = conn.cursor()
             c.execute("SELECT COUNT(*) FROM trades WHERE result='SKIPPED'")
             skipped = c.fetchone()[0] or 0
@@ -383,7 +383,7 @@ def handle_commands():
             per_page = 10
             offset = (page - 1) * per_page
 
-            conn = sqlite3.connect("trades_live.db")
+            conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
             c = conn.cursor()
             c.execute("SELECT COUNT(*) FROM trades")
             total = c.fetchone()[0] or 0
@@ -912,7 +912,7 @@ MAKER_MODE               = os.environ.get("MAKER_MODE", "true").lower() == "true
 MAKER_BID_CENTS          = float(os.environ.get("MAKER_BID_CENTS", "99.0"))
 MAKER_CANCEL_REV_PCT     = float(os.environ.get("MAKER_CANCEL_REV_PCT", "0.02"))   # Binance move against bet (~5s window) that cancels
 MAKER_CANCEL_T_SECS      = float(os.environ.get("MAKER_CANCEL_T_SECS", "1.0"))     # cancel unfilled remainder this close to window end
-MAKER_FILL_POLL_SECS     = float(os.environ.get("MAKER_FILL_POLL_SECS", "2.0"))
+MAKER_FILL_POLL_SECS     = float(os.environ.get("MAKER_FILL_POLL_SECS", "1.0"))
 MAKER_BINANCE_FRESH_SECS = float(os.environ.get("MAKER_BINANCE_FRESH_SECS", "10.0"))
 # Polymarket platform rule: GTC/GTD limit orders require a minimum of 5 shares
 # (≈$4.95 at a 99¢ bid). Bets below that are rejected with a 400 error.
@@ -921,7 +921,90 @@ MAKER_MIN_SHARES         = float(os.environ.get("MAKER_MIN_SHARES", "5"))
 # disagrees with the signal) and a 99¢ limit would instantly TAKE at that low
 # price - a different, riskier bet than the maker model. Mirrors the old
 # "market disagrees" gate from taker mode.
-MAKER_MIN_ASK_CENTS      = float(os.environ.get("MAKER_MIN_ASK_CENTS", "95.0"))
+MAKER_MIN_ASK_CENTS      = float(os.environ.get("MAKER_MIN_ASK_CENTS", "96.0"))
+
+# ── VARIANT: fill-price bail-out floor ──────────────────────────────────────
+# If a resting bid starts getting filled BELOW this price, the outcome is
+# collapsing and our bid is absorbing the cascade (this is what produced the
+# 49¢ HYPE fill). Cancel the remainder immediately the moment a cheap fill is
+# detected. This is separate from MAKER_MIN_ASK_CENTS (which only guards the
+# placement instant); this guards the RESTING period.
+MAKER_BAILOUT_CENTS      = float(os.environ.get("MAKER_BAILOUT_CENTS", "96.0"))
+
+# ── VARIANT: PER-ASSET 5m frontier — MEASURED from the probe /grid ───────────
+# Built from 682k+ settled windows (all 7 assets, both timeframes). The bands
+# below use the time-left ranges that had real sample counts (hundreds-to-
+# thousands per cell). Three tiers fall out of the data:
+#   calm    (BTC/XRP/DOGE/BNB): 0.05 → 0.10 → 0.10 → 0.20 → 0.40
+#   mid     (ETH):              0.05 → 0.10 → 0.20 → 0.40 → 0.40
+#   volatile(SOL/HYPE):         0.10 → 0.20 → 0.40 → 0.40 → 0.40
+# Universal truth across every coin: 70-120s out needs ~0.40% to hold >=99%.
+# The 0-10s buzzer band is included now (the big sample finally made it solid).
+#
+# Each row: (max_secs_left, min_abs_move_pct), ascending max_secs.
+PER_ASSET_FRONTIER = {
+    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+    "SOL":  [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
+    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "HYPE": [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
+}
+
+# ── VARIANT: PER-ASSET 15m frontier — MEASURED from the probe /grid ──────────
+# Now measured (replaces the old scaling GUESS). A 15m window has far more
+# elapsed time, so at long time-left a smaller current move is already "locked"
+# than the same time-left in a 5m window — which is why several 15m long-band
+# thresholds sit BELOW their 5m counterparts. Some 15m cells were still noisy
+# (non-monotonic), so these are smoothed to be monotonic-ascending and rounded
+# to bucket edges. Less battle-tested than the 5m table; revisit as 15m fills.
+PER_ASSET_FRONTIER_15M = {
+    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
+    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+    "SOL":  [(10, 0.10), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.20)],
+    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
+    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
+    "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+}
+
+# Fallback for anything past 120s left, or an asset not in the tables.
+GLOBAL_FRONTIER = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
+FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
+# HYPE floor now redundant — HYPE's measured table is already strict. Off by
+# default (0.0); set HYPE_MIN_MOVE_PCT>0 to re-impose an extra hard floor.
+HYPE_MIN_MOVE_PCT     = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.0"))
+
+
+def _frontier_lookup(bands, secs_left):
+    for max_secs, min_move in bands:
+        if secs_left <= max_secs:
+            return min_move
+    return FRONTIER_FALLBACK_PCT
+
+# ── VARIANT: stacking ────────────────────────────────────────────────────────
+# Re-enter the SAME window multiple times while the move stays above threshold
+# for the time remaining (mirrors the wallet's avg 3.2 fills/window). Each clip
+# is a fresh resting bid. Capped to bound exposure: STACK_MAX clips x $bet.
+STACK_MAX        = int(os.environ.get("STACK_MAX", "3"))
+STACK_GAP_SECS   = float(os.environ.get("STACK_GAP_SECS", "12"))
+
+
+def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
+    """True if (move, time-left) clears THIS asset's MEASURED lock frontier for
+    this timeframe. Both 5m and 15m now use measured per-asset tables from the
+    probe /grid (no more guessing)."""
+    if secs_left <= 0:
+        return False
+    if tf == 15:
+        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER)
+    else:
+        bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
+    need = _frontier_lookup(bands, secs_left)
+    if asset == "HYPE" and HYPE_MIN_MOVE_PCT > 0:
+        need = max(need, HYPE_MIN_MOVE_PCT)
+    return abs_move_pct >= need
 
 resting_orders = {}   # order_id -> info
 _min_size_warned = False
@@ -981,6 +1064,29 @@ def cancel_clob_order(order_id):
     return False
 
 
+def _live_fill_price_cents(info):
+    """Real avg fill price (cents) so far for this order's token, from the public
+    trades API. Returns None on error (caller then won't bail on missing data)."""
+    try:
+        r = requests.get(
+            "https://data-api.polymarket.com/trades",
+            params={"user": POLY_FUNDER, "market": info.get("condition_id", ""),
+                    "takerOnly": "false", "limit": 50},
+            timeout=6,
+        )
+        rows = [t for t in r.json() if str(t.get("side", "")).upper() == "BUY"]
+        tok = str(info.get("token_id"))
+        toks = [t for t in rows if str(t.get("asset", "")) == tok]
+        use = toks if toks else rows
+        tot_sh = sum(float(t["size"]) for t in use)
+        tot_usd = sum(float(t["size"]) * float(t["price"]) for t in use)
+        if tot_sh > 0:
+            return (tot_usd / tot_sh) * 100
+    except Exception as e:
+        log.warning(f"[MAKER] live fill-price check failed: {e}")
+    return None
+
+
 def get_order_matched(order_id):
     """Return (matched_shares, status) for an order, or (None, None) on error."""
     try:
@@ -1018,7 +1124,11 @@ def place_maker_order(asset, tf, direction, bet_size, open_time, close_time, w):
             return {"status": "skipped",
                     "error": f"ask {best_ask*100:.1f}¢ < {MAKER_MIN_ASK_CENTS:.0f}¢ - market disagrees"}
     except Exception as e:
-        log.warning(f"[MAKER] ask check failed ({e}) - proceeding without it")
+        # FAIL CLOSED: if we can't verify the ask is above the floor, do NOT place.
+        # A blind bid can cross a cheap ask (e.g. 91¢) and fill into a flipping
+        # outcome - exactly the entry we're trying to prevent.
+        log.warning(f"[MAKER] ask check failed ({e}) - skipping (won't place blind below floor)")
+        return {"status": "skipped", "error": f"ask check failed ({e}) - won't place blind"}
 
     import math
     price = round(MAKER_BID_CENTS / 100.0, 2)
@@ -1112,11 +1222,7 @@ def _finalize_maker(info, reason):
             w["trade_db_id"] = db_id
             state["balance_usd"] -= cost
             state["trades_today"] += 1
-            tg(
-                f"🟢 <b>FILLED (maker) · {emoji} {asset} {tf}m {dirn}</b>\n\n"
-                f"📦 {matched:g}/{info['shares']:g} sh @ {avg_price*100:.1f}¢ = ${cost:.2f}\n"
-                f"🪧 Closed: {reason}\n🕐 {est_str()}"
-            )
+            tg(f"🟢 {emoji}{asset} {tf}m {dirn} · {matched:g}sh@{avg_price*100:.1f}¢ · ${cost:.2f}")
             # If the window already rolled over, schedule settlement ourselves
             # (settle() has a guard so it can't run twice for the same window).
             if datetime.now(timezone.utc) >= info["close_time"]:
@@ -1171,6 +1277,21 @@ def maker_monitor():
                     if matched is not None:
                         if matched > info["matched"]:
                             info["matched"] = matched
+                            # ── VARIANT BAIL-OUT ──
+                            # A fill came in. Check what we ACTUALLY paid. If the
+                            # average fill price is below the bail-out floor, the
+                            # outcome is collapsing and our bid is absorbing the
+                            # cascade (the 49¢ HYPE failure). Cancel immediately.
+                            avg_c = _live_fill_price_cents(info)
+                            if avg_c is not None and avg_c < MAKER_BAILOUT_CENTS:
+                                emoji = ASSET_EMOJI.get(asset, "")
+                                tg(f"🛑 <b>BAIL-OUT · {emoji} {asset} {info['tf']}m {dirn}</b>\n"
+                                   f"Filling at {avg_c:.1f}¢ (< {MAKER_BAILOUT_CENTS:.0f}¢ floor) — "
+                                   f"outcome collapsing, cancelling remainder.")
+                                threading.Thread(target=_finalize_maker,
+                                                 args=(info, f"bail-out: filling at {avg_c:.1f}¢"),
+                                                 daemon=True).start()
+                                continue
                             if not info["notified_fill"]:
                                 info["notified_fill"] = True
                                 emoji = ASSET_EMOJI.get(asset, "")
@@ -1289,6 +1410,27 @@ def measure_vol_stats(hist, seconds=30, big_jump_pct=0.02):
     stats["max"] = max(pct_moves)
     stats["big"] = sum(1 for p in pct_moves if p > big_jump_pct)
     return stats
+
+
+def measure_move_hold(hist, open_price, seconds=60):
+    """MOVE-HOLD instability over the last N seconds (the metric we measure in the
+    probe). Looks at the move-from-open — (price - open) — each second and measures
+    how much that sequence DECAYS (slides toward zero) or SWINGS (bounces). Low =
+    the move held steady (good); high = decaying/swinging (bad). In % of price.
+    Returns None if not enough history or no open price."""
+    if not open_price or open_price <= 0:
+        return None
+    if len(hist) < 3:
+        return None
+    recent = list(hist)[-seconds:]
+    if len(recent) < 3:
+        return None
+    diffs = [(p - open_price) / open_price * 100.0 for p in recent if p > 0]
+    if len(diffs) < 3:
+        return None
+    level = diffs[-1]  # where the move currently sits
+    mad = sum(abs(d - level) for d in diffs) / len(diffs)
+    return round(mad, 4)
 
 
 def check_momentum(hist, direction, n):
@@ -1535,8 +1677,18 @@ def process_tick():
             absp = abs(pct)
             dirn = "UP" if pct >= 0 else "DOWN"
 
-            if w["traded"] or w["skipped"]:
+            if w["skipped"]:
                 continue
+            # ── STACKING ──
+            # Once the window has an entry, allow MORE clips into it while the
+            # move still clears the gate, spaced by STACK_GAP_SECS, up to
+            # STACK_MAX. This re-enters as certainty holds (the wallet's stacking).
+            if w["traded"]:
+                if w.get("stacks", 1) >= STACK_MAX:
+                    continue
+                if time.time() - w.get("last_stack_at", 0) < STACK_GAP_SECS:
+                    continue
+                # else fall through and re-check the gate for another clip
 
             # Per-asset-per-tf entry window (ETH/BNB/SOL/HYPE 5m can be tuned)
             entry_window = CONFIG["entry_window_seconds"]
@@ -1554,17 +1706,13 @@ def process_tick():
             if secs_left <= 0 or secs_left > entry_window:
                 continue
 
-            # Per-asset threshold override (ETH/BNB/SOL 5m need stronger moves)
-            effective_threshold = threshold
-            if tf == 5:
-                if asset == "ETH":
-                    effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.13"))
-                elif asset == "BNB":
-                    effective_threshold = float(os.environ.get("THRESHOLD_BNB_5_STRICT", "0.18"))
-                elif asset == "SOL":
-                    effective_threshold = float(os.environ.get("THRESHOLD_SOL_5_STRICT", "0.18"))
-
-            if absp < effective_threshold:
+            # ── FRONTIER GATE (the variant's core difference from the control) ──
+            # Enter only if the move clears the lock threshold for the time left,
+            # from 323k settled samples. HYPE is held to a stricter floor because
+            # it settles on Chainlink spot while we signal on Binance futures, so
+            # only large moves overwhelm the basis noise (matches how the
+            # profitable wallet trades HYPE: his entries are all 0.20%+).
+            if not frontier_locked(asset, absp, secs_left, tf):
                 continue
             if state["paused"]:
                 continue
@@ -1681,9 +1829,11 @@ def process_tick():
 
             # Log the reversal counts for entered trades (for tuning the choppy threshold)
             vol_stats = measure_vol_stats(hist, seconds=30)
-            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
+            move_hold = measure_move_hold(hist, w["open_price"], seconds=60)
+            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, hold={move_hold}, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
             w["entry_volatility"] = volatility
             w["entry_vol_stats"] = vol_stats
+            w["entry_hold"] = move_hold
             enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
 
 
@@ -1727,14 +1877,12 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
             w["entry_move"] = pct
             w["entry_revs"] = revs
             w["entry_recent_revs"] = recent_revs
+            w["stacks"] = w.get("stacks", 0) + 1
+            w["last_stack_at"] = time.time()
             active_directions[(asset, tf)] = dirn
-            tg(
-                f"🪧 <b>RESTING BID · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-                f"📈 Move: {pct:+.3f}%\n"
-                f"💵 {result['shares']:g} sh @ <b>{MAKER_BID_CENTS:.0f}¢</b> (${bet:.2f})\n"
-                f"⏱ {secs_left}s left · auto-cancel on Binance reversal\n"
-                f"🕐 {est_str()}"
-            )
+            sx = f" ×{w['stacks']}" if w["stacks"] > 1 else ""
+            tg(f"🪧 {emoji}{asset} {tf}m {dirn}{arrow}{sx} · {pct:+.3f}% · "
+               f"{result['shares']:g}sh@99¢ · {secs_left}s")
         else:
             # Failed (market not found, stale feed, rejected) - allow retry next cycle
             log.warning(f"[MAKER] place failed (will retry): {result.get('error')}")
@@ -2083,6 +2231,8 @@ def settle(w, asset, tf, close_price):
         "entry_recent_revs": w.get("entry_recent_revs"),
         "entry_volatility": w.get("entry_volatility"),
         "entry_vol_stats": w.get("entry_vol_stats"),
+        "entry_hold": w.get("entry_hold"),
+        "close_time": w.get("close_time"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
     t.start()
@@ -2115,7 +2265,7 @@ def _settle_worker(d, asset, tf):
         # Polymarket Gamma never returned outcome after 30 min - mark UNVERIFIED.
         # Do NOT fall back to Chainlink math - it gives wrong outcomes.
         log.error(f"Settled {asset} {tf}m UNVERIFIED - Polymarket Gamma never published outcome after 30min")
-        conn = sqlite3.connect("trades_live.db")
+        conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
         conn.execute("UPDATE trades SET result=?, profit_loss=0, balance_after=? WHERE id=?",
                      ("UNVERIFIED", state["balance_usd"], d["trade_db_id"]))
         conn.commit()
@@ -2133,7 +2283,7 @@ def _settle_worker(d, asset, tf):
 
     won = actual == d["direction"]
 
-    conn = sqlite3.connect("trades_live.db")
+    conn = sqlite3.connect(os.environ.get("DB_PATH", "trades_variant.db"))
     c = conn.cursor()
     c.execute("SELECT real_entry_cents, cost, shares FROM trades WHERE id=?", (d["trade_db_id"],))
     row = c.fetchone()
@@ -2166,37 +2316,23 @@ def _settle_worker(d, asset, tf):
         del open_positions[d["trade_db_id"]]
 
     total, wins, total_pnl = db_stats()
-    wr = f"{wins/total*100:.1f}%" if total > 0 else "—"
+    wr = f"{wins/total*100:.0f}%" if total > 0 else "—"
     emoji = ASSET_EMOJI.get(asset, "")
     out_emoji = "✅" if won else "❌"
 
-    # Entry conditions captured at trade time (for reviewing what wins/losses looked like)
-    cond_lines = ""
-    if d.get("entry_move") is not None:
-        vol_str = ""
-        vs = d.get("entry_vol_stats")
-        if vs:
-            vol_str = (
-                f"🌊 Net: {vs['net']:+.3f}% · Avg: {vs['avg']:.4f}\n"
-                f"🌊 RealizedVol: {vs['rv']:.4f} · BigJumps: {vs['big']}\n"
-            )
-        elif d.get("entry_volatility") is not None:
-            vol_str = f"🌊 Volatility: {d['entry_volatility']:.4f}%/s\n"
-        cond_lines = (
-            f"📈 Move: {d['entry_move']:+.3f}%\n"
-            f"🔄 Window rev: {d.get('entry_revs','?')} · 30s rev: {d.get('entry_recent_revs','?')}\n"
-            f"{vol_str}"
-            f"💲 Entry: {entry_c:.1f}¢\n"
-        )
+    # Entry conditions on the result line, so a LOSS carries its own numbers for
+    # forensics: what was the move and move-hold when it entered.
+    em_pct = d.get("entry_move")
+    em_hold = d.get("entry_hold")
+    cond_bits = []
+    if em_pct is not None:
+        cond_bits.append(f"{em_pct:+.3f}%")
+    if em_hold is not None:
+        cond_bits.append(f"hold {em_hold:.3f}")
+    cond_str = (" · entry: " + " · ".join(cond_bits)) if cond_bits else ""
 
-    tg(
-        f"{out_emoji} <b>{emoji} {asset} {tf}m · {result}</b>\n\n"
-        f"Called: {d['direction']} · Actual: {actual}\n"
-        f"{cond_lines}"
-        f"<i>Source: {source}</i>\n"
-        f"PnL: <b>${pl:+.3f}</b> · Bal: ${state['balance_usd']:.2f}\n"
-        f"📊 {total} · {wr} · ${total_pnl:+.2f}"
-    )
+    tg(f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · ${pl:+.3f} · "
+       f"bal ${state['balance_usd']:.2f} · {total}·{wr}{cond_str}")
 
     # Auto-pause after consecutive losses
     if not won and state["consecutive_losses"] >= CONFIG["consecutive_loss_limit"]:
@@ -2232,19 +2368,15 @@ def main():
         f"🪧 MAKER - resting {MAKER_BID_CENTS:.0f}¢ bids" if maker_ok else "🤖 TAKER - FAK orders")
 
     tg(
-        f"🚀 <b>PolySniper LIVE v4.1</b>\n"
+        f"🧪 <b>PolySniper VARIANT (per-asset gate)</b>\n"
         f"{mode_str}\n"
-        f"🎯 <b>EARLY ENTRY STRATEGY</b>\n\n"
-        f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
-        f"⏱ 5min + 15min\n"
-        f"💵 Bet: ${CONFIG['bet_size_day']:g} day / ${CONFIG['bet_size_night']:g} night (now ${current_bet_size():g})\n"
-        f"⏰ Entry window: last {CONFIG['entry_window_seconds']}s\n"
-        f"💲 Entry range: {CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢\n"
-        f"🛑 Stop loss: {CONFIG['stop_loss_cents']:.0f}¢\n"
-        f"⏸ Auto-pause after: {CONFIG['consecutive_loss_limit']} losses\n"
-        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n"
-        f"⚡ Lag measure: {'✅ hourly reports' if lag_ok else '❌ off'}\n"
-        f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n\n"
+        f"🎯 <b>PER-MARKET FRONTIER ENTRY</b>\n\n"
+        f"Each asset has its own move×time gate:\n"
+        f"  BTC lowest · HYPE/SOL highest\n"
+        f"  (calm liquid = low bar, volatile = high bar)\n"
+        f"🛟 Bail-out: cancel if filling < {MAKER_BAILOUT_CENTS:.0f}¢\n"
+        f"💵 Bet: ${CONFIG['bet_size_day']:g} flat\n"
+        f"💲 Ask floor: {MAKER_MIN_ASK_CENTS:.0f}¢\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
