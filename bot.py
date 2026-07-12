@@ -520,7 +520,29 @@ def handle_commands():
             t = u.get("message", {}).get("text", "").strip().lower()
             if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
-            if t == "/status":
+            if t == "/watch":
+                lines = []
+                for tf in TFS:
+                    open_ts, close_ts, secs_left = window_times(tf)
+                    for asset in ASSET_LIST:
+                        if asset in EXCLUDE_ASSETS:
+                            continue
+                        ref = prices_ref.get(asset)
+                        op = open_windows.get((asset, tf, open_ts))
+                        if ref is None or not op:
+                            continue
+                        mv = (ref - op) / op * 100.0
+                        need = _frontier_lookup(
+                            PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER_15M)
+                            if tf == 15 else
+                            PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER), secs_left)
+                        hot = "🔥" if abs(mv) >= need else "  "
+                        lines.append(f"{hot}{asset} {tf}m: {mv:+.3f}% "
+                                     f"(need ±{need:.2f}, {secs_left:.0f}s left)")
+                tg("👀 <b>live watch</b> (move vs threshold)\n" +
+                   ("\n".join(lines[:16]) if lines else "no windows captured yet — "
+                    "wait for the next window to open"))
+            elif t == "/status":
                 with pending_lock:
                     nopen = len(pending)
                 mode = "🟢 LIVE" if (LIVE and _clob) else "📄 PAPER"
@@ -536,13 +558,29 @@ def handle_commands():
                 if not (LIVE and _clob):
                     tg("📄 paper mode — no real balance")
                     continue
+                bal = None
                 try:
-                    bal = _clob.get_balance_allowance(
-                        params=None) if hasattr(_clob, "get_balance_allowance") else None
-                    tg(f"💰 wallet balance: {bal}")
-                except Exception as e:
-                    tg(f"⚠️ couldn't fetch balance: {e}\n"
-                       f"(funder: {POLY_FUNDER[:10]}…)")
+                    from py_clob_client_v2.clob_types import (
+                        BalanceAllowanceParams, AssetType)
+                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                    bal = _clob.get_balance_allowance(params=params)
+                except Exception as e1:
+                    try:
+                        # some SDK builds accept a plain dict
+                        bal = _clob.get_balance_allowance(
+                            params={"asset_type": "COLLATERAL"})
+                    except Exception as e2:
+                        tg(f"⚠️ balance fetch failed: {e1} / {e2}\n"
+                           f"(funder {POLY_FUNDER[:10]}…)")
+                        continue
+                # bal often returns raw units (USDC has 6 decimals)
+                try:
+                    raw = float(bal.get("balance", 0)) if isinstance(bal, dict) else float(bal)
+                    usdc = raw / 1_000_000 if raw > 1000 else raw
+                    tg(f"💰 <b>wallet balance</b>: ${usdc:.2f} USDC\n"
+                       f"(bankroll stop set at ${BANKROLL_STOP:g})")
+                except Exception:
+                    tg(f"💰 wallet balance (raw): {bal}")
             elif t == "/stats":
                 sb = db_scoreboard()
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "—"
@@ -686,18 +724,28 @@ def engine():
                     if ref is None:
                         continue
                     wkey = (asset, tf, open_ts)
-                    # capture open price once — ONLY if we caught the window near
-                    # its true start. elapsed = window_length - secs_left.
+                    # Capture the open price the first time we see this window.
+                    # If we catch it near the true start, that's a clean open.
+                    # If we join mid-window (e.g. right after boot), we still
+                    # capture the earliest price we saw AND record how late we
+                    # were, so the gate can require a move relative to it. Only
+                    # windows joined AFTER the entry cutoff are useless (no time
+                    # to act), so those we skip.
                     if wkey not in open_windows:
                         elapsed = (tf * 60) - secs_left
-                        if elapsed <= OPEN_CAPTURE_GRACE:
-                            open_windows[wkey] = ref   # clean open, anchored to start
+                        cutoff_open = ENTRY_MAX_SECS_15M if tf == 15 else ENTRY_MAX_SECS
+                        if secs_left <= 2:
+                            open_windows[wkey] = None      # window basically over
                         else:
-                            open_windows[wkey] = None  # joined late — skip this window
+                            # capture the open regardless; flag if it was late
+                            open_windows[wkey] = ref
+                            if elapsed > OPEN_CAPTURE_GRACE:
+                                log.info(f"[OPEN] {asset} {tf}m joined mid-window "
+                                         f"({elapsed:.0f}s in) — ref-anchored open")
                         continue
                     op = open_windows[wkey]
                     if op is None:
-                        continue  # window had no clean open; never enter it
+                        continue  # window unusable
                     move = (ref - op) / op * 100.0
                     direction = "UP" if move >= 0 else "DOWN"
                     absmove = abs(move)
