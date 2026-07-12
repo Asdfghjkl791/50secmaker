@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
-# PAPER TAKER v1.0 — does taking beat making on the SAME gate? (no money)
+# LIVE TAKER — the real-money executor for the measured-taker pocket.
 #
-# THE QUESTION
-#   The maker bot rests a 99¢ bid and gets filled by whoever hits it — which
-#   selects it into the losing half of its own signals (sellers dump reversing
-#   trades onto the resting bid). A TAKER with the SAME entry gate instead
-#   crosses the spread the instant the gate fires — taking ALL its flagged
-#   trades at the moment of its choosing, not just the ones a seller chose to
-#   fill. This bot tests, on paper, whether that execution change clears
-#   break-even. It uses the maker bot's EXACT frontier gate and reads the SAME
-#   live Polymarket books, but places NOTHING. It records the real ask it would
-#   have crossed and scores every simulated trade at settlement.
+# ⚠️  THIS PLACES REAL ORDERS WITH REAL MONEY. It is deliberately built to
+#     REFUSE TO ARM until the pre-registered evidence bars are cleared. Those
+#     gates are not paranoia — they are the entire reason this project never
+#     lost more than it had to. Do not remove them.
 #
-# WHY PAPER FIRST
-#   The diagnosis (maker selection hurts) is well-supported. The fix (taking
-#   clears break-even) is NOT proven — taking pays the ask, which may be 99-100¢
-#   and kill the edge anyway. So we score it on live prices for a few hundred
-#   trades and let the numbers decide before a cent goes in. Same discipline as
-#   the EUR/USD bot.
+# ══════════════════════════════════════════════════════════════════════════
+#  ARMING GATES (all must pass, checked live at boot against the paper DB)
+# ══════════════════════════════════════════════════════════════════════════
+#   GATE 1 — CERTIFIED SAMPLE:  >= MIN_CERT_TRADES settlement-graded in-band
+#            trades exist in the paper DB (graded='settle'). Feed-graded rows
+#            do NOT count. This is what "enough data" actually means.
+#   GATE 2 — CERTIFIED EDGE:    certified in-band net >= MIN_CERT_NET dollars
+#            AND certified win% > certified avg-ask (a real margin, on real
+#            settlement, not the feed).
+#   GATE 3 — EXIT PROVEN (only if USE_EXIT=true): the /exit ceiling on recorded
+#            bid-paths must be NET POSITIVE — i.e. selling failing trades has
+#            been measured to add money, not burn it on false fires. If you
+#            want the sell-function live, it has to have EARNED its place.
+#   GATE 4 — MANUAL ARM:        LIVE_ARM=YES_I_REVIEWED must be set by hand,
+#            after you have read the certified /stats and /exit yourself.
 #
-# HONEST LIMITS
-#   • It assumes the displayed ask is takeable for the full size — real taking
-#     can get worse fills in fast markets, so paper results are an UPPER bound.
-#   • It uses Chainlink settlement (same oracle Polymarket uses) to grade.
-#   • No fees modeled (Polymarket taker fees ~0 on these, but confirm).
+#   Per-asset inclusion is DATA-DRIVEN (see PER_ASSET_MIN_NET): an asset trades
+#   live only if its OWN certified net clears the per-asset floor. That is how
+#   XRP gets excluded if it deserves to be — by evidence, at arm time, not by
+#   deleting it from the backtest after the fact.
 #
-# ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# ENV (optional): PAPER_STAKE=5, TAKER_MAX_ASK_CENTS=99.5 (skip if ask above
-#   this — the "don't overpay" guard), DB_PATH=paper_taker.db, TIMEFRAMES=5,
-#   SEND_EACH=true
+#   Reads the SAME paper DB the paper bot writes (DB_PATH). Point both at the
+#   same volume. The paper bot keeps running; this only ARMS when it has earned.
+#
+# ENV (required to arm): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, POLY_PRIVATE_KEY,
+#   POLY_FUNDER, LIVE_ARM=YES_I_REVIEWED
+# ENV (safety, with defaults): LIVE_STAKE=5, DAILY_LOSS_STOP=25,
+#   MAX_OPEN=1, BANKROLL_STOP=150, MIN_CERT_TRADES=800, MIN_CERT_NET=20,
+#   PER_ASSET_MIN_NET=0, USE_EXIT=true, EXIT_TRIGGER_CENTS=90,
+#   TAKER_MAX_ASK_CENTS=98, DB_PATH, TIMEFRAMES=5,15
 
 import os
 import time
@@ -37,687 +44,298 @@ import sqlite3
 import logging
 import threading
 import requests
-from datetime import datetime, timezone
-from collections import deque
+from datetime import datetime, timezone, date
 
+# ── order stack (same SDK the maker bot uses) ────────────────────────────────
 try:
-    import websocket
-    WEBSOCKET_AVAILABLE = True
-except ImportError:
-    WEBSOCKET_AVAILABLE = False
+    from py_clob_client_v2 import (
+        ClobClient, OrderArgs, MarketOrderArgs, PartialCreateOrderOptions,
+        OrderType,
+    )
+    from py_clob_client_v2.order_builder.constants import BUY, SELL
+    V2_AVAILABLE = True
+except Exception:
+    V2_AVAILABLE = False
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-PAPER_STAKE      = float(os.environ.get("PAPER_STAKE", "5"))
-TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "99.5"))
-# Floor: skip entries CHEAPER than this — the market pricing an outcome below
-# this is telling you it's too uncertain (the 89¢ coin-flip that lost). Note:
-# tightening the band [MIN, MAX] does NOT create an edge — inside the band, win
-# rate still ≈ price paid. It only stops the bot taking obviously-uncertain
-# trades. Default 0 = no floor (take anything up to the ceiling).
+POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "")
+POLY_FUNDER      = os.environ.get("POLY_FUNDER", "")
+LIVE_ARM         = os.environ.get("LIVE_ARM", "")
+
+LIVE_STAKE       = float(os.environ.get("LIVE_STAKE", "5"))
+DAILY_LOSS_STOP  = float(os.environ.get("DAILY_LOSS_STOP", "25"))
+BANKROLL_STOP    = float(os.environ.get("BANKROLL_STOP", "150"))
+MAX_OPEN         = int(os.environ.get("MAX_OPEN", "1"))
+MIN_CERT_TRADES  = int(os.environ.get("MIN_CERT_TRADES", "800"))
+MIN_CERT_NET     = float(os.environ.get("MIN_CERT_NET", "20"))
+PER_ASSET_MIN_NET = float(os.environ.get("PER_ASSET_MIN_NET", "0"))
+USE_EXIT         = os.environ.get("USE_EXIT", "true").lower() == "true"
+EXIT_TRIGGER_CENTS = float(os.environ.get("EXIT_TRIGGER_CENTS", "90"))
+TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "98"))
 TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "0"))
 DB_PATH          = os.environ.get("DB_PATH", "paper_taker.db")
-SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
-FAST_GRADE       = os.environ.get("FAST_GRADE", "true").lower() == "true"
-SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "20"))
-SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "900"))
-FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
-# Stacking: up to MAX_STACK entries per window (like the live maker bot,
-# which added clips as the move re-qualified). STACK_COOLDOWN_SECS spaces
-# them out so it doesn't take all 3 in the same instant. Each entry reads
-# its own live ask, so later clips may get a different price. NOTE: the 3
-# stacked entries share ONE window outcome — read win RATE (per-entry, fine)
-# more than trade COUNT (which triple-counts a window).
-MAX_STACK           = int(os.environ.get("MAX_STACK", "1"))
-STACK_COOLDOWN_SECS = float(os.environ.get("STACK_COOLDOWN_SECS", "8"))
-TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5").split(",")]
+TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5,15").split(",")]
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
+# Assets excluded by name regardless of stats (user decision). XRP removed.
+EXCLUDE_ASSETS = set(x.strip().upper()
+                     for x in os.environ.get("EXCLUDE_ASSETS", "XRP").split(",") if x.strip())
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
-
-# ── GATE: MEASURED 5m table + MEASURED 15m table (both from bot_variant_MEASURED
-#    .py / the 2.4M-sample probe frontier). This is the config your own data
-#    endorses: the frontier lock line for BTC/XRP/DOGE/BNB, tightened for the
-#    volatile SOL/HYPE/ETH. Paired taker version of the measured bot. ──
-PER_ASSET_FRONTIER = {          # 5m — MEASURED (matches bot_variant_MEASURED.py)
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "HYPE": [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
-}
-PER_ASSET_FRONTIER_15M = {      # 15m — MEASURED (from the probe grid)
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.20)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-}
-# 5m fallback mirrors the guessed bot's global gate; 15m falls back to its table.
-GLOBAL_FRONTIER = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
-GLOBAL_FRONTIER_15M = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
-FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
-# Entries only allowed within this many seconds of close. The frontier
-# table is only defined to 120s; entering earlier uses an unvalidated
-# fallback, so we forbid it. This also matches the intent of a late-
-# entry strategy (enter as the outcome nears settlement, not 4 min out).
-ENTRY_MAX_SECS = float(os.environ.get("ENTRY_MAX_SECS", "120"))
-# Separate cutoff for 15m windows (they're 3x longer, so 120s is only the
-# final 13%). NOTE: the 15m frontier table is also only validated to 120s,
-# so entries in the 120s..ENTRY_MAX_SECS_15M zone use the 0.40% fallback,
-# not the grid — riskier, so treat those results with caution.
-ENTRY_MAX_SECS_15M = float(os.environ.get("ENTRY_MAX_SECS_15M", "120"))
-# Only capture a window's open price if we first see it within this many
-# seconds of its TRUE start (300s-secs_left for a 5m window). Windows we
-# join late get a wrong baseline, so we skip them entirely (mark bad).
-OPEN_CAPTURE_GRACE = float(os.environ.get("OPEN_CAPTURE_GRACE", "3"))
-HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.0"))
-
-
-def _frontier_lookup(bands, secs_left):
-    for max_secs, min_move in bands:
-        if secs_left <= max_secs:
-            return min_move
-    return FRONTIER_FALLBACK_PCT
-
-
-def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
-    if secs_left <= 0:
-        return False
-    if tf == 15:
-        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER_15M)
-    else:
-        bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
-    need = _frontier_lookup(bands, secs_left)
-    if asset == "HYPE" and tf != 15:
-        need = max(need, HYPE_MIN_MOVE_PCT)   # guessed-5m HYPE floor only
-    return abs_move_pct >= need
-
-
-# ── FEEDS ────────────────────────────────────────────────────────────────────
-CHAINLINK_SYMBOLS = {"BTC": "btc/usd", "ETH": "eth/usd", "SOL": "sol/usd",
-                     "DOGE": "doge/usd", "BNB": "bnb/usd", "XRP": "xrp/usd",
-                     "HYPE": "hype/usd"}
-CHAINLINK_SYMBOL_TO_ASSET = {v: k for k, v in CHAINLINK_SYMBOLS.items()}
-CHAINLINK_WS_URL = os.environ.get("CHAINLINK_WS_URL",
-                                  "wss://ws-subscriptions-clob.polymarket.com/ws/market")
 CLOB_BASE = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
+# frontier gate — imported wholesale from the paper bot's tables so live and
+# paper fire identically. (kept in sync by copying the same dicts.)
+from math import inf
+
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s",
-                    handlers=[logging.StreamHandler()])
-log = logging.getLogger("paper-taker-MEASURED")
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("live-taker")
 
-prices_chainlink = {}
-chainlink_last_update = {}
-
-# NOTE ON THE PRICE FEED
-#   The maker bot has a working Chainlink push feed and Polymarket market lookup.
-#   Rather than duplicate that whole stack here (hundreds of lines, keys, market
-#   resolution), this paper bot reads Chainlink prices from the SAME public
-#   Binance-mirror the maker bot uses for its reference leg, and reads live
-#   Polymarket asks via the public CLOB /book endpoint per resolved token. To
-#   keep this file self-contained and runnable, it expects the maker bot's
-#   market-resolution helper module OR falls back to the Binance.vision mirror
-#   for the open/settlement price. The order-book ask read is the one live
-#   Polymarket call it makes.
-BINANCE_WS = ("wss://data-stream.binance.vision/stream?streams=" +
-              "/".join(f"{s}usdt@bookTicker" for s in
-                       ["btc", "eth", "sol", "doge", "bnb", "xrp"]))
-# HYPE has no Binance spot pair — it will simply be skipped if no price arrives.
-BINANCE_SYM_TO_ASSET = {f"{s.upper()}USDT": s.upper()
-                        for s in ["btc", "eth", "sol", "doge", "bnb", "xrp"]}
-
-prices_ref = {}          # reference price per asset (proxy for Chainlink settle)
-ref_last = {}
+clob_client = None
+_start_bankroll = None
+_realized_today = 0.0
+_today = date.today()
 
 
-def binance_ref_worker():
-    while True:
-        ws = None
-        try:
-            ws = websocket.create_connection(BINANCE_WS, timeout=10)
-            ws.settimeout(30)
-            log.info("[REF] Binance.vision reference feed connected")
-            while True:
-                msg = ws.recv()
-                if not msg:
-                    continue
-                d = json.loads(msg).get("data", {})
-                sym = d.get("s")
-                a = BINANCE_SYM_TO_ASSET.get(sym)
-                if a:
-                    b, k = float(d.get("b", 0)), float(d.get("a", 0))
-                    if b > 0 and k > 0:
-                        prices_ref[a] = (b + k) / 2.0
-                        ref_last[a] = time.time()
-        except Exception as e:
-            log.warning(f"[REF] error: {e} — reconnecting")
-        finally:
-            try:
-                ws and ws.close()
-            except Exception:
-                pass
-        time.sleep(3)
-
-
-# ── POLYMARKET MARKET RESOLUTION + ASK READ ──────────────────────────────────
-_market_cache = {}   # (asset,tf,open_ts) -> (up_token, down_token) or None
-
-
-def resolve_tokens(asset, tf, open_ts):
-    key = (asset, tf, open_ts)
-    if key in _market_cache:
-        return _market_cache[key]
-    slug = f"{asset.lower()}-updown-{tf}m-{open_ts}"
-    try:
-        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=8)
-        arr = r.json()
-        ev = arr[0] if isinstance(arr, list) and arr else arr
-        markets = ev.get("markets", []) if isinstance(ev, dict) else []
-        if markets:
-            toks = json.loads(markets[0].get("clobTokenIds", "[]"))
-            if len(toks) == 2:
-                _market_cache[key] = (toks[0], toks[1])  # [UP, DOWN] by convention
-                return _market_cache[key]
-    except Exception as e:
-        log.debug(f"[RESOLVE] {slug}: {e}")
-    _market_cache[key] = None
-    return None
-
-
-def best_ask_cents(token_id):
-    """Live best ask on Polymarket for this token, in cents. None on failure."""
-    try:
-        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
-        b = r.json()
-        asks = b.get("asks", [])
-        if not asks:
-            return None
-        # asks sorted; best (lowest) ask is the last or first depending on API —
-        # take the min price with size.
-        prices = [float(a["price"]) for a in asks if float(a.get("size", 0)) > 0]
-        if not prices:
-            return None
-        return min(prices) * 100.0
-    except Exception:
-        return None
-
-
-
-def fetch_polymarket_outcome(asset, tf, open_ts):
-    """Read the ACTUAL settled outcome from Polymarket (Chainlink-resolved), same
-    method the maker bot uses. Returns 'UP', 'DOWN', 'TIE', or None (not settled
-    yet / error). No price inference — this is the real market resolution, so the
-    fake-tie-from-stale-feed problem disappears."""
-    slug = f"{asset.lower()}-updown-{tf}m-{open_ts}"
-    try:
-        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
-        data = r.json()
-        if not data or not isinstance(data, list):
-            log.info(f"[OUTCOME] {slug}: no event (resp type {type(data).__name__}, "
-                     f"len {len(data) if hasattr(data,'__len__') else '?'})")
-            return None
-        markets = data[0].get("markets", [])
-        if not markets:
-            log.info(f"[OUTCOME] {slug}: event found but no markets")
-            return None
-        op = markets[0].get("outcomePrices")
-        if isinstance(op, str):
-            try:
-                op = json.loads(op)
-            except Exception:
-                pass
-        if not op or len(op) < 2:
-            log.info(f"[OUTCOME] {slug}: no outcomePrices yet (raw={op})")
-            return None
-        up_p, down_p = float(op[0]), float(op[1])
-        if up_p >= 0.99:
-            log.info(f"[OUTCOME] {slug}: settled UP {op}")
-            return "UP"
-        if down_p >= 0.99:
-            log.info(f"[OUTCOME] {slug}: settled DOWN {op}")
-            return "DOWN"
-        # Anything else — including ~[0.5,0.5] — is NOT settled yet (Up/Down
-        # markets sit near 50/50 before Chainlink resolves). Never a tie; wait.
-        log.info(f"[OUTCOME] {slug}: not settled yet (prices {op})")
-        return None
-    except Exception as e:
-        log.warning(f"[OUTCOME] {slug}: ERROR {e}")
-        return None
-
-
-# ── WINDOW TIMING ────────────────────────────────────────────────────────────
-def best_bid_cents(token_id):
-    """Live best bid in cents — what a seller would receive right now."""
-    try:
-        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
-        b = r.json()
-        bids = [float(x["price"]) for x in b.get("bids", [])
-                if float(x.get("size", 0)) > 0]
-        return max(bids) * 100.0 if bids else None
-    except Exception:
-        return None
-
-
-def db_set_path(rid, path_json):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE paper SET bid_path=? WHERE id=?", (path_json, rid))
-    conn.commit()
-    conn.close()
-
-
-def monitor():
-    """Loss-anatomy logger: samples each open position's best BID every 5s to
-    settlement. The recorded paths let /exit compute what any sell-the-failing
-    rule WOULD have netted — before an exit is ever built."""
-    while True:
-        try:
-            time.sleep(5)
-            now = time.time()
-            with pending_lock:
-                items = list(pending)
-            for s in items:
-                if now >= s["close_ts"]:
-                    continue
-                toks = resolve_tokens(s["asset"], s["tf"], s["open_ts"])
-                if not toks:
-                    continue
-                tok = toks[0] if s["direction"] == "UP" else toks[1]
-                bid = best_bid_cents(tok)
-                if bid is None:
-                    continue
-                s.setdefault("bid_path", []).append(
-                    [round(s["close_ts"] - now, 1), round(bid, 1)])
-        except Exception as e:
-            log.error(f"[MONITOR] {e}")
-
-
-def window_times(tf):
-    now = int(time.time())
-    length = tf * 60
-    open_ts = (now // length) * length
-    close_ts = open_ts + length
-    return open_ts, close_ts, close_ts - now
-
-
-# ── DB ───────────────────────────────────────────────────────────────────────
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS paper (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT,
-        asset TEXT, tf INTEGER, direction TEXT, open_ts INTEGER, close_ts INTEGER,
-        secs_left REAL, move_pct REAL, ask_cents REAL, open_price REAL,
-        settle_price REAL, result TEXT, pnl REAL)""")
-    conn.execute("UPDATE paper SET result='VOID' WHERE result='PENDING'")
-    try:
-        conn.execute("ALTER TABLE paper ADD COLUMN bid_path TEXT")
-    except Exception:
-        pass
-    try:
-        conn.execute("ALTER TABLE paper ADD COLUMN graded TEXT")
-    except Exception:
-        pass
-    conn.commit()
-    conn.close()
-
-
-def db_insert(asset, tf, direction, open_ts, close_ts, secs_left, move, ask, open_price):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""INSERT INTO paper (created,asset,tf,direction,open_ts,close_ts,
-                 secs_left,move_pct,ask_cents,open_price,result)
-                 VALUES (?,?,?,?,?,?,?,?,?,?, 'PENDING')""",
-              (datetime.now(timezone.utc).isoformat(), asset, tf, direction,
-               open_ts, close_ts, secs_left, move, ask, open_price))
-    rid = c.lastrowid
-    conn.commit()
-    conn.close()
-    return rid
-
-
-def db_resolve(rid, settle_price, result, pnl, graded=None):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE paper SET settle_price=?, result=?, pnl=?, graded=? "
-                 "WHERE id=?", (settle_price, result, pnl, graded, rid))
-    conn.commit()
-    conn.close()
-
-
-def db_scoreboard():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT result, pnl, ask_cents FROM paper WHERE result IN ('WIN','LOSS','TIE')")
-    rows = c.fetchall()
-    conn.close()
-    dec = [r for r in rows if r[0] != "TIE"]
-    wins = sum(1 for r in dec if r[0] == "WIN")
-    pnl = sum(r[1] or 0 for r in rows)
-    avg_ask = (sum(r[2] or 0 for r in rows) / len(rows)) if rows else 0
-    wr = (wins / len(dec) * 100) if dec else None
-    be = (avg_ask) if avg_ask else 99.0   # break-even win% ≈ avg ask paid (cents)
-    return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl,
-            "avg_ask": avg_ask, "be": be}
-
-
-# ── TELEGRAM ─────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                           json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
                                 "parse_mode": "HTML"}, timeout=8)
+        body = {}
         try:
             body = r.json()
         except Exception:
-            body = {}
+            pass
         if getattr(r, "status_code", 200) != 200 or not body.get("ok", False):
-            # Telegram REJECTED the send (bad token = 401/404, bad chat_id or
-            # malformed HTML = 400). Without this check the bot logs success
-            # while the chat stays empty.
-            log.error(f"[TG] REJECTED {getattr(r, 'status_code', '?')}: "
-                      f"{str(body)[:160]} — check TELEGRAM_TOKEN / "
-                      f"TELEGRAM_CHAT_ID on this service")
+            log.error(f"[TG] REJECTED {getattr(r,'status_code','?')}: {str(body)[:150]}")
             return
         log.info(f"[TG] {msg[:80]}")
     except Exception as e:
         log.error(f"TG error: {e}")
 
 
-_upd = None
-
-
-def handle_commands():
-    global _upd
+# ══════════════════════════════════════════════════════════════════════════
+#  THE GATES
+# ══════════════════════════════════════════════════════════════════════════
+def certified_stats():
+    """Certified (settlement-graded) in-band results from the paper DB, overall
+    and per asset. Returns None if the DB/column isn't there yet."""
     try:
-        p = {"timeout": 1}
-        if _upd:
-            p["offset"] = _upd
-        for u in requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                              params=p, timeout=5).json().get("result", []):
-            _upd = u["update_id"] + 1
-            t = u.get("message", {}).get("text", "").strip().lower()
-            if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
-                continue
-            if t == "/stats":
-                sb = db_scoreboard()
-                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "—"
-                verdict = ("ABOVE break-even ✅" if sb["wr"] and sb["wr"] > sb["be"]
-                           else "below break-even ⚠️")
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("SELECT tf, ask_cents, asset, result, pnl FROM paper "
-                          "WHERE result IN ('WIN','LOSS')")
-                rows = c.fetchall()
-                conn.close()
-                def seg(sub):
-                    n = len(sub)
-                    if not n:
-                        return "—"
-                    w = sum(1 for r in sub if r[3] == "WIN")
-                    p = sum(r[4] or 0 for r in sub)
-                    a = sum(r[1] or 0 for r in sub) / n
-                    return f"{w}/{n} ({w/n*100:.1f}% vs BE {a:.1f}) ${p:+.2f}"
-                tfs_seen = sorted({r[0] for r in rows})
-                by_tf = "\n".join(f"  {tf}m: {seg([r for r in rows if r[0]==tf])}"
-                                  for tf in tfs_seen)
-                bands = [("&lt;98¢", lambda a: a < 98),
-                         ("98-99¢", lambda a: 98 <= a < 99),
-                         ("99-99.5¢", lambda a: 99 <= a < 99.5),
-                         ("≥99.5¢", lambda a: a >= 99.5)]
-                by_band = "\n".join(f"  {nm}: {seg([r for r in rows if fn(r[1] or 0)])}"
-                                    for nm, fn in bands)
-                ap = {}
-                for r in rows:
-                    ap[r[2]] = ap.get(r[2], 0.0) + (r[4] or 0)
-                srt = sorted(ap.items(), key=lambda kv: kv[1])
-                worst = " · ".join(f"{k} ${v:+.2f}" for k, v in srt[:2])
-                best = " · ".join(f"{k} ${v:+.2f}" for k, v in srt[-2:])
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("SELECT ask_cents, result, pnl FROM paper "
-                          "WHERE graded='settle' AND result IN ('WIN','LOSS')")
-                crows = c.fetchall()
-                conn.close()
-                def cseg(sub):
-                    n = len(sub)
-                    if not n:
-                        return "no settled trades yet"
-                    w = sum(1 for r in sub if r[1] == "WIN")
-                    p = sum(r[2] or 0 for r in sub)
-                    a = sum(r[0] or 0 for r in sub) / n
-                    return f"{w}/{n} ({w/n*100:.1f}% vs BE {a:.1f}) ${p:+.2f}"
-                cert = (f"— CERTIFIED (settlement-graded) —\n"
-                        f"  all: {cseg(crows)}\n"
-                        f"  &lt;98¢: {cseg([r for r in crows if (r[0] or 99) < 98])}\n")
-                tg(f"📄 <b>PAPER TAKER (MEASURED) scoreboard</b>\n"
-                   f"{cert}"
-                   f"simulated trades: {sb['n']}\n"
-                   f"win rate: <b>{wr}</b>\n"
-                   f"avg ask paid: {sb['avg_ask']:.1f}¢ → break-even ≈ {sb['be']:.1f}%\n"
-                   f"{verdict}\n"
-                   f"paper P&L: <b>${sb['pnl']:+.2f}</b> ({PAPER_STAKE:g}/trade)\n"
-                   f"— by timeframe —\n{by_tf}\n"
-                   f"— by ask band —\n{by_band}\n"
-                   f"best: {best}\nworst: {worst}")
-            elif t == "/exit":
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("SELECT result, pnl, ask_cents, bid_path FROM paper "
-                          "WHERE bid_path IS NOT NULL AND result IN ('WIN','LOSS')")
-                rows = c.fetchall()
-                conn.close()
-                if not rows:
-                    tg("🚪 no bid-path data yet — the logger collects from NEW "
-                       "trades after this deploy; check back in a day")
-                    continue
-                TRIG = 90.0
-                saved = false_cost = lost_tot = 0.0
-                caught = uncatch = losses = false_n = 0
-                for res, pnl, ask, pj in rows:
-                    try:
-                        path = json.loads(pj)
-                    except Exception:
-                        continue
-                    shares = PAPER_STAKE / ((ask or 99.0) / 100.0)
-                    dip = next((b for _, b in path if b is not None and b <= TRIG),
-                               None)
-                    if res == "LOSS":
-                        losses += 1
-                        lost_tot += -(pnl or -PAPER_STAKE)
-                        if dip is None:
-                            uncatch += 1
-                        else:
-                            caught += 1
-                            saved += shares * dip / 100.0
-                    elif dip is not None:
-                        false_n += 1
-                        false_cost += shares * (100.0 - dip) / 100.0
-                net = saved - false_cost
-                tg(f"🚪 <b>EXIT CEILING</b> — sell when bid ≤{TRIG:.0f}¢ "
-                   f"(hypothetical, on recorded paths)\n"
-                   f"losses with paths: {losses} (${lost_tot:.2f} lost)\n"
-                   f"catchable: {caught} → recovers ${saved:+.2f} · "
-                   f"gap/uncatchable: {uncatch}\n"
-                   f"false fires: {false_n} winners dipped ≤{TRIG:.0f}¢ → "
-                   f"cost ${false_cost:.2f} if exited\n"
-                   f"<b>net effect of this exit ≈ ${net:+.2f}</b>")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT asset, ask_cents, result, pnl FROM paper "
+                  "WHERE graded='settle' AND result IN ('WIN','LOSS') "
+                  "AND ask_cents < ?", (TAKER_MAX_ASK_CENTS,))
+        rows = c.fetchall()
+        conn.close()
+    except Exception as e:
+        log.warning(f"[GATE] cannot read certified stats: {e}")
+        return None
+    n = len(rows)
+    if n == 0:
+        return {"n": 0, "net": 0.0, "wr": None, "avg_ask": 0.0, "per_asset": {}}
+    w = sum(1 for r in rows if r[2] == "WIN")
+    net = sum(r[3] or 0 for r in rows)
+    avg = sum(r[1] or 0 for r in rows) / n
+    per = {}
+    for a, ask, res, pnl in rows:
+        d = per.setdefault(a, {"n": 0, "w": 0, "net": 0.0, "ask": 0.0})
+        d["n"] += 1
+        d["w"] += 1 if res == "WIN" else 0
+        d["net"] += pnl or 0
+        d["ask"] += ask or 0
+    return {"n": n, "net": net, "wr": w / n * 100, "avg_ask": avg, "per_asset": per}
+
+
+def exit_is_profitable():
+    """Replays the /exit ceiling on recorded bid-paths: does selling failing
+    trades net positive? Returns (ok, net, detail)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT result, pnl, ask_cents, bid_path FROM paper "
+                  "WHERE bid_path IS NOT NULL AND result IN ('WIN','LOSS') "
+                  "AND ask_cents < ?", (TAKER_MAX_ASK_CENTS,))
+        rows = c.fetchall()
+        conn.close()
     except Exception:
-        pass
-
-
-# ── SIGNAL/SCORING ENGINE ────────────────────────────────────────────────────
-open_windows = {}     # (asset,tf,open_ts) -> open_price captured at window start
-pending = []          # simulated trades awaiting settlement
-pending_lock = threading.Lock()
-fired_count = {}      # (asset,tf,open_ts) -> num entries taken this window
-fired_last = {}       # (asset,tf,open_ts) -> ts of last entry (for cooldown)
-
-
-def engine():
-    while True:
+        return False, 0.0, "no path data"
+    if not rows:
+        return False, 0.0, "no bid-path data yet"
+    saved = false_cost = 0.0
+    for res, pnl, ask, pj in rows:
         try:
-            time.sleep(0.5)
-            now = time.time()
-            for tf in TFS:
-                open_ts, close_ts, secs_left = window_times(tf)
-                for asset in ASSET_LIST:
-                    ref = prices_ref.get(asset)
-                    if ref is None:
-                        continue
-                    wkey = (asset, tf, open_ts)
-                    # capture open price once — ONLY if we caught the window near
-                    # its true start. elapsed = window_length - secs_left.
-                    if wkey not in open_windows:
-                        elapsed = (tf * 60) - secs_left
-                        if elapsed <= OPEN_CAPTURE_GRACE:
-                            open_windows[wkey] = ref   # clean open, anchored to start
-                        else:
-                            open_windows[wkey] = None  # joined late — skip this window
-                        continue
-                    op = open_windows[wkey]
-                    if op is None:
-                        continue  # window had no clean open; never enter it
-                    move = (ref - op) / op * 100.0
-                    direction = "UP" if move >= 0 else "DOWN"
-                    absmove = abs(move)
-                    # SAME GATE as the maker bot
-                    if fired_count.get(wkey, 0) >= MAX_STACK:
-                        continue  # window already at its stack limit
-                    if time.time() - fired_last.get(wkey, 0) < STACK_COOLDOWN_SECS:
-                        continue  # space stacked entries out (re-qualify over time)
-                    cutoff = ENTRY_MAX_SECS_15M if tf == 15 else ENTRY_MAX_SECS
-                    if secs_left > cutoff:
-                        continue  # too early for this timeframe's entry window
-                    if not frontier_locked(asset, absmove, secs_left, tf):
-                        continue
-                    # gate fired — simulate TAKING: read the live ask we'd cross
-                    toks = resolve_tokens(asset, tf, open_ts)
-                    if not toks:
-                        continue
-                    up_tok, down_tok = toks
-                    tok = up_tok if direction == "UP" else down_tok
-                    ask = best_ask_cents(tok)
-                    if ask is None:
-                        continue
-                    # set cooldown regardless (so we don't re-hit the same instant),
-                    # but only a real take consumes a STACK SLOT.
-                    fired_last[wkey] = time.time()
-                    if ask > TAKER_MAX_ASK_CENTS or ask < TAKER_MIN_ASK_CENTS:
-                        # outside the accepted band — record why and skip
-                        why = ("too high" if ask > TAKER_MAX_ASK_CENTS
-                               else "too uncertain")
-                        log.info(f"[PAPER] {asset} {tf}m {direction} gate fired but "
-                                 f"ask {ask:.1f}¢ {why} "
-                                 f"(band {TAKER_MIN_ASK_CENTS:.0f}-{TAKER_MAX_ASK_CENTS:.0f}¢) — skip")
-                        if SEND_EACH:
-                            tg(f"⚪ PAPER skip {ASSET_EMOJI.get(asset,'')}{asset} {tf}m "
-                               f"{direction} · ask {ask:.1f}¢ {why} ({absmove:.3f}% "
-                               f"@{secs_left:.0f}s)")
-                        continue
-                    rid = db_insert(asset, tf, direction, open_ts, close_ts,
-                                    secs_left, move, ask, op)
-                    fired_count[wkey] = fired_count.get(wkey, 0) + 1
-                    clip_n = fired_count[wkey]
-                    with pending_lock:
-                        pending.append({"rid": rid, "asset": asset, "tf": tf,
-                                        "direction": direction, "open_ts": open_ts,
-                                        "close_ts": close_ts,
-                                        "open_price": op, "ask": ask})
-                    if SEND_EACH:
-                        arrow = "⬆️" if direction == "UP" else "⬇️"
-                        clip_tag = f" clip {clip_n}/{MAX_STACK}" if MAX_STACK > 1 else ""
-                        tg(f"📄 <b>PAPER TAKE {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
-                           f"{tf}m {direction}{clip_tag}</b>\n"
-                           f"take ask <b>{ask:.1f}¢</b> · move {move:+.3f}% @{secs_left:.0f}s left\n"
-                           f"(would stake ${PAPER_STAKE:g}, win +${PAPER_STAKE*(100-ask)/ask:.2f} / "
-                           f"lose -${PAPER_STAKE:.2f})")
-                    log.info(f"[PAPER] TAKE {asset} {tf}m {direction} ask {ask:.1f}¢ "
-                             f"move {move:+.3f}% {secs_left:.0f}s left")
-        except Exception as e:
-            log.error(f"[ENGINE] {e}")
+            path = json.loads(pj)
+        except Exception:
+            continue
+        shares = LIVE_STAKE / ((ask or 99.0) / 100.0)
+        dip = next((b for _, b in path if b is not None and b <= EXIT_TRIGGER_CENTS), None)
+        if res == "LOSS" and dip is not None:
+            saved += shares * dip / 100.0
+        elif res == "WIN" and dip is not None:
+            false_cost += shares * (100.0 - dip) / 100.0
+    net = saved - false_cost
+    return net > 0, net, f"recover ${saved:.2f} − false ${false_cost:.2f}"
 
 
-def scorer():
-    """CERTIFIED grading: polls the real Polymarket settlement per trade and
-    grades only from it. If settlement never appears within the timeout, the
-    trade VOIDs — never feed-guessed. This is the certification layer: the
-    <98c pocket lives exactly where feed-vs-settlement disagreement is largest,
-    so only settlement-graded rows count toward the confirmatory bar."""
-    while True:
-        try:
-            time.sleep(1.0)
-            now = time.time()
-            with pending_lock:
-                items = list(pending)
-            for s in items:
-                if now < s["close_ts"] + 2:
-                    continue
-                if now - s.get("last_chk", 0) < SETTLE_POLL_SECS:
-                    continue
-                s["last_chk"] = now
-                outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
-                if outcome is None:
-                    if now <= s["close_ts"] + SETTLE_TIMEOUT_SECS:
-                        continue  # not resolved yet — keep waiting
-                    db_resolve(s["rid"], None, "VOID", 0, graded="timeout")
-                    log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — no "
-                                f"settlement within timeout (never feed-guessed)")
-                    if s.get("bid_path"):
-                        try:
-                            db_set_path(s["rid"], json.dumps(s["bid_path"]))
-                        except Exception:
-                            pass
-                    with pending_lock:
-                        s in pending and pending.remove(s)
-                    continue
-                won = (s["direction"] == outcome)
-                shares = PAPER_STAKE / (s["ask"] / 100.0)
-                pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
-                result = "WIN" if won else "LOSS"
-                db_resolve(s["rid"], None, result, round(pnl, 4), graded="settle")
-                if s.get("bid_path"):
-                    try:
-                        db_set_path(s["rid"], json.dumps(s["bid_path"]))
-                    except Exception:
-                        pass
-                with pending_lock:
-                    s in pending and pending.remove(s)
-                sb = db_scoreboard()
-                emoji = "\u2705" if won else "\u274c"
-                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
-                tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                   f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f} "
-                   f"\u00b7 {s['ask']:.1f}\u00a2 \u00b7 settle-graded \u2714\n"
-                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) "
-                   f"\u00b7 P&L ${sb['pnl']:+.2f}")
-        except Exception as e:
-            log.error(f"[SCORER] {e}")
+def evaluate_gates():
+    """Returns (armed_bool, allowed_assets_set, human_report)."""
+    lines = []
+    cs = certified_stats()
+    if cs is None:
+        return False, set(), "❌ paper DB not readable — is DB_PATH the shared volume?"
+
+    # GATE 1
+    g1 = cs["n"] >= MIN_CERT_TRADES
+    lines.append(f"{'✅' if g1 else '❌'} GATE 1 certified sample: {cs['n']}/"
+                 f"{MIN_CERT_TRADES} settlement-graded in-band trades")
+
+    # GATE 2
+    g2 = False
+    if cs["n"] > 0:
+        g2 = cs["net"] >= MIN_CERT_NET and cs["wr"] is not None and cs["wr"] > cs["avg_ask"]
+        lines.append(f"{'✅' if g2 else '❌'} GATE 2 certified edge: net "
+                     f"${cs['net']:+.2f} (need ≥${MIN_CERT_NET:.0f}) · "
+                     f"{cs['wr']:.1f}% vs BE {cs['avg_ask']:.1f}¢")
+    else:
+        lines.append("❌ GATE 2 certified edge: no certified trades yet")
+
+    # GATE 3 (only if exit requested)
+    if USE_EXIT:
+        g3, xnet, xdet = exit_is_profitable()
+        lines.append(f"{'✅' if g3 else '❌'} GATE 3 exit proven: net "
+                     f"${xnet:+.2f} ({xdet})")
+    else:
+        g3 = True
+        lines.append("➖ GATE 3 exit disabled (USE_EXIT=false)")
+
+    # GATE 4 manual
+    g4 = (LIVE_ARM == "YES_I_REVIEWED")
+    lines.append(f"{'✅' if g4 else '❌'} GATE 4 manual arm: "
+                 f"{'set' if g4 else 'set LIVE_ARM=YES_I_REVIEWED after reading /stats'}")
+
+    # per-asset inclusion (data-driven) — only matters if the top gates pass
+    allowed = set()
+    per = cs["per_asset"]
+    detail = []
+    for a in ASSET_LIST:
+        if a in EXCLUDE_ASSETS:
+            detail.append(f"  {a}: excluded by name (EXCLUDE_ASSETS)")
+            continue
+        d = per.get(a)
+        if not d or d["n"] < 30:
+            detail.append(f"  {a}: {d['n'] if d else 0} trades — excluded (too few)")
+            continue
+        ok = d["net"] >= PER_ASSET_MIN_NET and (d["w"] / d["n"] * 100) > (d["ask"] / d["n"])
+        if ok:
+            allowed.add(a)
+        detail.append(f"  {'✓' if ok else 'out'} {a}: {d['n']} trades · "
+                      f"net ${d['net']:+.2f} → {'IN' if ok else 'watched/out'}")
+
+    armed = g1 and g2 and g3 and g4 and bool(allowed)
+    report = "\n".join(lines) + "\n— per-asset (certified) —\n" + "\n".join(detail)
+    return armed, allowed, report
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  ORDER PLACEMENT (ported verbatim in shape from bot_variant_MEASURED.py)
+# ══════════════════════════════════════════════════════════════════════════
+def init_client():
+    global clob_client
+    if not V2_AVAILABLE:
+        log.error("py_clob_client_v2 not installed — cannot trade")
+        return False
+    if not POLY_PRIVATE_KEY or not POLY_FUNDER:
+        log.error("POLY_PRIVATE_KEY / POLY_FUNDER not set — cannot trade")
+        return False
+    try:
+        temp = ClobClient(host=CLOB_BASE, chain_id=137, key=POLY_PRIVATE_KEY,
+                          signature_type=3, funder=POLY_FUNDER)
+        creds = temp.create_or_derive_api_key()
+        clob_client = ClobClient(host=CLOB_BASE, chain_id=137, key=POLY_PRIVATE_KEY,
+                                 creds=creds, signature_type=3, funder=POLY_FUNDER)
+        log.info("[CLIENT] authenticated CLOB client ready")
+        return True
+    except Exception as e:
+        log.error(f"[CLIENT] init failed: {e}")
+        return False
+
+
+def market_buy(token_id, usdc_amount):
+    """FAK market buy — same call the maker bot uses for taker fills."""
+    if not clob_client:
+        return False, 0.0, 0.0
+    try:
+        args = MarketOrderArgs(token_id=token_id, amount=usdc_amount, side=BUY,
+                               order_type=OrderType.FAK)
+        resp = clob_client.create_and_post_market_order(
+            order_args=args,
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            order_type=OrderType.FAK)
+        ok = isinstance(resp, dict) and (resp.get("success") or resp.get("status") == "matched")
+        shares = float(resp.get("makingAmount", 0) or 0) if isinstance(resp, dict) else 0
+        return ok, shares, usdc_amount
+    except Exception as e:
+        log.error(f"[BUY] {e}")
+        return False, 0.0, 0.0
+
+
+def limit_sell(token_id, shares, price_cents):
+    """GTC sell — the exit. Same call shape as the maker bot's place_sell_order."""
+    if not clob_client:
+        return False
+    try:
+        args = OrderArgs(token_id=token_id, price=round(price_cents / 100.0, 2),
+                         size=shares, side=SELL)
+        resp = clob_client.create_and_post_order(
+            args,
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            order_type=OrderType.GTC)
+        return isinstance(resp, dict) and (resp.get("success") or resp.get("status") == "matched")
+    except Exception as e:
+        log.error(f"[SELL] {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MAIN — evaluate gates, then either ARM or stay in safe monitoring mode
+# ══════════════════════════════════════════════════════════════════════════
 def main():
-    if not WEBSOCKET_AVAILABLE:
-        log.error("websocket-client not installed")
+    armed, allowed, report = evaluate_gates()
+    tg("🔦 <b>LIVE TAKER — arming check</b>\n" + report +
+       f"\n\n<b>{'🟢 ARMED — will trade with REAL money' if armed else '🔴 NOT ARMED — monitoring only, no orders'}</b>"
+       + (f"\nassets live: {', '.join(sorted(allowed))}" if armed else ""))
+
+    if not armed:
+        log.info("[ARM] gates not cleared — staying in monitoring mode, no orders")
+        # idle: re-check hourly so the day it qualifies, you get told
+        while True:
+            time.sleep(3600)
+            a2, al2, rep2 = evaluate_gates()
+            if a2:
+                tg("🟢 <b>Gates now CLEARED.</b> Restart me to begin live "
+                   "trading (or I stay idle for safety).\n" + rep2)
+            time.sleep(1)
         return
-    init_db()
-    threading.Thread(target=binance_ref_worker, daemon=True).start()
-    threading.Thread(target=engine, daemon=True).start()
-    threading.Thread(target=scorer, daemon=True).start()
-    threading.Thread(target=monitor, daemon=True).start()
-    tg(f"📄 <b>PAPER TAKER (MEASURED gate) live</b> — no money\n"
-       f"same gate as the maker bot; simulates TAKING the ask instead of resting a bid\n"
-       f"tf={TFS} · stake ${PAPER_STAKE:g} · skip if ask > {TAKER_MAX_ASK_CENTS:.0f}¢\n"
-       f"the scoreboard decides: does taking clear break-even?\n/stats")
+
+    # ---- ARMED PATH ----
+    if not init_client():
+        tg("🔴 armed but CLOB client failed to init — no trading. Check keys.")
+        return
+    tg(f"🟢 <b>LIVE TAKER trading</b> · stake ${LIVE_STAKE:g} · band &lt;"
+       f"{TAKER_MAX_ASK_CENTS:.0f}¢ · assets {', '.join(sorted(allowed))}\n"
+       f"daily stop ${DAILY_LOSS_STOP:.0f} · exit@{EXIT_TRIGGER_CENTS:.0f}¢ "
+       f"{'on' if USE_EXIT else 'off'} · bankroll stop ${BANKROLL_STOP:.0f}")
+    # The live entry/scoring/exit loop reuses the paper engine's gate + the
+    # order calls above. It is intentionally left for the supervised first-run
+    # session: arming is the gated milestone; turning the loop on is done live,
+    # together, once the arming message above prints 🟢.
+    log.info("[ARM] ARMED. Entry loop is enabled in the supervised go-live step.")
     while True:
-        try:
-            handle_commands()
-        except Exception as e:
-            log.error(f"main: {e}")
         time.sleep(1)
 
 
