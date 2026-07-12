@@ -59,6 +59,8 @@ TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "0"))
 DB_PATH          = os.environ.get("DB_PATH", "paper_taker.db")
 SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
 FAST_GRADE       = os.environ.get("FAST_GRADE", "true").lower() == "true"
+SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "20"))
+SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "900"))
 FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
 # Stacking: up to MAX_STACK entries per window (like the live maker bot,
 # which added clips as the move re-qualified). STACK_COOLDOWN_SECS spaces
@@ -358,6 +360,10 @@ def init_db():
         conn.execute("ALTER TABLE paper ADD COLUMN bid_path TEXT")
     except Exception:
         pass
+    try:
+        conn.execute("ALTER TABLE paper ADD COLUMN graded TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -376,10 +382,10 @@ def db_insert(asset, tf, direction, open_ts, close_ts, secs_left, move, ask, ope
     return rid
 
 
-def db_resolve(rid, settle_price, result, pnl):
+def db_resolve(rid, settle_price, result, pnl, graded=None):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE paper SET settle_price=?, result=?, pnl=? WHERE id=?",
-                 (settle_price, result, pnl, rid))
+    conn.execute("UPDATE paper SET settle_price=?, result=?, pnl=?, graded=? "
+                 "WHERE id=?", (settle_price, result, pnl, graded, rid))
     conn.commit()
     conn.close()
 
@@ -472,7 +478,25 @@ def handle_commands():
                 srt = sorted(ap.items(), key=lambda kv: kv[1])
                 worst = " · ".join(f"{k} ${v:+.2f}" for k, v in srt[:2])
                 best = " · ".join(f"{k} ${v:+.2f}" for k, v in srt[-2:])
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT ask_cents, result, pnl FROM paper "
+                          "WHERE graded='settle' AND result IN ('WIN','LOSS')")
+                crows = c.fetchall()
+                conn.close()
+                def cseg(sub):
+                    n = len(sub)
+                    if not n:
+                        return "no settled trades yet"
+                    w = sum(1 for r in sub if r[1] == "WIN")
+                    p = sum(r[2] or 0 for r in sub)
+                    a = sum(r[0] or 0 for r in sub) / n
+                    return f"{w}/{n} ({w/n*100:.1f}% vs BE {a:.1f}) ${p:+.2f}"
+                cert = (f"— CERTIFIED (settlement-graded) —\n"
+                        f"  all: {cseg(crows)}\n"
+                        f"  &lt;98¢: {cseg([r for r in crows if (r[0] or 99) < 98])}\n")
                 tg(f"📄 <b>PAPER TAKER (MEASURED) scoreboard</b>\n"
+                   f"{cert}"
                    f"simulated trades: {sb['n']}\n"
                    f"win rate: <b>{wr}</b>\n"
                    f"avg ask paid: {sb['avg_ask']:.1f}¢ → break-even ≈ {sb['be']:.1f}%\n"
@@ -620,43 +644,43 @@ def engine():
 
 
 def scorer():
-    """Grade off the reference feed at window close (~1s after). The feed tracks
-    the same price the market settles on, so close-vs-open direction IS the
-    outcome. No Polymarket settlement read (that field is trading price, not
-    resolution, and never cleanly flips). Waits up to 30s for a feed price at
-    close, else voids."""
+    """CERTIFIED grading: polls the real Polymarket settlement per trade and
+    grades only from it. If settlement never appears within the timeout, the
+    trade VOIDs — never feed-guessed. This is the certification layer: the
+    <98c pocket lives exactly where feed-vs-settlement disagreement is largest,
+    so only settlement-graded rows count toward the confirmatory bar."""
     while True:
         try:
-            time.sleep(0.5)
+            time.sleep(1.0)
             now = time.time()
             with pending_lock:
                 items = list(pending)
             for s in items:
-                if now < s["close_ts"]:
+                if now < s["close_ts"] + 2:
                     continue
-                settle = prices_ref.get(s["asset"])
-                op = s["open_price"]
-                if settle is None:
-                    if now > s["close_ts"] + 30:
-                        db_resolve(s["rid"], None, "VOID", 0)
-                        log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — no feed price at close")
-                        with pending_lock:
-                            s in pending and pending.remove(s)
+                if now - s.get("last_chk", 0) < SETTLE_POLL_SECS:
                     continue
-                move = (settle - op) / op * 100.0
-                if abs(move) < FAST_TIE_EPS_PCT:
-                    # essentially no move — wait a bit for the feed to tick off
-                    # the exact open; void only if it truly never moves.
-                    if now > s["close_ts"] + 30:
-                        db_resolve(s["rid"], None, "VOID", 0)
-                        with pending_lock:
-                            s in pending and pending.remove(s)
+                s["last_chk"] = now
+                outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
+                if outcome is None:
+                    if now <= s["close_ts"] + SETTLE_TIMEOUT_SECS:
+                        continue  # not resolved yet — keep waiting
+                    db_resolve(s["rid"], None, "VOID", 0, graded="timeout")
+                    log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — no "
+                                f"settlement within timeout (never feed-guessed)")
+                    if s.get("bid_path"):
+                        try:
+                            db_set_path(s["rid"], json.dumps(s["bid_path"]))
+                        except Exception:
+                            pass
+                    with pending_lock:
+                        s in pending and pending.remove(s)
                     continue
-                won = (s["direction"] == ("UP" if move > 0 else "DOWN"))
+                won = (s["direction"] == outcome)
                 shares = PAPER_STAKE / (s["ask"] / 100.0)
                 pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
                 result = "WIN" if won else "LOSS"
-                db_resolve(s["rid"], None, result, round(pnl, 4))
+                db_resolve(s["rid"], None, result, round(pnl, 4), graded="settle")
                 if s.get("bid_path"):
                     try:
                         db_set_path(s["rid"], json.dumps(s["bid_path"]))
@@ -665,14 +689,16 @@ def scorer():
                 with pending_lock:
                     s in pending and pending.remove(s)
                 sb = db_scoreboard()
-                emoji = "\u2705" if result == "WIN" else "\u274c"
+                emoji = "\u2705" if won else "\u274c"
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
                 tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                    f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f} "
-                   f"({move:+.3f}%)\n"
-                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
+                   f"\u00b7 {s['ask']:.1f}\u00a2 \u00b7 settle-graded \u2714\n"
+                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) "
+                   f"\u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
+
 
 def main():
     if not WEBSOCKET_AVAILABLE:
