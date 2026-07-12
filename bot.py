@@ -574,11 +574,13 @@ def handle_commands():
                            f"(funder {POLY_FUNDER[:10]}…)")
                         continue
                 # bal often returns raw units (USDC has 6 decimals)
+                log.info(f"[BALANCE] raw response: {bal}")
                 try:
                     raw = float(bal.get("balance", 0)) if isinstance(bal, dict) else float(bal)
                     usdc = raw / 1_000_000 if raw > 1000 else raw
                     tg(f"💰 <b>wallet balance</b>: ${usdc:.2f} USDC\n"
-                       f"(bankroll stop set at ${BANKROLL_STOP:g})")
+                       f"raw: <code>{str(bal)[:120]}</code>\n"
+                       f"funder: <code>{POLY_FUNDER}</code>")
                 except Exception:
                     tg(f"💰 wallet balance (raw): {bal}")
             elif t == "/stats":
