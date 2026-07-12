@@ -55,6 +55,7 @@ BANKROLL_STOP    = float(os.environ.get("BANKROLL_STOP", "15"))
 EXCLUDE_ASSETS   = set(x.strip().upper() for x in
                        os.environ.get("EXCLUDE_ASSETS", "XRP").split(",") if x.strip())
 EXIT_TRIGGER_CENTS = float(os.environ.get("EXIT_TRIGGER_CENTS", "0"))  # 0 = no exit
+EXIT_FLOOR_CENTS = float(os.environ.get("EXIT_FLOOR_CENTS", "50"))  # don't sell below this (gapped)
 _clob = None
 _live_realized = 0.0
 try:
@@ -381,12 +382,12 @@ def db_set_path(rid, path_json):
 
 
 def monitor():
-    """Loss-anatomy logger: samples each open position's best BID every 5s to
-    settlement. The recorded paths let /exit compute what any sell-the-failing
-    rule WOULD have netted — before an exit is ever built."""
+    """Samples each open position's best BID frequently — logs the path AND
+    fires the live exit the instant the bid crosses the trigger band. Runs at
+    1s (not 5s) so a fast move is caught near the trigger, not after it gaps."""
     while True:
         try:
-            time.sleep(5)
+            time.sleep(1)
             now = time.time()
             with pending_lock:
                 items = list(pending)
@@ -402,15 +403,26 @@ def monitor():
                     continue
                 s.setdefault("bid_path", []).append(
                     [round(s["close_ts"] - now, 1), round(bid, 1)])
-                # LIVE exit: sell the failing position if its bid hits the trigger
+                # LIVE exit: sell a failing position when its bid crosses the
+                # trigger — but only within a BAND. Below EXIT_FLOOR the bid has
+                # already gapped (selling there locks in a near-total loss), so
+                # hold to settlement instead. This cuts SMALL losses early
+                # without panic-dumping craters.
                 if (LIVE and EXIT_TRIGGER_CENTS > 0 and not s.get("exited")
-                        and bid <= EXIT_TRIGGER_CENTS):
+                        and EXIT_FLOOR_CENTS <= bid <= EXIT_TRIGGER_CENTS):
                     shares = LIVE_STAKE / (s["ask"] / 100.0)
                     if live_sell(s["token"], round(shares, 2), bid):
                         s["exited"] = True
                         tg(f"🔴 <b>LIVE EXIT {ASSET_EMOJI.get(s['asset'],'')}"
                            f"{s['asset']} {s['tf']}m</b> sold @{bid:.1f}¢ "
-                           f"(cut failing position)")
+                           f"(cut failing position, was {s['ask']:.0f}¢)")
+                    else:
+                        log.warning(f"[EXIT] sell failed {s['asset']} @{bid:.1f}¢")
+                elif (LIVE and EXIT_TRIGGER_CENTS > 0 and not s.get("exited")
+                      and bid < EXIT_FLOOR_CENTS):
+                    log.info(f"[EXIT] {s['asset']} bid {bid:.1f}¢ already below "
+                             f"floor {EXIT_FLOOR_CENTS:.0f}¢ — holding to settle "
+                             f"(gapped, selling would lock max loss)")
         except Exception as e:
             log.error(f"[MONITOR] {e}")
 
