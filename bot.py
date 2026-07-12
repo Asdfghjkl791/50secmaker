@@ -520,7 +520,30 @@ def handle_commands():
             t = u.get("message", {}).get("text", "").strip().lower()
             if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
-            if t == "/stats":
+            if t == "/status":
+                with pending_lock:
+                    nopen = len(pending)
+                mode = "🟢 LIVE" if (LIVE and _clob) else "📄 PAPER"
+                left = BANKROLL_STOP + _live_realized  # realized is <=0
+                tg(f"{mode} <b>status</b>\n"
+                   f"open positions: {nopen}\n"
+                   f"realized P&L today: ${_live_realized:+.2f}\n"
+                   f"bankroll left: ${max(0.0, left):.2f} / ${BANKROLL_STOP:g}\n"
+                   f"assets: {','.join(a for a in ASSET_LIST if a not in EXCLUDE_ASSETS)}\n"
+                   f"tf={TFS} · stake ${LIVE_STAKE:g} · "
+                   f"exit {'@'+str(int(EXIT_TRIGGER_CENTS))+'¢' if EXIT_TRIGGER_CENTS>0 else 'off'}")
+            elif t == "/balance":
+                if not (LIVE and _clob):
+                    tg("📄 paper mode — no real balance")
+                    continue
+                try:
+                    bal = _clob.get_balance_allowance(
+                        params=None) if hasattr(_clob, "get_balance_allowance") else None
+                    tg(f"💰 wallet balance: {bal}")
+                except Exception as e:
+                    tg(f"⚠️ couldn't fetch balance: {e}\n"
+                       f"(funder: {POLY_FUNDER[:10]}…)")
+            elif t == "/stats":
                 sb = db_scoreboard()
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "—"
                 verdict = ("ABOVE break-even ✅" if sb["wr"] and sb["wr"] > sb["be"]
@@ -783,9 +806,18 @@ def scorer():
                         s in pending and pending.remove(s)
                     continue
                 won = (s["direction"] == outcome)
-                shares = PAPER_STAKE / (s["ask"] / 100.0)
-                pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
+                stake = LIVE_STAKE if LIVE else PAPER_STAKE
+                shares = stake / (s["ask"] / 100.0)
+                if s.get("exited"):
+                    # position was sold early at the exit trigger — approximate
+                    # realized as the exit proceeds minus stake
+                    pnl = shares * (EXIT_TRIGGER_CENTS / 100.0) - stake
+                else:
+                    pnl = (shares * 1.0 - stake) if won else -stake
                 result = "WIN" if won else "LOSS"
+                if LIVE:
+                    global _live_realized
+                    _live_realized += pnl
                 db_resolve(s["rid"], None, result, round(pnl, 4), graded="settle")
                 if s.get("bid_path"):
                     try:
@@ -806,6 +838,34 @@ def scorer():
             log.error(f"[SCORER] {e}")
 
 
+def daily_summary():
+    """Posts a once-daily P&L recap."""
+    last_day = None
+    while True:
+        try:
+            time.sleep(60)
+            today = datetime.now(timezone.utc).date()
+            now = datetime.now(timezone.utc)
+            # fire once per day around 00:05 UTC
+            if now.hour == 0 and now.minute < 5 and last_day != today:
+                last_day = today
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT result, pnl FROM paper WHERE result IN "
+                          "('WIN','LOSS') AND date(created)=date('now','-1 day')")
+                rows = c.fetchall()
+                conn.close()
+                if rows:
+                    w = sum(1 for r in rows if r[0] == "WIN")
+                    p = sum(r[1] or 0 for r in rows)
+                    tg(f"📅 <b>Daily summary</b>\n"
+                       f"trades: {len(rows)} · wins: {w} · "
+                       f"P&L: ${p:+.2f}"
+                       + (f"\nrealized (live): ${_live_realized:+.2f}" if LIVE else ""))
+        except Exception as e:
+            log.error(f"[SUMMARY] {e}")
+
+
 def main():
     if not WEBSOCKET_AVAILABLE:
         log.error("websocket-client not installed")
@@ -818,6 +878,7 @@ def main():
     threading.Thread(target=engine, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
+    threading.Thread(target=daily_summary, daemon=True).start()
     if LIVE and live_ok:
         tg(f"🟢 <b>LIVE TRADER armed</b> — REAL money\n"
            f"stake ${LIVE_STAKE:g} · bankroll stop ${BANKROLL_STOP:g} · "
