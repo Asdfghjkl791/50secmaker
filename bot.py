@@ -292,6 +292,51 @@ def fetch_polymarket_outcome(asset, tf, open_ts):
 
 
 # ── WINDOW TIMING ────────────────────────────────────────────────────────────
+def best_bid_cents(token_id):
+    """Live best bid in cents — what a seller would receive right now."""
+    try:
+        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
+        b = r.json()
+        bids = [float(x["price"]) for x in b.get("bids", [])
+                if float(x.get("size", 0)) > 0]
+        return max(bids) * 100.0 if bids else None
+    except Exception:
+        return None
+
+
+def db_set_path(rid, path_json):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE paper SET bid_path=? WHERE id=?", (path_json, rid))
+    conn.commit()
+    conn.close()
+
+
+def monitor():
+    """Loss-anatomy logger: samples each open position's best BID every 5s to
+    settlement. The recorded paths let /exit compute what any sell-the-failing
+    rule WOULD have netted — before an exit is ever built."""
+    while True:
+        try:
+            time.sleep(5)
+            now = time.time()
+            with pending_lock:
+                items = list(pending)
+            for s in items:
+                if now >= s["close_ts"]:
+                    continue
+                toks = resolve_tokens(s["asset"], s["tf"], s["open_ts"])
+                if not toks:
+                    continue
+                tok = toks[0] if s["direction"] == "UP" else toks[1]
+                bid = best_bid_cents(tok)
+                if bid is None:
+                    continue
+                s.setdefault("bid_path", []).append(
+                    [round(s["close_ts"] - now, 1), round(bid, 1)])
+        except Exception as e:
+            log.error(f"[MONITOR] {e}")
+
+
 def window_times(tf):
     now = int(time.time())
     length = tf * 60
@@ -309,6 +354,10 @@ def init_db():
         secs_left REAL, move_pct REAL, ask_cents REAL, open_price REAL,
         settle_price REAL, result TEXT, pnl REAL)""")
     conn.execute("UPDATE paper SET result='VOID' WHERE result='PENDING'")
+    try:
+        conn.execute("ALTER TABLE paper ADD COLUMN bid_path TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -354,9 +403,21 @@ def db_scoreboard():
 # ── TELEGRAM ─────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                            "parse_mode": "HTML"}, timeout=8)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+                                "parse_mode": "HTML"}, timeout=8)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if getattr(r, "status_code", 200) != 200 or not body.get("ok", False):
+            # Telegram REJECTED the send (bad token = 401/404, bad chat_id or
+            # malformed HTML = 400). Without this check the bot logs success
+            # while the chat stays empty.
+            log.error(f"[TG] REJECTED {getattr(r, 'status_code', '?')}: "
+                      f"{str(body)[:160]} — check TELEGRAM_TOKEN / "
+                      f"TELEGRAM_CHAT_ID on this service")
+            return
         log.info(f"[TG] {msg[:80]}")
     except Exception as e:
         log.error(f"TG error: {e}")
@@ -378,16 +439,90 @@ def handle_commands():
             if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
             if t == "/stats":
-                s = db_scoreboard()
-                wr = f"{s['wr']:.1f}%" if s["wr"] is not None else "—"
-                verdict = ("ABOVE break-even ✅" if s["wr"] and s["wr"] > s["be"]
+                sb = db_scoreboard()
+                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "—"
+                verdict = ("ABOVE break-even ✅" if sb["wr"] and sb["wr"] > sb["be"]
                            else "below break-even ⚠️")
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT tf, ask_cents, asset, result, pnl FROM paper "
+                          "WHERE result IN ('WIN','LOSS')")
+                rows = c.fetchall()
+                conn.close()
+                def seg(sub):
+                    n = len(sub)
+                    if not n:
+                        return "—"
+                    w = sum(1 for r in sub if r[3] == "WIN")
+                    p = sum(r[4] or 0 for r in sub)
+                    a = sum(r[1] or 0 for r in sub) / n
+                    return f"{w}/{n} ({w/n*100:.1f}% vs BE {a:.1f}) ${p:+.2f}"
+                tfs_seen = sorted({r[0] for r in rows})
+                by_tf = "\n".join(f"  {tf}m: {seg([r for r in rows if r[0]==tf])}"
+                                  for tf in tfs_seen)
+                bands = [("&lt;98¢", lambda a: a < 98),
+                         ("98-99¢", lambda a: 98 <= a < 99),
+                         ("99-99.5¢", lambda a: 99 <= a < 99.5),
+                         ("≥99.5¢", lambda a: a >= 99.5)]
+                by_band = "\n".join(f"  {nm}: {seg([r for r in rows if fn(r[1] or 0)])}"
+                                    for nm, fn in bands)
+                ap = {}
+                for r in rows:
+                    ap[r[2]] = ap.get(r[2], 0.0) + (r[4] or 0)
+                srt = sorted(ap.items(), key=lambda kv: kv[1])
+                worst = " · ".join(f"{k} ${v:+.2f}" for k, v in srt[:2])
+                best = " · ".join(f"{k} ${v:+.2f}" for k, v in srt[-2:])
                 tg(f"📄 <b>PAPER TAKER (MEASURED) scoreboard</b>\n"
-                   f"simulated trades: {s['n']}\n"
+                   f"simulated trades: {sb['n']}\n"
                    f"win rate: <b>{wr}</b>\n"
-                   f"avg ask paid: {s['avg_ask']:.1f}¢ → break-even ≈ {s['be']:.1f}%\n"
+                   f"avg ask paid: {sb['avg_ask']:.1f}¢ → break-even ≈ {sb['be']:.1f}%\n"
                    f"{verdict}\n"
-                   f"paper P&L: <b>${s['pnl']:+.2f}</b> ({PAPER_STAKE:g}/trade)")
+                   f"paper P&L: <b>${sb['pnl']:+.2f}</b> ({PAPER_STAKE:g}/trade)\n"
+                   f"— by timeframe —\n{by_tf}\n"
+                   f"— by ask band —\n{by_band}\n"
+                   f"best: {best}\nworst: {worst}")
+            elif t == "/exit":
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT result, pnl, ask_cents, bid_path FROM paper "
+                          "WHERE bid_path IS NOT NULL AND result IN ('WIN','LOSS')")
+                rows = c.fetchall()
+                conn.close()
+                if not rows:
+                    tg("🚪 no bid-path data yet — the logger collects from NEW "
+                       "trades after this deploy; check back in a day")
+                    continue
+                TRIG = 90.0
+                saved = false_cost = lost_tot = 0.0
+                caught = uncatch = losses = false_n = 0
+                for res, pnl, ask, pj in rows:
+                    try:
+                        path = json.loads(pj)
+                    except Exception:
+                        continue
+                    shares = PAPER_STAKE / ((ask or 99.0) / 100.0)
+                    dip = next((b for _, b in path if b is not None and b <= TRIG),
+                               None)
+                    if res == "LOSS":
+                        losses += 1
+                        lost_tot += -(pnl or -PAPER_STAKE)
+                        if dip is None:
+                            uncatch += 1
+                        else:
+                            caught += 1
+                            saved += shares * dip / 100.0
+                    elif dip is not None:
+                        false_n += 1
+                        false_cost += shares * (100.0 - dip) / 100.0
+                net = saved - false_cost
+                tg(f"🚪 <b>EXIT CEILING</b> — sell when bid ≤{TRIG:.0f}¢ "
+                   f"(hypothetical, on recorded paths)\n"
+                   f"losses with paths: {losses} (${lost_tot:.2f} lost)\n"
+                   f"catchable: {caught} → recovers ${saved:+.2f} · "
+                   f"gap/uncatchable: {uncatch}\n"
+                   f"false fires: {false_n} winners dipped ≤{TRIG:.0f}¢ → "
+                   f"cost ${false_cost:.2f} if exited\n"
+                   f"<b>net effect of this exit ≈ ${net:+.2f}</b>")
     except Exception:
         pass
 
@@ -522,6 +657,11 @@ def scorer():
                 pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
                 result = "WIN" if won else "LOSS"
                 db_resolve(s["rid"], None, result, round(pnl, 4))
+                if s.get("bid_path"):
+                    try:
+                        db_set_path(s["rid"], json.dumps(s["bid_path"]))
+                    except Exception:
+                        pass
                 with pending_lock:
                     s in pending and pending.remove(s)
                 sb = db_scoreboard()
@@ -542,6 +682,7 @@ def main():
     threading.Thread(target=binance_ref_worker, daemon=True).start()
     threading.Thread(target=engine, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
+    threading.Thread(target=monitor, daemon=True).start()
     tg(f"📄 <b>PAPER TAKER (MEASURED gate) live</b> — no money\n"
        f"same gate as the maker bot; simulates TAKING the ask instead of resting a bid\n"
        f"tf={TFS} · stake ${PAPER_STAKE:g} · skip if ask > {TAKER_MAX_ASK_CENTS:.0f}¢\n"
