@@ -586,7 +586,7 @@ def handle_commands():
                 cert = (f"— CERTIFIED (settlement-graded) —\n"
                         f"  all: {cseg(crows)}\n"
                         f"  &lt;98¢: {cseg([r for r in crows if (r[0] or 99) < 98])}\n")
-                tg(f"📄 <b>PAPER TAKER (MEASURED) scoreboard</b>\n"
+                tg(f"{'🟢 LIVE' if (LIVE and _clob) else '📄 PAPER'} <b>TAKER scoreboard</b>\n"
                    f"{cert}"
                    f"simulated trades: {sb['n']}\n"
                    f"win rate: <b>{wr}</b>\n"
@@ -823,10 +823,9 @@ def main():
            f"stake ${LIVE_STAKE:g} · bankroll stop ${BANKROLL_STOP:g} · "
            f"exclude {','.join(sorted(EXCLUDE_ASSETS))} · tf={TFS}\n"
            f"exit: {'sell @'+str(int(EXIT_TRIGGER_CENTS))+'¢' if EXIT_TRIGGER_CENTS>0 else 'off'}")
-    tg(f"📄 <b>PAPER TAKER (MEASURED gate) live</b> — no money\n"
-       f"same gate as the maker bot; simulates TAKING the ask instead of resting a bid\n"
-       f"tf={TFS} · stake ${PAPER_STAKE:g} · skip if ask > {TAKER_MAX_ASK_CENTS:.0f}¢\n"
-       f"the scoreboard decides: does taking clear break-even?\n/stats")
+    if not (LIVE and live_ok):
+        tg(f"📄 <b>PAPER MODE</b> — no money (set LIVE=true + keys to trade)\n"
+           f"tf={TFS} · stake ${PAPER_STAKE:g} · skip if ask > {TAKER_MAX_ASK_CENTS:.0f}¢\n/stats")
     while True:
         try:
             handle_commands()
