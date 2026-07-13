@@ -413,18 +413,9 @@ def monitor():
                     shares = LIVE_STAKE / (s["ask"] / 100.0)
                     if live_sell(s["token"], round(shares, 2), bid):
                         s["exited"] = True
-                        s["exit_price"] = bid   # record ACTUAL sell price
-                        # exited positions are DONE — resolve now at the real
-                        # sell price, don't wait for settlement (you're out).
-                        exit_pnl = shares * (bid / 100.0) - LIVE_STAKE
-                        global _live_realized
-                        _live_realized += exit_pnl
-                        db_resolve(s["rid"], bid / 100.0, "EXIT", round(exit_pnl, 4))
-                        with pending_lock:
-                            s in pending and pending.remove(s)
                         tg(f"🔴 <b>LIVE EXIT {ASSET_EMOJI.get(s['asset'],'')}"
                            f"{s['asset']} {s['tf']}m</b> sold @{bid:.1f}¢ "
-                           f"(was {s['ask']:.0f}¢) · <b>${exit_pnl:+.2f}</b>")
+                           f"(cut failing position, was {s['ask']:.0f}¢)")
                     else:
                         log.warning(f"[EXIT] sell failed {s['asset']} @{bid:.1f}¢")
                 elif (LIVE and EXIT_TRIGGER_CENTS > 0 and not s.get("exited")
@@ -879,7 +870,12 @@ def scorer():
                 won = (s["direction"] == outcome)
                 stake = LIVE_STAKE if LIVE else PAPER_STAKE
                 shares = stake / (s["ask"] / 100.0)
-                pnl = (shares * 1.0 - stake) if won else -stake
+                if s.get("exited"):
+                    # position was sold early at the exit trigger — approximate
+                    # realized as the exit proceeds minus stake
+                    pnl = shares * (EXIT_TRIGGER_CENTS / 100.0) - stake
+                else:
+                    pnl = (shares * 1.0 - stake) if won else -stake
                 result = "WIN" if won else "LOSS"
                 if LIVE:
                     global _live_realized
