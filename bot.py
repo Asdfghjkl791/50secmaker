@@ -42,7 +42,7 @@
 #   MONITOR_POLL_SECS=2, SETTLE_POLL_SECS=15, SETTLE_TIMEOUT_SECS=1800,
 #   DB_PATH=paper_favorite_dip.db, SEND_EACH=true
 
-import os, time, json, sqlite3, logging, threading, requests, csv, io
+import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 try:
@@ -406,54 +406,131 @@ def fetch_price_history(token_id, start_ts, end_ts):
 
 
 _export_lock = threading.Lock()
+_paths_io_lock = threading.Lock()
+_paths_pause = threading.Event()   # set by /pausepaths, checked between markets
+EXPORT_DIR = os.path.dirname(os.path.abspath(DB_PATH))
+PATHS_CSV = os.path.join(EXPORT_DIR, "favdip_paths.csv")
+PATHS_DONE = os.path.join(EXPORT_DIR, "favdip_paths_done.txt")
+PATHS_HEADER = ["asset", "tf", "open_ts", "token_dir", "t",
+                "secs_into_window", "price_cents"]
+TG_PART_BYTES = 40 * 1024 * 1024   # Telegram bot upload limit is 50MB
+
+
+def _market_key(asset, tf, open_ts):
+    return f"{asset}|{tf}|{open_ts}"
+
 
 def export_paths_worker():
-    """For every trade: price path of BOTH sides across its whole window.
-    This is what the inverse needs — what the other side cost at the dip,
-    and how both sides moved afterwards."""
+    """Price path of BOTH sides for every market the bot traded, one row per
+    minute. Stored per MARKET (not per trade) so markets traded on both sides
+    aren't fetched twice; join to trades on asset+tf+open_ts.
+    Written to the volume as it goes and RESUMABLE: re-running /exportpaths
+    after a restart skips markets already done."""
     if not _export_lock.acquire(blocking=False):
-        tg("⏳ path export already running")
+        tg("⏳ path export already running — /sendpaths sends what's done so far")
         return
     try:
         conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute("""SELECT id, asset, tf, direction, open_ts, close_ts,
-                               created FROM trades ORDER BY id""").fetchall()
+        mkts = conn.execute("""SELECT DISTINCT asset, tf, open_ts, close_ts
+                               FROM trades ORDER BY open_ts""").fetchall()
         conn.close()
-        if not rows:
-            tg("no trades to export")
+        done = set()
+        if os.path.exists(PATHS_DONE):
+            with open(PATHS_DONE) as f:
+                done = {ln.strip() for ln in f if ln.strip()}
+        todo = [m for m in mkts if _market_key(m[0], m[1], m[2]) not in done]
+        if not todo:
+            tg(f"✅ all {len(mkts)} markets already pulled — sending")
+            send_paths_files()
             return
-        tg(f"⏳ pulling price paths for {len(rows)} trades — "
-           f"takes ~{max(1, len(rows) * 2 // 60)} min")
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["trade_id", "asset", "tf", "fav_dir", "side", "token_dir",
-                    "t", "secs_into_window", "secs_since_entry", "price_cents"])
-        got, missing = 0, 0
-        for (tid, asset, tf, direction, open_ts, close_ts, created) in rows:
+        tg(f"⏳ pulling paths: {len(todo)} markets left of {len(mkts)} "
+           f"(~{max(1, len(todo) * 7 // 600)} min). Saved as it goes — "
+           f"safe to restart, just /exportpaths again.")
+        new_file = not os.path.exists(PATHS_CSV)
+        got = empty = 0
+        for i, (asset, tf, open_ts, close_ts) in enumerate(todo, 1):
+            if _paths_pause.is_set():
+                tg(f"⏸ paths paused at {i - 1}/{len(todo)} · progress saved\n"
+                   f"/resumepaths to continue · /sendpaths to send what's done")
+                return
             toks = resolve_tokens(asset, tf, open_ts)
-            if not toks:
-                _market_cache.pop((asset, tf, open_ts), None)  # allow retry later
-                missing += 1
-                continue
-            ets = _iso_to_ts(created) or open_ts
-            any_pts = False
-            for token_dir, tok in (("UP", toks[0]), ("DOWN", toks[1])):
-                side = "FAV" if token_dir == direction else "OPP"
-                pts = fetch_price_history(tok, open_ts, close_ts)
-                for (t, p) in pts:
-                    any_pts = True
-                    w.writerow([tid, asset, tf, direction, side, token_dir, t,
-                                t - open_ts, round(t - ets, 1), round(p, 2)])
-                time.sleep(0.25)   # be gentle with the API
-            got += 1 if any_pts else 0
-            missing += 0 if any_pts else 1
-        tg_document("favdip_paths.csv", buf.getvalue(),
-                    f"price paths · {got} trades with data · {missing} without")
+            rows = []
+            if toks:
+                for token_dir, tok in (("UP", toks[0]), ("DOWN", toks[1])):
+                    for (t, p) in fetch_price_history(tok, open_ts, close_ts):
+                        rows.append([asset, tf, open_ts, token_dir, t,
+                                     t - open_ts, round(p, 2)])
+                    time.sleep(0.1)
+            _market_cache.pop((asset, tf, open_ts), None)   # keep memory flat
+            with _paths_io_lock:
+                with open(PATHS_CSV, "a", newline="") as f:
+                    w = csv.writer(f)
+                    if new_file:
+                        w.writerow(PATHS_HEADER)
+                        new_file = False
+                    w.writerows(rows)
+                with open(PATHS_DONE, "a") as f:
+                    f.write(_market_key(asset, tf, open_ts) + "\n")
+            got += 1 if rows else 0
+            empty += 0 if rows else 1
+            if i % 1000 == 0:
+                tg(f"⏳ paths {i}/{len(todo)} · {got} with data · {empty} empty")
+        tg(f"✅ paths done · {got} markets with data · {empty} empty — sending")
+        send_paths_files()
     except Exception as e:
         log.error(f"[EXPORT] {e}")
-        tg(f"⚠️ path export crashed: {e}")
+        tg(f"⚠️ path export stopped: {e} — /exportpaths resumes it")
     finally:
         _export_lock.release()
+
+
+def send_paths_files():
+    """Gzip the paths CSV into parts under Telegram's limit and send each.
+    Each part is a complete .csv.gz with its own header."""
+    if not os.path.exists(PATHS_CSV):
+        tg("no paths file yet — run /exportpaths")
+        return
+    parts, part_no = [], 0
+    with _paths_io_lock:
+        with open(PATHS_CSV, newline="") as src:
+            header = src.readline()
+            out = gz = None
+            for line in src:
+                if gz is None or out.tell() >= TG_PART_BYTES:
+                    if gz:
+                        gz.close(); out.close()
+                    part_no += 1
+                    path = os.path.join(EXPORT_DIR,
+                                        f"favdip_paths_part{part_no}.csv.gz")
+                    out = open(path, "wb")
+                    gz = gzip.GzipFile(fileobj=out, mode="wb")
+                    gz.write(header.encode())
+                    parts.append(path)
+                gz.write(line.encode())
+            if gz:
+                gz.close(); out.close()
+    if not parts:
+        tg("paths file is empty so far")
+        return
+    for n, path in enumerate(parts, 1):
+        try:
+            with open(path, "rb") as f:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                    data={"chat_id": TELEGRAM_CHAT_ID,
+                          "caption": f"paths part {n}/{len(parts)}"},
+                    files={"document": (os.path.basename(path), f,
+                                        "application/gzip")},
+                    timeout=300)
+            if r.status_code != 200:
+                tg(f"⚠️ part {n} upload failed ({r.status_code})")
+        except Exception as e:
+            tg(f"⚠️ part {n} upload failed: {e}")
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 _upd = None
@@ -507,13 +584,25 @@ def handle_commands():
                 else:
                     tg_document("favdip_trades.csv", text,
                                 f"{n} trades · DB {DB_PATH}")
-            elif t == "/exportpaths":
+            elif t in ("/exportpaths", "/resumepaths"):
+                _paths_pause.clear()
                 threading.Thread(target=export_paths_worker, daemon=True).start()
+            elif t == "/pausepaths":
+                if _export_lock.locked():
+                    _paths_pause.set()
+                    tg("⏸ pausing after the current market…")
+                else:
+                    tg("no path export running")
+            elif t == "/sendpaths":
+                threading.Thread(target=send_paths_files, daemon=True).start()
             elif t == "/help":
                 tg("📖 <b>commands</b>\n/stats — scoreboard\n"
                    "/status — open positions\n"
                    "/export — all trades as CSV\n"
-                   "/exportpaths — both sides' price paths as CSV\n"
+                   "/exportpaths — pull both sides' price paths (resumable)\n"
+                   "/pausepaths — pause the path export\n"
+                   "/resumepaths — continue where it stopped\n"
+                   "/sendpaths — send the paths pulled so far\n"
                    "/help — this list")
     except Exception:
         pass
