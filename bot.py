@@ -42,7 +42,7 @@
 #   MONITOR_POLL_SECS=2, SETTLE_POLL_SECS=15, SETTLE_TIMEOUT_SECS=1800,
 #   DB_PATH=paper_favorite_dip.db, SEND_EACH=true
 
-import os, time, json, sqlite3, logging, threading, requests
+import os, time, json, sqlite3, logging, threading, requests, csv, io
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 try:
@@ -251,29 +251,42 @@ def init_db():
         direction TEXT, open_ts INTEGER, close_ts INTEGER, entry_ask REAL,
         peak_at_entry REAL, result TEXT, pnl REAL, ladder_sold REAL DEFAULT 0,
         ladder_proceeds REAL DEFAULT 0, hold_pnl REAL)""")
+    # New columns for inverse analysis (only filled for trades from now on).
+    for col in ("opp_ask REAL", "opp_bid REAL", "entry_bid REAL",
+                "peak_bid_after REAL", "min_bid_after REAL"):
+        try:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass   # already exists
     conn.execute("UPDATE trades SET result='VOID' WHERE result='PENDING'")
     conn.commit()
     conn.close()
 
 
-def db_insert(asset, tf, direction, open_ts, close_ts, entry_ask, peak_at_entry):
+def db_insert(asset, tf, direction, open_ts, close_ts, entry_ask, peak_at_entry,
+              opp_ask=None, opp_bid=None, entry_bid=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO trades (created,asset,tf,direction,open_ts,close_ts,
-                 entry_ask,peak_at_entry,result) VALUES (?,?,?,?,?,?,?,?, 'PENDING')""",
+                 entry_ask,peak_at_entry,result,opp_ask,opp_bid,entry_bid)
+                 VALUES (?,?,?,?,?,?,?,?, 'PENDING',?,?,?)""",
               (datetime.now(timezone.utc).isoformat(), asset, tf, direction,
-               open_ts, close_ts, entry_ask, peak_at_entry))
+               open_ts, close_ts, entry_ask, peak_at_entry,
+               opp_ask, opp_bid, entry_bid))
     rid = c.lastrowid
     conn.commit()
     conn.close()
     return rid
 
 
-def db_resolve(rid, result, pnl, ladder_sold, ladder_proceeds, hold_pnl):
+def db_resolve(rid, result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
+               peak_bid_after=None, min_bid_after=None):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""UPDATE trades SET result=?, pnl=?, ladder_sold=?,
-                    ladder_proceeds=?, hold_pnl=? WHERE id=?""",
-                 (result, pnl, ladder_sold, ladder_proceeds, hold_pnl, rid))
+                    ladder_proceeds=?, hold_pnl=?, peak_bid_after=?,
+                    min_bid_after=? WHERE id=?""",
+                 (result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
+                  peak_bid_after, min_bid_after, rid))
     conn.commit()
     conn.close()
 
@@ -312,6 +325,135 @@ def tg(msg):
         log.info(f"[TG] {msg[:80]}")
     except Exception as e:
         log.error(f"TG error: {e}")
+
+
+# ── DATA EXPORT (for offline analysis / inverse-strategy engineering) ───────
+
+def tg_document(filename, text, caption=""):
+    """Send a text file (CSV) to the Telegram chat as a downloadable document."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]},
+            files={"document": (filename, text.encode("utf-8"), "text/csv")},
+            timeout=120)
+        ok = False
+        try:
+            ok = r.json().get("ok", False)
+        except Exception:
+            pass
+        if r.status_code != 200 or not ok:
+            log.error(f"[TG-DOC] REJECTED {r.status_code}: {r.text[:150]}")
+            tg(f"⚠️ upload of {filename} failed ({r.status_code})")
+    except Exception as e:
+        log.error(f"[TG-DOC] {e}")
+        tg(f"⚠️ upload of {filename} failed: {e}")
+
+
+def _iso_to_ts(s):
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def build_trades_csv():
+    """Every row of the trades table + derived timing columns."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
+    conn.close()
+    if not rows:
+        return None, 0
+    cols = list(rows[0].keys())
+    extra = ["entry_ts", "window_secs", "secs_into_window", "secs_left_at_entry",
+             "dip_cents", "shares_total"]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols + extra)
+    for r in rows:
+        ets = _iso_to_ts(r["created"])
+        win = (r["close_ts"] - r["open_ts"]) if r["close_ts"] and r["open_ts"] else None
+        into = round(ets - r["open_ts"], 1) if ets and r["open_ts"] else None
+        left = round(r["close_ts"] - ets, 1) if ets and r["close_ts"] else None
+        dip = (round(r["peak_at_entry"] - r["entry_ask"], 2)
+               if r["peak_at_entry"] is not None and r["entry_ask"] else None)
+        sh = (round(PAPER_STAKE / (r["entry_ask"] / 100.0), 4)
+              if r["entry_ask"] else None)
+        w.writerow([r[c] for c in cols] +
+                   [round(ets, 1) if ets else None, win, into, left, dip, sh])
+    return buf.getvalue(), len(rows)
+
+
+def fetch_price_history(token_id, start_ts, end_ts):
+    """Polymarket's per-token price history (1-minute points). Returns
+    [(t, price_cents), ...] — may be empty for older/closed markets."""
+    for params in ({"market": token_id, "startTs": int(start_ts),
+                    "endTs": int(end_ts), "fidelity": 1},
+                   {"market": token_id, "interval": "max", "fidelity": 1}):
+        try:
+            r = requests.get(f"{CLOB_BASE}/prices-history", params=params,
+                             timeout=15)
+            hist = r.json().get("history", []) if r.status_code == 200 else []
+            pts = [(int(h["t"]), float(h["p"]) * 100.0) for h in hist
+                   if "t" in h and "p" in h
+                   and start_ts - 60 <= int(h["t"]) <= end_ts + 60]
+            if pts:
+                return pts
+        except Exception as e:
+            log.debug(f"[HIST] {token_id[:10]}: {e}")
+    return []
+
+
+_export_lock = threading.Lock()
+
+def export_paths_worker():
+    """For every trade: price path of BOTH sides across its whole window.
+    This is what the inverse needs — what the other side cost at the dip,
+    and how both sides moved afterwards."""
+    if not _export_lock.acquire(blocking=False):
+        tg("⏳ path export already running")
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""SELECT id, asset, tf, direction, open_ts, close_ts,
+                               created FROM trades ORDER BY id""").fetchall()
+        conn.close()
+        if not rows:
+            tg("no trades to export")
+            return
+        tg(f"⏳ pulling price paths for {len(rows)} trades — "
+           f"takes ~{max(1, len(rows) * 2 // 60)} min")
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["trade_id", "asset", "tf", "fav_dir", "side", "token_dir",
+                    "t", "secs_into_window", "secs_since_entry", "price_cents"])
+        got, missing = 0, 0
+        for (tid, asset, tf, direction, open_ts, close_ts, created) in rows:
+            toks = resolve_tokens(asset, tf, open_ts)
+            if not toks:
+                _market_cache.pop((asset, tf, open_ts), None)  # allow retry later
+                missing += 1
+                continue
+            ets = _iso_to_ts(created) or open_ts
+            any_pts = False
+            for token_dir, tok in (("UP", toks[0]), ("DOWN", toks[1])):
+                side = "FAV" if token_dir == direction else "OPP"
+                pts = fetch_price_history(tok, open_ts, close_ts)
+                for (t, p) in pts:
+                    any_pts = True
+                    w.writerow([tid, asset, tf, direction, side, token_dir, t,
+                                t - open_ts, round(t - ets, 1), round(p, 2)])
+                time.sleep(0.25)   # be gentle with the API
+            got += 1 if any_pts else 0
+            missing += 0 if any_pts else 1
+        tg_document("favdip_paths.csv", buf.getvalue(),
+                    f"price paths · {got} trades with data · {missing} without")
+    except Exception as e:
+        log.error(f"[EXPORT] {e}")
+        tg(f"⚠️ path export crashed: {e}")
+    finally:
+        _export_lock.release()
 
 
 _upd = None
@@ -358,9 +500,21 @@ def handle_commands():
                                  f"  {st} · {p['left']:.0f} riding · "
                                  f"next {p['rung']:.0f}¢{pk}")
                 tg(head + ("\n\n" + "\n".join(lines) if lines else "\n\nno open positions"))
+            elif t == "/export":
+                text, n = build_trades_csv()
+                if not text:
+                    tg("no trades in the database yet")
+                else:
+                    tg_document("favdip_trades.csv", text,
+                                f"{n} trades · DB {DB_PATH}")
+            elif t == "/exportpaths":
+                threading.Thread(target=export_paths_worker, daemon=True).start()
             elif t == "/help":
                 tg("📖 <b>commands</b>\n/stats — scoreboard\n"
-                   "/status — open positions\n/help — this list")
+                   "/status — open positions\n"
+                   "/export — all trades as CSV\n"
+                   "/exportpaths — both sides' price paths as CSV\n"
+                   "/help — this list")
     except Exception:
         pass
 
@@ -430,8 +584,12 @@ def dip_monitor():
                             continue
                         # ── ENTRY: dip on an established favorite ──
                         fired.add(key)
+                        opp_tok = toks[1] if direction == "UP" else toks[0]
+                        opp_ask = best_ask_cents(opp_tok)
+                        opp_bid = best_bid_cents(opp_tok)
+                        entry_bid = best_bid_cents(tok)
                         rid = db_insert(asset, tf, direction, open_ts, close_ts,
-                                        ask, pk)
+                                        ask, pk, opp_ask, opp_bid, entry_bid)
                         shares_total = PAPER_STAKE / (ask / 100.0)
                         with pending_lock:
                             pending.append({
@@ -443,7 +601,7 @@ def dip_monitor():
                                 "shares_left": shares_total,
                                 "next_rung": min(ask + RUNG_STEP_CENTS, RUNG_CAP_CENTS),
                                 "ladder_proceeds": 0.0, "ladder_sold": 0.0,
-                                "peak_bid": ask,
+                                "peak_bid": ask, "min_bid": None,
                             })
                         if SEND_EACH:
                             arrow = "↑" if direction == "UP" else "↓"
@@ -458,13 +616,17 @@ def dip_monitor():
             with pending_lock:
                 items = list(pending)
             for s in items:
-                if now >= s["close_ts"] or s["shares_left"] < 1:
+                if now >= s["close_ts"]:
                     continue
                 bid = best_bid_cents(s["token"])
                 if bid is None:
                     continue
                 if bid > s.get("peak_bid", 0.0):
                     s["peak_bid"] = bid
+                if s.get("min_bid") is None or bid < s["min_bid"]:
+                    s["min_bid"] = bid
+                if s["shares_left"] < 1:
+                    continue
                 sold_this_poll = 0.0
                 proceeds_this_poll = 0.0
                 while bid >= s["next_rung"] and s["shares_left"] >= 1:
@@ -520,7 +682,8 @@ def scorer():
                     settle_px = prices_ref.get(s["asset"])
                     if op is None or settle_px is None or abs((settle_px - op) / op) < 1e-6:
                         db_resolve(s["rid"], "VOID", 0, s["ladder_sold"],
-                                   s["ladder_proceeds"], 0)
+                                   s["ladder_proceeds"], 0,
+                                   s.get("peak_bid"), s.get("min_bid"))
                         with pending_lock:
                             s in pending and pending.remove(s)
                         continue
@@ -533,7 +696,8 @@ def scorer():
                 pnl = round(s["ladder_proceeds"] + remaining_settle - stake, 4)
                 result = "WIN" if won else "LOSS"
                 db_resolve(s["rid"], result, pnl, s["ladder_sold"],
-                           round(s["ladder_proceeds"], 4), round(hold_pnl, 4))
+                           round(s["ladder_proceeds"], 4), round(hold_pnl, 4),
+                           s.get("peak_bid"), s.get("min_bid"))
                 with pending_lock:
                     s in pending and pending.remove(s)
                 sb = db_scoreboard()
