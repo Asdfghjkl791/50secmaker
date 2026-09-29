@@ -75,6 +75,16 @@ LADDER_SELL_FRAC = float(os.environ.get("LADDER_SELL_FRAC", "0.5"))
 # once the bid reaches it, the whole remainder sells rather than dangling.
 RUNG_CAP_CENTS   = float(os.environ.get("RUNG_CAP_CENTS", "99"))
 
+# ── INVERSE: on every favorite-dip trigger, also paper-buy the OTHER side ──
+# Filled at the other side's REAL best ask at that moment (never 100-minus-
+# favorite), so wide 1h/4h books cost what they really cost. Tracked in its
+# own table (inv_trades) with both hold-to-settle and ladder P&L.
+INV_ENABLED         = os.environ.get("INV_ENABLED", "true").lower() == "true"
+INV_RUNG_STEP_CENTS = float(os.environ.get("INV_RUNG_STEP_CENTS", "8"))
+INV_LADDER_SELL_FRAC = float(os.environ.get("INV_LADDER_SELL_FRAC", "0.5"))
+INV_SEND_EACH       = os.environ.get("INV_SEND_EACH", "false").lower() == "true"
+TABLES = ("trades", "inv_trades")
+
 MONITOR_POLL_SECS   = float(os.environ.get("MONITOR_POLL_SECS", "2"))
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
 SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "1800"))
@@ -258,9 +268,34 @@ def init_db():
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass   # already exists
-    conn.execute("UPDATE trades SET result='VOID' WHERE result='PENDING'")
+    conn.execute("""CREATE TABLE IF NOT EXISTS inv_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, fav_id INTEGER,
+        asset TEXT, tf INTEGER, direction TEXT, open_ts INTEGER, close_ts INTEGER,
+        entry_ask REAL, entry_bid REAL, fav_ask REAL, fav_bid REAL,
+        peak_at_entry REAL, result TEXT, pnl REAL, ladder_sold REAL DEFAULT 0,
+        ladder_proceeds REAL DEFAULT 0, hold_pnl REAL, peak_bid_after REAL,
+        min_bid_after REAL)""")
+    for tbl in TABLES:
+        conn.execute(f"UPDATE {tbl} SET result='VOID' WHERE result='PENDING'")
     conn.commit()
     conn.close()
+
+
+def db_insert_inv(fav_id, asset, tf, direction, open_ts, close_ts, entry_ask,
+                  entry_bid, fav_ask, fav_bid, peak_at_entry):
+    """direction = the side BOUGHT (opposite of the favorite)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT INTO inv_trades (created,fav_id,asset,tf,direction,open_ts,
+                 close_ts,entry_ask,entry_bid,fav_ask,fav_bid,peak_at_entry,result)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'PENDING')""",
+              (datetime.now(timezone.utc).isoformat(), fav_id, asset, tf,
+               direction, open_ts, close_ts, entry_ask, entry_bid, fav_ask,
+               fav_bid, peak_at_entry))
+    rid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
 
 
 def db_insert(asset, tf, direction, open_ts, close_ts, entry_ask, peak_at_entry,
@@ -280,9 +315,10 @@ def db_insert(asset, tf, direction, open_ts, close_ts, entry_ask, peak_at_entry,
 
 
 def db_resolve(rid, result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
-               peak_bid_after=None, min_bid_after=None):
+               peak_bid_after=None, min_bid_after=None, table="trades"):
+    assert table in TABLES
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""UPDATE trades SET result=?, pnl=?, ladder_sold=?,
+    conn.execute(f"""UPDATE {table} SET result=?, pnl=?, ladder_sold=?,
                     ladder_proceeds=?, hold_pnl=?, peak_bid_after=?,
                     min_bid_after=? WHERE id=?""",
                  (result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
@@ -291,22 +327,29 @@ def db_resolve(rid, result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
     conn.close()
 
 
-def db_scoreboard():
+def db_scoreboard(table="trades"):
+    assert table in TABLES
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT result, pnl, tf FROM trades WHERE result IN ('WIN','LOSS')")
+    c.execute(f"""SELECT result, pnl, tf, hold_pnl, entry_ask FROM {table}
+                  WHERE result IN ('WIN','LOSS')""")
     rows = c.fetchall()
     conn.close()
     wins = sum(1 for r in rows if r[0] == "WIN")
     pnl = sum(r[1] or 0 for r in rows)
+    hold = sum(r[3] or 0 for r in rows)
     wr = (wins / len(rows) * 100) if rows else None
     by_tf = {}
     for r in rows:
-        d = by_tf.setdefault(r[2], {"n": 0, "w": 0, "pnl": 0.0})
+        d = by_tf.setdefault(r[2], {"n": 0, "w": 0, "pnl": 0.0, "hold": 0.0,
+                                    "px": 0.0})
         d["n"] += 1
         d["w"] += 1 if r[0] == "WIN" else 0
         d["pnl"] += r[1] or 0
-    return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl, "by_tf": by_tf}
+        d["hold"] += r[3] or 0
+        d["px"] += r[4] or 0
+    return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl, "hold": hold,
+            "by_tf": by_tf}
 
 
 def tg(msg):
@@ -357,11 +400,16 @@ def _iso_to_ts(s):
         return None
 
 
-def build_trades_csv():
-    """Every row of the trades table + derived timing columns."""
+def build_trades_csv(table="trades", tf=None):
+    """Every row of a table (optionally one timeframe) + derived timing columns."""
+    assert table in TABLES
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
+    if tf:
+        rows = conn.execute(f"SELECT * FROM {table} WHERE tf=? ORDER BY id",
+                            (tf,)).fetchall()
+    else:
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
     conn.close()
     if not rows:
         return None, 0
@@ -376,8 +424,9 @@ def build_trades_csv():
         win = (r["close_ts"] - r["open_ts"]) if r["close_ts"] and r["open_ts"] else None
         into = round(ets - r["open_ts"], 1) if ets and r["open_ts"] else None
         left = round(r["close_ts"] - ets, 1) if ets and r["close_ts"] else None
-        dip = (round(r["peak_at_entry"] - r["entry_ask"], 2)
-               if r["peak_at_entry"] is not None and r["entry_ask"] else None)
+        fav_px = r["fav_ask"] if "fav_ask" in cols else r["entry_ask"]
+        dip = (round(r["peak_at_entry"] - fav_px, 2)
+               if r["peak_at_entry"] is not None and fav_px else None)
         sh = (round(PAPER_STAKE / (r["entry_ask"] / 100.0), 4)
               if r["entry_ask"] else None)
         w.writerow([r[c] for c in cols] +
@@ -420,7 +469,7 @@ def _market_key(asset, tf, open_ts):
     return f"{asset}|{tf}|{open_ts}"
 
 
-def export_paths_worker():
+def export_paths_worker(tf=None):
     """Price path of BOTH sides for every market the bot traded, one row per
     minute. Stored per MARKET (not per trade) so markets traded on both sides
     aren't fetched twice; join to trades on asset+tf+open_ts.
@@ -431,37 +480,39 @@ def export_paths_worker():
         return
     try:
         conn = sqlite3.connect(DB_PATH)
-        mkts = conn.execute("""SELECT DISTINCT asset, tf, open_ts, close_ts
-                               FROM trades ORDER BY open_ts""").fetchall()
+        q = "SELECT DISTINCT asset, tf, open_ts, close_ts FROM trades"
+        mkts = (conn.execute(q + " WHERE tf=? ORDER BY open_ts", (tf,)).fetchall()
+                if tf else conn.execute(q + " ORDER BY open_ts").fetchall())
         conn.close()
+        scope = f" {label_for(tf)}" if tf else ""
         done = set()
         if os.path.exists(PATHS_DONE):
             with open(PATHS_DONE) as f:
                 done = {ln.strip() for ln in f if ln.strip()}
         todo = [m for m in mkts if _market_key(m[0], m[1], m[2]) not in done]
         if not todo:
-            tg(f"✅ all {len(mkts)} markets already pulled — sending")
-            send_paths_files()
+            tg(f"✅ all {len(mkts)}{scope} markets already pulled — sending")
+            send_paths_files(tf)
             return
-        tg(f"⏳ pulling paths: {len(todo)} markets left of {len(mkts)} "
+        tg(f"⏳ pulling{scope} paths: {len(todo)} markets left of {len(mkts)} "
            f"(~{max(1, len(todo) * 7 // 600)} min). Saved as it goes — "
            f"safe to restart, just /exportpaths again.")
         new_file = not os.path.exists(PATHS_CSV)
         got = empty = 0
-        for i, (asset, tf, open_ts, close_ts) in enumerate(todo, 1):
+        for i, (asset, mtf, open_ts, close_ts) in enumerate(todo, 1):
             if _paths_pause.is_set():
                 tg(f"⏸ paths paused at {i - 1}/{len(todo)} · progress saved\n"
                    f"/resumepaths to continue · /sendpaths to send what's done")
                 return
-            toks = resolve_tokens(asset, tf, open_ts)
+            toks = resolve_tokens(asset, mtf, open_ts)
             rows = []
             if toks:
                 for token_dir, tok in (("UP", toks[0]), ("DOWN", toks[1])):
                     for (t, p) in fetch_price_history(tok, open_ts, close_ts):
-                        rows.append([asset, tf, open_ts, token_dir, t,
+                        rows.append([asset, mtf, open_ts, token_dir, t,
                                      t - open_ts, round(p, 2)])
                     time.sleep(0.1)
-            _market_cache.pop((asset, tf, open_ts), None)   # keep memory flat
+            _market_cache.pop((asset, mtf, open_ts), None)   # keep memory flat
             with _paths_io_lock:
                 with open(PATHS_CSV, "a", newline="") as f:
                     w = csv.writer(f)
@@ -470,13 +521,13 @@ def export_paths_worker():
                         new_file = False
                     w.writerows(rows)
                 with open(PATHS_DONE, "a") as f:
-                    f.write(_market_key(asset, tf, open_ts) + "\n")
+                    f.write(_market_key(asset, mtf, open_ts) + "\n")
             got += 1 if rows else 0
             empty += 0 if rows else 1
             if i % 1000 == 0:
                 tg(f"⏳ paths {i}/{len(todo)} · {got} with data · {empty} empty")
-        tg(f"✅ paths done · {got} markets with data · {empty} empty — sending")
-        send_paths_files()
+        tg(f"✅{scope} paths done · {got} markets with data · {empty} empty — sending")
+        send_paths_files(tf)
     except Exception as e:
         log.error(f"[EXPORT] {e}")
         tg(f"⚠️ path export stopped: {e} — /exportpaths resumes it")
@@ -484,7 +535,7 @@ def export_paths_worker():
         _export_lock.release()
 
 
-def send_paths_files():
+def send_paths_files(tf=None):
     """Gzip the paths CSV into parts under Telegram's limit and send each.
     Each part is a complete .csv.gz with its own header."""
     if not os.path.exists(PATHS_CSV):
@@ -495,13 +546,17 @@ def send_paths_files():
         with open(PATHS_CSV, newline="") as src:
             header = src.readline()
             out = gz = None
+            tf_col = PATHS_HEADER.index("tf")
             for line in src:
+                if tf and line.split(",")[tf_col] != str(tf):
+                    continue
                 if gz is None or out.tell() >= TG_PART_BYTES:
                     if gz:
                         gz.close(); out.close()
                     part_no += 1
                     path = os.path.join(EXPORT_DIR,
-                                        f"favdip_paths_part{part_no}.csv.gz")
+                                        f"favdip_paths{'_' + label_for(tf) if tf else ''}"
+                                        f"_part{part_no}.csv.gz")
                     out = open(path, "wb")
                     gz = gzip.GzipFile(fileobj=out, mode="wb")
                     gz.write(header.encode())
@@ -510,7 +565,8 @@ def send_paths_files():
             if gz:
                 gz.close(); out.close()
     if not parts:
-        tg("paths file is empty so far")
+        tg("no paths pulled for that timeframe yet" if tf
+           else "paths file is empty so far")
         return
     for n, path in enumerate(parts, 1):
         try:
@@ -533,6 +589,32 @@ def send_paths_files():
                 pass
 
 
+def _parse_tf(s):
+    s = s.strip().lower()
+    return {"15": 15, "15m": 15, "60": 60, "1h": 60, "60m": 60,
+            "240": 240, "4h": 240, "240m": 240}.get(s)
+
+
+def inverse_stats_text():
+    inv, fav = db_scoreboard("inv_trades"), db_scoreboard("trades")
+    if inv["n"] == 0:
+        return ("🔄 <b>INVERSE · PAPER</b>\nno settled inverse trades yet "
+                "(started with this update)")
+    lines = [f"🔄 <b>INVERSE · PAPER</b>  (fills at the other side's real ask)",
+             f"{inv['n']} trades · {inv['wr']:.1f}% win",
+             f"hold {money(inv['hold'])} · ladder {money(inv['pnl'])}", "━━━━━━━━━━"]
+    for tf, d in sorted(inv["by_tf"].items()):
+        n = d["n"]
+        lines.append(f"<b>{label_for(tf)}</b> {n} · {d['w'] / n * 100:.0f}% win · "
+                     f"avg @{d['px'] / n:.0f}¢\n  hold {money(d['hold'])} "
+                     f"({d['hold'] / n / PAPER_STAKE * 100:+.1f}%/trade) · "
+                     f"ladder {money(d['pnl'])}")
+    lines.append("━━━━━━━━━━")
+    lines.append(f"favorite (all time): hold {money(fav['hold'])} · "
+                 f"ladder {money(fav['pnl'])}")
+    return "\n".join(lines)
+
+
 _upd = None
 
 def handle_commands():
@@ -547,7 +629,16 @@ def handle_commands():
             t = u.get("message", {}).get("text", "").strip().lower()
             if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
-            if t == "/stats":
+            # optional timeframe argument: "/export 60", "/exportpaths 15m", "1h", "4h"
+            parts = t.split()
+            t = parts[0].split("@")[0] if parts else ""
+            arg_tf = _parse_tf(parts[1]) if len(parts) > 1 else None
+            if len(parts) > 1 and arg_tf is None:
+                tg(f"unknown timeframe '{parts[1]}' — use 15m, 1h or 4h")
+                continue
+            if t == "/istats":
+                tg(inverse_stats_text())
+            elif t == "/stats":
                 sb = db_scoreboard()
                 if sb["n"] == 0:
                     tg("📊 <b>FAVORITE DIP · PAPER</b>\nno settled trades yet")
@@ -563,7 +654,8 @@ def handle_commands():
                     snap = [dict(asset=p["asset"], tf=p["tf"], direction=p["direction"],
                                  entry=p["entry_ask"], banked=p["ladder_proceeds"],
                                  left=p["shares_left"], rung=p["next_rung"],
-                                 peak_after=p.get("peak_bid", 0.0))
+                                 peak_after=p.get("peak_bid", 0.0),
+                                 kind=p.get("kind", "FAV"))
                             for p in pending]
                 head = f"📊 <b>FAVORITE DIP status</b>\n{len(snap)} open"
                 lines = []
@@ -572,21 +664,25 @@ def handle_commands():
                     st = (f"banked ${p['banked']:.2f}" if p["banked"] > 0
                           else "no rungs yet")
                     pk = f" · peak {p['peak_after']:.0f}¢" if p["peak_after"] else ""
-                    lines.append(f"{ASSET_EMOJI.get(p['asset'],'')}{p['asset']} "
+                    lines.append(f"{'INV ' if p['kind'] == 'INV' else ''}"
+                                 f"{ASSET_EMOJI.get(p['asset'],'')}{p['asset']} "
                                  f"{label_for(p['tf'])} {ar} @{p['entry']:.0f}¢\n"
                                  f"  {st} · {p['left']:.0f} riding · "
                                  f"next {p['rung']:.0f}¢{pk}")
                 tg(head + ("\n\n" + "\n".join(lines) if lines else "\n\nno open positions"))
             elif t == "/export":
-                text, n = build_trades_csv()
-                if not text:
-                    tg("no trades in the database yet")
-                else:
-                    tg_document("favdip_trades.csv", text,
-                                f"{n} trades · DB {DB_PATH}")
+                sfx = f"_{label_for(arg_tf)}" if arg_tf else ""
+                for table, name in (("trades", "favdip_trades"),
+                                    ("inv_trades", "favdip_inverse")):
+                    text, n = build_trades_csv(table, arg_tf)
+                    if text:
+                        tg_document(f"{name}{sfx}.csv", text, f"{n} rows · {table}")
+                    else:
+                        tg(f"no rows in {table}{' for ' + label_for(arg_tf) if arg_tf else ''} yet")
             elif t in ("/exportpaths", "/resumepaths"):
                 _paths_pause.clear()
-                threading.Thread(target=export_paths_worker, daemon=True).start()
+                threading.Thread(target=export_paths_worker, args=(arg_tf,),
+                                 daemon=True).start()
             elif t == "/pausepaths":
                 if _export_lock.locked():
                     _paths_pause.set()
@@ -594,15 +690,18 @@ def handle_commands():
                 else:
                     tg("no path export running")
             elif t == "/sendpaths":
-                threading.Thread(target=send_paths_files, daemon=True).start()
+                threading.Thread(target=send_paths_files, args=(arg_tf,),
+                                 daemon=True).start()
             elif t == "/help":
-                tg("📖 <b>commands</b>\n/stats — scoreboard\n"
+                tg("📖 <b>commands</b>  (add 15m / 1h / 4h to limit to one timeframe)\n"
+                   "/stats — favorite scoreboard\n"
+                   "/istats — inverse vs favorite, per timeframe\n"
                    "/status — open positions\n"
-                   "/export — all trades as CSV\n"
-                   "/exportpaths — pull both sides' price paths (resumable)\n"
+                   "/export [tf] — favorite + inverse trades as CSV\n"
+                   "/exportpaths [tf] — pull both sides' price paths (resumable)\n"
                    "/pausepaths — pause the path export\n"
-                   "/resumepaths — continue where it stopped\n"
-                   "/sendpaths — send the paths pulled so far\n"
+                   "/resumepaths [tf] — continue where it stopped\n"
+                   "/sendpaths [tf] — send the paths pulled so far\n"
                    "/help — this list")
     except Exception:
         pass
@@ -691,7 +790,30 @@ def dip_monitor():
                                 "next_rung": min(ask + RUNG_STEP_CENTS, RUNG_CAP_CENTS),
                                 "ladder_proceeds": 0.0, "ladder_sold": 0.0,
                                 "peak_bid": ask, "min_bid": None,
+                                "table": "trades", "kind": "FAV",
+                                "step": RUNG_STEP_CENTS, "frac": LADDER_SELL_FRAC,
                             })
+                        if INV_ENABLED and opp_ask and 0 < opp_ask < RUNG_CAP_CENTS:
+                            inv_dir = "DOWN" if direction == "UP" else "UP"
+                            inv_rid = db_insert_inv(rid, asset, tf, inv_dir, open_ts,
+                                                    close_ts, opp_ask, opp_bid, ask,
+                                                    entry_bid, pk)
+                            inv_sh = PAPER_STAKE / (opp_ask / 100.0)
+                            with pending_lock:
+                                pending.append({
+                                    "rid": inv_rid, "asset": asset, "tf": tf,
+                                    "direction": inv_dir, "open_ts": open_ts,
+                                    "close_ts": close_ts, "entry_ask": opp_ask,
+                                    "peak_at_entry": pk, "token": opp_tok,
+                                    "shares_total": inv_sh, "shares_left": inv_sh,
+                                    "next_rung": min(opp_ask + INV_RUNG_STEP_CENTS,
+                                                     RUNG_CAP_CENTS),
+                                    "ladder_proceeds": 0.0, "ladder_sold": 0.0,
+                                    "peak_bid": opp_ask, "min_bid": None,
+                                    "table": "inv_trades", "kind": "INV",
+                                    "step": INV_RUNG_STEP_CENTS,
+                                    "frac": INV_LADDER_SELL_FRAC,
+                                })
                         if SEND_EACH:
                             arrow = "↑" if direction == "UP" else "↓"
                             tg(f"🔵 <b>{ASSET_EMOJI.get(asset,'')}{asset} "
@@ -720,7 +842,7 @@ def dip_monitor():
                 proceeds_this_poll = 0.0
                 while bid >= s["next_rung"] and s["shares_left"] >= 1:
                     at_cap = s["next_rung"] >= RUNG_CAP_CENTS
-                    sell_shares = s["shares_left"] * LADDER_SELL_FRAC
+                    sell_shares = s["shares_left"] * s.get("frac", LADDER_SELL_FRAC)
                     if sell_shares < 1 or at_cap:
                         sell_shares = s["shares_left"]   # sweep dust / the cap
                     proceeds = sell_shares * (bid / 100.0)
@@ -731,10 +853,11 @@ def dip_monitor():
                     proceeds_this_poll += proceeds
                     if at_cap:
                         break
-                    s["next_rung"] = min(s["next_rung"] + RUNG_STEP_CENTS,
+                    s["next_rung"] = min(s["next_rung"] + s.get("step", RUNG_STEP_CENTS),
                                          RUNG_CAP_CENTS)
-                if sold_this_poll > 0:
-                    tg(f"🪜 <b>{ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                is_inv = s.get("kind") == "INV"
+                if sold_this_poll > 0 and (not is_inv or INV_SEND_EACH):
+                    tg(f"🪜 <b>{'INV ' if is_inv else ''}{ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                        f"{label_for(s['tf'])}</b> — sold {sold_this_poll:.0f} sh "
                        f"@ {bid:.0f}¢ → +${proceeds_this_poll:.2f}\n"
                        f"banked ${s['ladder_proceeds']:.2f} · "
@@ -772,7 +895,8 @@ def scorer():
                     if op is None or settle_px is None or abs((settle_px - op) / op) < 1e-6:
                         db_resolve(s["rid"], "VOID", 0, s["ladder_sold"],
                                    s["ladder_proceeds"], 0,
-                                   s.get("peak_bid"), s.get("min_bid"))
+                                   s.get("peak_bid"), s.get("min_bid"),
+                                   s.get("table", "trades"))
                         with pending_lock:
                             s in pending and pending.remove(s)
                         continue
@@ -786,9 +910,16 @@ def scorer():
                 result = "WIN" if won else "LOSS"
                 db_resolve(s["rid"], result, pnl, s["ladder_sold"],
                            round(s["ladder_proceeds"], 4), round(hold_pnl, 4),
-                           s.get("peak_bid"), s.get("min_bid"))
+                           s.get("peak_bid"), s.get("min_bid"),
+                           s.get("table", "trades"))
                 with pending_lock:
                     s in pending and pending.remove(s)
+                if s.get("kind") == "INV":
+                    if INV_SEND_EACH:
+                        tg(f"{'✅' if won else '❌'} INV {s['asset']} "
+                           f"{label_for(s['tf'])} @{s['entry_ask']:.0f}¢ · "
+                           f"hold {money(hold_pnl)} · ladder {money(pnl)}")
+                    continue
                 sb = db_scoreboard()
                 tag = "" if graded_by == "settlement" else " ⚠️ feed-graded"
                 lbl = label_for(s["tf"])
@@ -825,6 +956,7 @@ def main():
     threading.Thread(target=binance_ref_worker, daemon=True).start()
     labels = ", ".join(label_for(t) for t in TFS)
     tg(f"🔵 <b>FAVORITE DIP LADDER · PAPER</b> — no money, untested\n"
+       f"{'🔄 inverse ON: each dip also buys the other side at its real ask · /istats' + chr(10) if INV_ENABLED else ''}"
        f"buys dips ≥{DIP_DROP_CENTS:.0f}¢ below peak on sides that reached "
        f"≥{FAVORITE_MIN_CENTS:.0f}¢ · floor {DIP_FLOOR_CENTS:.0f}¢\n"
        f"ladder: sell {LADDER_SELL_FRAC:.0%} every {RUNG_STEP_CENTS:.0f}¢ climb\n"
