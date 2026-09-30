@@ -66,6 +66,9 @@ DIP_DROP_CENTS     = float(os.environ.get("DIP_DROP_CENTS", "10"))
 DIP_FLOOR_CENTS    = float(os.environ.get("DIP_FLOOR_CENTS", "50"))
 ENTRY_CUTOFF_SECS  = float(os.environ.get("ENTRY_CUTOFF_SECS", "30"))
 MAX_STACK          = int(os.environ.get("MAX_STACK", "1"))
+# One entry per market: once either side is bought, the other side is never
+# bought in that same market (avoids holding both sides of one outcome).
+ONE_PER_MARKET     = os.environ.get("ONE_PER_MARKET", "true").lower() == "true"
 
 # ── LADDER: sell a fixed-cent increment each time the bid climbs a rung ────
 RUNG_STEP_CENTS  = float(os.environ.get("RUNG_STEP_CENTS", "8"))
@@ -711,6 +714,8 @@ def handle_commands():
 peak_ask = {}
 # (asset,tf,open_ts,direction) already entered this window
 fired = set()
+# (asset,tf,open_ts) markets already entered on either side
+entered_markets = set()
 # ("REF",tf,open_ts) -> {asset: underlying ref price at window start},
 # captured ONLY for settlement-fallback grading — never used for entry
 open_windows = {}
@@ -725,6 +730,7 @@ def _cleanup_stale(now):
     for k in [k for k in open_windows if k[2] < cutoff]:
         del open_windows[k]
     fired.difference_update([k for k in fired if k[2] < cutoff])
+    entered_markets.difference_update([k for k in entered_markets if k[2] < cutoff])
 
 
 def dip_monitor():
@@ -764,6 +770,8 @@ def dip_monitor():
                             pk = ask
                         if key in fired:
                             continue
+                        if ONE_PER_MARKET and (asset, tf, open_ts) in entered_markets:
+                            continue
                         if pk < FAVORITE_MIN_CENTS:
                             continue
                         if ask < DIP_FLOOR_CENTS:
@@ -772,6 +780,7 @@ def dip_monitor():
                             continue
                         # ── ENTRY: dip on an established favorite ──
                         fired.add(key)
+                        entered_markets.add((asset, tf, open_ts))
                         opp_tok = toks[1] if direction == "UP" else toks[0]
                         opp_ask = best_ask_cents(opp_tok)
                         opp_bid = best_bid_cents(opp_tok)
