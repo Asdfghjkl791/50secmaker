@@ -87,6 +87,13 @@ INV_RUNG_STEP_CENTS = float(os.environ.get("INV_RUNG_STEP_CENTS", "8"))
 INV_LADDER_SELL_FRAC = float(os.environ.get("INV_LADDER_SELL_FRAC", "0.5"))
 INV_SEND_EACH       = os.environ.get("INV_SEND_EACH", "false").lower() == "true"
 TABLES = ("trades", "inv_trades")
+# What /stats and /istats count by default:
+#   "today" (default) = since midnight in STATS_TZ, resets every day
+#   "all"             = every trade ever
+#   an ISO time       = from that moment on, e.g. 2026-10-01T09:00-04:00
+# "/stats all" always shows everything, whatever this is set to.
+STATS_SINCE = os.environ.get("STATS_SINCE", "today").strip().lower()
+STATS_TZ    = ZoneInfo(os.environ.get("STATS_TZ", "America/Thunder_Bay"))
 
 MONITOR_POLL_SECS   = float(os.environ.get("MONITOR_POLL_SECS", "2"))
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
@@ -330,14 +337,16 @@ def db_resolve(rid, result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
     conn.close()
 
 
-def db_scoreboard(table="trades"):
+def db_scoreboard(table="trades", since_ts=None):
     assert table in TABLES
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(f"""SELECT result, pnl, tf, hold_pnl, entry_ask FROM {table}
+    c.execute(f"""SELECT result, pnl, tf, hold_pnl, entry_ask, created FROM {table}
                   WHERE result IN ('WIN','LOSS')""")
     rows = c.fetchall()
     conn.close()
+    if since_ts is not None:
+        rows = [r for r in rows if (_iso_to_ts(r[5]) or 0) >= since_ts]
     wins = sum(1 for r in rows if r[0] == "WIN")
     pnl = sum(r[1] or 0 for r in rows)
     hold = sum(r[3] or 0 for r in rows)
@@ -598,23 +607,52 @@ def _parse_tf(s):
             "240": 240, "4h": 240, "240m": 240}.get(s)
 
 
-def inverse_stats_text():
-    inv, fav = db_scoreboard("inv_trades"), db_scoreboard("trades")
-    if inv["n"] == 0:
-        return ("🔄 <b>INVERSE · PAPER</b>\nno settled inverse trades yet "
-                "(started with this update)")
-    lines = [f"🔄 <b>INVERSE · PAPER</b>  (fills at the other side's real ask)",
-             f"{inv['n']} trades · {inv['wr']:.1f}% win",
-             f"hold {money(inv['hold'])} · ladder {money(inv['pnl'])}", "━━━━━━━━━━"]
-    for tf, d in sorted(inv["by_tf"].items()):
+def _since_ts(mode=None):
+    mode = (mode or STATS_SINCE or "all").lower()
+    if mode == "all":
+        return None
+    if mode == "today":
+        now = datetime.now(STATS_TZ)
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    try:
+        return datetime.fromisoformat(mode.upper() if "t" in mode else mode).timestamp()
+    except Exception:
+        return None
+
+
+def stats_text(table, mode=None):
+    """Same layout for both strategies: totals, then one block per timeframe,
+    then the other strategy's totals as a footer."""
+    other = "trades" if table == "inv_trades" else "inv_trades"
+    since = _since_ts(mode)
+    sb, ob = db_scoreboard(table, since), db_scoreboard(other, since)
+    if table == "inv_trades":
+        title = "🔄 <b>INVERSE · PAPER</b>  (fills at the other side's real ask)"
+        foot_name = "favorite"
+    else:
+        title = "📊 <b>FAVORITE DIP · PAPER</b>"
+        foot_name = "inverse"
+    scope = "all time"
+    if since is not None:
+        st = datetime.fromtimestamp(since, tz=STATS_TZ)
+        scope = ("today" if st.hour == 0 and st.minute == 0
+                 and st.date() == datetime.now(STATS_TZ).date()
+                 else "since " + st.strftime("%b %d %H:%M"))
+    title += f" · {scope}"
+    if sb["n"] == 0:
+        return f"{title}\nno settled trades yet"
+    lines = [title,
+             f"{sb['n']} trades · {sb['wr']:.1f}% win",
+             f"hold {money(sb['hold'])} · ladder {money(sb['pnl'])}", "━━━━━━━━━━"]
+    for tf, d in sorted(sb["by_tf"].items()):
         n = d["n"]
         lines.append(f"<b>{label_for(tf)}</b> {n} · {d['w'] / n * 100:.0f}% win · "
                      f"avg @{d['px'] / n:.0f}¢\n  hold {money(d['hold'])} "
                      f"({d['hold'] / n / PAPER_STAKE * 100:+.1f}%/trade) · "
                      f"ladder {money(d['pnl'])}")
     lines.append("━━━━━━━━━━")
-    lines.append(f"favorite (all time): hold {money(fav['hold'])} · "
-                 f"ladder {money(fav['pnl'])}")
+    lines.append(f"{foot_name} ({scope}): hold {money(ob['hold'])} · "
+                 f"ladder {money(ob['pnl'])}")
     return "\n".join(lines)
 
 
@@ -635,23 +673,18 @@ def handle_commands():
             # optional timeframe argument: "/export 60", "/exportpaths 15m", "1h", "4h"
             parts = t.split()
             t = parts[0].split("@")[0] if parts else ""
+            if t in ("/stats", "/istats"):
+                mode = parts[1] if len(parts) > 1 and parts[1] in ("all", "today") else None
+                tg(stats_text("trades" if t == "/stats" else "inv_trades", mode))
+                continue
             arg_tf = _parse_tf(parts[1]) if len(parts) > 1 else None
             if len(parts) > 1 and arg_tf is None:
                 tg(f"unknown timeframe '{parts[1]}' — use 15m, 1h or 4h")
                 continue
             if t == "/istats":
-                tg(inverse_stats_text())
+                tg(stats_text("inv_trades"))
             elif t == "/stats":
-                sb = db_scoreboard()
-                if sb["n"] == 0:
-                    tg("📊 <b>FAVORITE DIP · PAPER</b>\nno settled trades yet")
-                    continue
-                tf_bits = [f"{label_for(tf)} {money(d['pnl'])}"
-                          for tf, d in sorted(sb["by_tf"].items())]
-                tg(f"📊 <b>FAVORITE DIP · PAPER</b>\n"
-                   f"{sb['n']} trades · {sb['wr']:.1f}% win\n"
-                   f"{' · '.join(tf_bits)}\n"
-                   f"━━━━━━━━━━\nP&L <b>{money(sb['pnl'])}</b>")
+                tg(stats_text("trades"))
             elif t == "/status":
                 with pending_lock:
                     snap = [dict(asset=p["asset"], tf=p["tf"], direction=p["direction"],
@@ -697,8 +730,8 @@ def handle_commands():
                                  daemon=True).start()
             elif t == "/help":
                 tg("📖 <b>commands</b>  (add 15m / 1h / 4h to limit to one timeframe)\n"
-                   "/stats — favorite scoreboard\n"
-                   "/istats — inverse vs favorite, per timeframe\n"
+                   "/stats — favorite today, per timeframe (/stats all = all time)\n"
+                   "/istats — inverse today, per timeframe (/istats all = all time)\n"
                    "/status — open positions\n"
                    "/export [tf] — favorite + inverse trades as CSV\n"
                    "/exportpaths [tf] — pull both sides' price paths (resumable)\n"
