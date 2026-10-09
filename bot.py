@@ -35,6 +35,18 @@
 #   - Feed-fallback settlement grading carries the same ~0.5% fog as every
 #     other bot in this project.
 #
+# ── LIVE XRP (added Oct 9) ─────────────────────────────────────────────────
+#   ONE real-money setup: XRP 15m, favorite dips 12-15c -> buy the OTHER side,
+#   hold to settlement. Everything else stays paper and is silent on Telegram.
+#   OFF until LIVE_ENABLED=true. Needs `py-clob-client` in requirements.txt.
+#   ENV: LIVE_ENABLED=false, LIVE_STAKE=1, LIVE_MAX_OVERPAY_CENTS=2,
+#        LIVE_DAILY_LOSS_LIMIT=10, LIVE_MAX_OPEN=3,
+#        POLY_PRIVATE_KEY, POLY_FUNDER (your Polymarket wallet address),
+#        POLY_SIG_TYPE=1 (1 = email login, 2 = browser-wallet login)
+#   Commands: /live [all] · /balance · /stop · /go
+#   Paper fav/inverse trades no longer message you (PAPER_ALERTS=false);
+#   /stats, /istats and /export still work.
+#
 # ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 # ENV (optional): PAPER_STAKE=5, TIMEFRAMES=15,60,240, FAVORITE_MIN_CENTS=65,
 #   DIP_DROP_CENTS=10, DIP_FLOOR_CENTS=50, ENTRY_CUTOFF_SECS=30, MAX_STACK=1,
@@ -55,7 +67,10 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PAPER_STAKE      = float(os.environ.get("PAPER_STAKE", "5"))
 DB_PATH          = os.environ.get("DB_PATH", "paper_favorite_dip.db")
-SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
+# Per-trade Telegram messages for the PAPER favorite/inverse trades.
+# Off by default now — only the XRP setup messages you (see LIVE below).
+PAPER_ALERTS     = os.environ.get("PAPER_ALERTS", "false").lower() == "true"
+SEND_EACH        = PAPER_ALERTS
 
 # 5m excluded by default — too little runway for a dip to recover and ladder.
 TFS = [int(x) for x in os.environ.get("TIMEFRAMES", "15,60,240").split(",")]
@@ -85,8 +100,23 @@ RUNG_CAP_CENTS   = float(os.environ.get("RUNG_CAP_CENTS", "99"))
 INV_ENABLED         = os.environ.get("INV_ENABLED", "true").lower() == "true"
 INV_RUNG_STEP_CENTS = float(os.environ.get("INV_RUNG_STEP_CENTS", "8"))
 INV_LADDER_SELL_FRAC = float(os.environ.get("INV_LADDER_SELL_FRAC", "0.5"))
-INV_SEND_EACH       = os.environ.get("INV_SEND_EACH", "false").lower() == "true"
+INV_SEND_EACH       = PAPER_ALERTS
 TABLES = ("trades", "inv_trades")
+
+# ── LIVE: the one real-money setup ─────────────────────────────────────────
+XRP_ASSET        = os.environ.get("XRP_ASSET", "XRP")
+XRP_TF           = int(os.environ.get("XRP_TF", "15"))
+XRP_DIP_MIN      = float(os.environ.get("XRP_DIP_MIN", "12"))
+XRP_DIP_MAX      = float(os.environ.get("XRP_DIP_MAX", "15"))
+LIVE_ENABLED     = os.environ.get("LIVE_ENABLED", "false").lower() == "true"
+LIVE_STAKE       = float(os.environ.get("LIVE_STAKE", "1"))
+LIVE_MAX_OVERPAY = float(os.environ.get("LIVE_MAX_OVERPAY_CENTS", "2"))
+LIVE_DAILY_LOSS  = float(os.environ.get("LIVE_DAILY_LOSS_LIMIT", "10"))
+LIVE_MAX_OPEN    = int(os.environ.get("LIVE_MAX_OPEN", "3"))
+POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "").strip()
+POLY_FUNDER      = os.environ.get("POLY_FUNDER", "").strip()
+POLY_SIG_TYPE    = int(os.environ.get("POLY_SIG_TYPE", "1"))
+FEE_RATE         = 0.07   # taker fee: shares x 0.07 x p x (1-p)
 # What /stats and /istats count by default:
 #   "today" (default) = since midnight in STATS_TZ, resets every day
 #   "all"             = every trade ever
@@ -285,6 +315,13 @@ def init_db():
         peak_at_entry REAL, result TEXT, pnl REAL, ladder_sold REAL DEFAULT 0,
         ladder_proceeds REAL DEFAULT 0, hold_pnl REAL, peak_bid_after REAL,
         min_bid_after REAL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS xrp_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, inv_id INTEGER,
+        mode TEXT, asset TEXT, tf INTEGER, direction TEXT, open_ts INTEGER,
+        close_ts INTEGER, fav_peak REAL, fav_ask REAL, dip REAL, seen_ask REAL,
+        cap REAL, order_id TEXT, status TEXT, cost REAL, shares REAL,
+        avg_price REAL, note TEXT, result TEXT, pnl REAL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)""")
     for tbl in TABLES:
         conn.execute(f"UPDATE {tbl} SET result='VOID' WHERE result='PENDING'")
     conn.commit()
@@ -656,6 +693,264 @@ def stats_text(table, mode=None):
     return "\n".join(lines)
 
 
+# ═══ LIVE XRP ═══════════════════════════════════════════════════════════════
+# One setup only: XRP 15m, favorite dipped 12-15c below its peak -> buy the
+# OTHER side. Every signal is logged in xrp_trades (mode LIVE / PAPER /
+# MISSED / BLOCKED) and settled from Polymarket's own result, even across
+# restarts. PAPER rows = what $LIVE_STAKE would have done (fee included).
+
+_clob = None
+_clob_lock = threading.Lock()
+_live_lock = threading.Lock()
+
+
+def kv_get(k, default=None):
+    conn = sqlite3.connect(DB_PATH)
+    r = conn.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    conn.close()
+    return r[0] if r else default
+
+
+def kv_set(k, v):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", (k, str(v)))
+    conn.commit()
+    conn.close()
+
+
+def live_paused():
+    return kv_get("live_paused", "0") == "1"
+
+
+def clob():
+    """Signed Polymarket client, built once. Raises with a readable reason."""
+    global _clob
+    with _clob_lock:
+        if _clob is not None:
+            return _clob
+        if not POLY_PRIVATE_KEY:
+            raise RuntimeError("POLY_PRIVATE_KEY is not set in Railway")
+        if POLY_SIG_TYPE in (1, 2) and not POLY_FUNDER:
+            raise RuntimeError("POLY_FUNDER (your Polymarket wallet address) is not set")
+        try:
+            from py_clob_client.client import ClobClient
+        except ImportError:
+            raise RuntimeError("py-clob-client is not installed — add it to requirements.txt")
+        c = ClobClient(CLOB_BASE, key=POLY_PRIVATE_KEY, chain_id=137,
+                       signature_type=POLY_SIG_TYPE,
+                       funder=POLY_FUNDER or None)
+        c.set_api_creds(c.create_or_derive_api_creds())
+        _clob = c
+        return c
+
+
+def usdc_balance():
+    c = clob()
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+    r = c.get_balance_allowance(BalanceAllowanceParams(
+        asset_type=AssetType.COLLATERAL, signature_type=POLY_SIG_TYPE))
+    return float(r.get("balance", 0)) / 1e6
+
+
+def _today_start():
+    now = datetime.now(STATS_TZ)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def xrp_rows(since_ts=None):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""SELECT id, created, mode, result, pnl, cost, open_ts
+                           FROM xrp_trades""").fetchall()
+    conn.close()
+    if since_ts is not None:
+        rows = [r for r in rows if (_iso_to_ts(r[1]) or 0) >= since_ts]
+    return rows
+
+
+def live_risk_check():
+    """Returns None if a live trade is allowed, else the reason it isn't."""
+    if live_paused():
+        return "paused (/go to resume)"
+    rows = xrp_rows(_today_start())
+    live = [r for r in rows if r[2] == "LIVE"]
+    realized = sum(r[4] or 0 for r in live if r[3] in ("WIN", "LOSS"))
+    open_rows = [r for r in live if r[3] is None]
+    open_cost = sum(r[5] or 0 for r in open_rows)
+    if len(open_rows) >= LIVE_MAX_OPEN:
+        return f"{len(open_rows)} trades already open (max {LIVE_MAX_OPEN})"
+    # worst case: every open trade loses, plus this one
+    if realized - open_cost - LIVE_STAKE < -LIVE_DAILY_LOSS - 1e-9:
+        return (f"daily loss limit ${LIVE_DAILY_LOSS:g} reached "
+                f"(today {money(realized)}, ${open_cost:.2f} still open)")
+    return None
+
+
+def _insert_xrp(**kw):
+    cols = ",".join(kw)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(f"INSERT INTO xrp_trades (created,{cols}) VALUES (?{',?' * len(kw)})",
+              (datetime.now(timezone.utc).isoformat(), *kw.values()))
+    rid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def _place_live_buy(token, seen_ask):
+    """FOK market buy of LIVE_STAKE dollars, never above seen_ask + overpay.
+    Returns (status, cost, shares, order_id, note)."""
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+    cap = min(round((seen_ask + LIVE_MAX_OVERPAY) / 100.0, 2), 0.95)
+    c = clob()
+    mo = MarketOrderArgs(token_id=token, amount=round(LIVE_STAKE, 2), side=BUY,
+                         price=cap, order_type=OrderType.FOK)
+    signed = c.create_market_order(mo)
+    resp = c.post_order(signed, OrderType.FOK) or {}
+    log.info(f"[LIVE] order resp: {str(resp)[:300]}")
+    oid = resp.get("orderID") or resp.get("orderId") or ""
+    if not resp.get("success", False) or resp.get("errorMsg"):
+        return "REJECTED", 0.0, 0.0, oid, str(resp.get("errorMsg") or resp)[:200]
+    status = str(resp.get("status", "")).lower()
+    try:
+        cost = float(resp.get("makingAmount") or 0)
+        shares = float(resp.get("takingAmount") or 0)
+    except Exception:
+        cost, shares = 0.0, 0.0
+    if status != "matched" and shares <= 0:
+        return "UNFILLED", 0.0, 0.0, oid, f"status={status}"
+    if cost <= 0 or shares <= 0:   # matched but amounts missing: estimate
+        cost, shares = LIVE_STAKE, LIVE_STAKE / (seen_ask / 100.0)
+        return "FILLED", cost, shares, oid, "amounts estimated"
+    return "FILLED", cost, shares, oid, ""
+
+
+def xrp_signal(inv_rid, direction, token, open_ts, close_ts, fav_peak, fav_ask, opp_ask):
+    """Called the moment the paper bot opens an inverse trade that matches the
+    XRP setup. Places the real order (if live) and always logs + messages."""
+    dip = fav_peak - fav_ask
+    arrow = "↑" if direction == "UP" else "↓"
+    t_et = datetime.fromtimestamp(open_ts, tz=STATS_TZ).strftime("%H:%M")
+    head = f"⚪ <b>XRP 15m {arrow}</b> ({t_et} window) · fav dipped {fav_peak:.0f}→{fav_ask:.0f}¢"
+    base = dict(inv_id=inv_rid, asset=XRP_ASSET, tf=XRP_TF, direction=direction,
+                open_ts=open_ts, close_ts=close_ts, fav_peak=fav_peak,
+                fav_ask=fav_ask, dip=dip, seen_ask=opp_ask)
+    if not LIVE_ENABLED:
+        sh = LIVE_STAKE / (opp_ask / 100.0)
+        _insert_xrp(mode="PAPER", cost=LIVE_STAKE, shares=sh, avg_price=opp_ask, **base)
+        tg(f"{head}\n📝 paper ${LIVE_STAKE:g} @ {opp_ask:.0f}¢ (live is OFF)")
+        return
+    with _live_lock:
+        why = live_risk_check()
+        if why:
+            _insert_xrp(mode="BLOCKED", note=why, **base)
+            tg(f"{head}\n⛔ skipped: {why}")
+            return
+        try:
+            status, cost, shares, oid, note = _place_live_buy(token, opp_ask)
+        except Exception as e:
+            log.error(f"[LIVE] order error: {e}")
+            _insert_xrp(mode="MISSED", status="ERROR", note=str(e)[:200], **base)
+            tg(f"{head}\n⚠️ order failed: {str(e)[:200]}")
+            return
+        if status != "FILLED":
+            _insert_xrp(mode="MISSED", status=status, order_id=oid, note=note, **base)
+            why = (f"no shares at or under {opp_ask + LIVE_MAX_OVERPAY:.0f}¢"
+                   if status == "UNFILLED" else "order rejected")
+            tg(f"{head}\n⏭ not filled — {why}\n<i>{note[:150]}</i>")
+            return
+        avg = cost / shares * 100.0
+        _insert_xrp(mode="LIVE", status=status, order_id=oid, cost=cost,
+                    shares=shares, avg_price=avg,
+                    cap=opp_ask + LIVE_MAX_OVERPAY, note=note, **base)
+        tg(f"{head}\n💵 <b>LIVE</b> bought {shares:.2f} sh for ${cost:.2f} "
+           f"@ {avg:.1f}¢ (saw {opp_ask:.0f}¢)\nwin pays +${shares - cost:.2f}")
+
+
+def xrp_settler():
+    """Settles every open xrp_trades row from Polymarket's result. Independent
+    of the paper scorer, so live trades survive a restart."""
+    while True:
+        try:
+            time.sleep(20)
+            now = time.time()
+            conn = sqlite3.connect(DB_PATH)
+            rows = conn.execute("""SELECT id, mode, direction, open_ts, close_ts,
+                                   cost, shares, seen_ask, avg_price FROM xrp_trades
+                                   WHERE result IS NULL AND mode IN ('LIVE','PAPER')
+                                   AND close_ts < ?""", (now - 5,)).fetchall()
+            conn.close()
+            for rid, mode, d, o, c_ts, cost, shares, seen, avg in rows:
+                outcome = fetch_polymarket_outcome(XRP_ASSET, XRP_TF, o)
+                if outcome is None:
+                    if now - c_ts > 6 * 3600:
+                        conn = sqlite3.connect(DB_PATH)
+                        conn.execute("UPDATE xrp_trades SET result='VOID', pnl=0 WHERE id=?", (rid,))
+                        conn.commit(); conn.close()
+                        tg(f"⚠️ XRP trade #{rid} couldn't be graded after 6h — check Polymarket")
+                    continue
+                won = outcome == d
+                p = (avg or seen) / 100.0
+                if mode == "PAPER":   # include the taker fee, like real trading
+                    fee = shares * FEE_RATE * p * (1 - p)
+                    pnl = (shares - cost - fee) if won else (-cost - fee)
+                else:                 # real fill amounts already net of what we paid
+                    pnl = (shares - cost) if won else -cost
+                res = "WIN" if won else "LOSS"
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("UPDATE xrp_trades SET result=?, pnl=? WHERE id=?",
+                             (res, round(pnl, 4), rid))
+                conn.commit(); conn.close()
+                today = [r for r in xrp_rows(_today_start()) if r[2] == mode
+                         and r[3] in ("WIN", "LOSS")]
+                tot = sum(r[4] or 0 for r in today)
+                tag = "💵 LIVE" if mode == "LIVE" else "📝 paper"
+                tg(f"{'✅' if won else '❌'} <b>XRP 15m {res} {money(pnl)}</b> · {tag}\n"
+                   f"today: {len(today)} trades · {sum(1 for r in today if r[3] == 'WIN')} wins · "
+                   f"{money(tot)}")
+        except Exception as e:
+            log.error(f"[XRP-SETTLE] {e}")
+
+
+def live_text(all_time=False):
+    since = None if all_time else _today_start()
+    rows = xrp_rows(since)
+    scope = "all time" if all_time else "today"
+    out = [f"⚪ <b>XRP 15m inverse · dip {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢</b> · {scope}",
+           f"live: {'ON' if LIVE_ENABLED else 'OFF'}"
+           f"{' · ⏸ PAUSED' if LIVE_ENABLED and live_paused() else ''}"
+           f" · ${LIVE_STAKE:g}/trade · daily limit ${LIVE_DAILY_LOSS:g}"]
+    for mode, name in (("LIVE", "💵 real"), ("PAPER", "📝 paper")):
+        m = [r for r in rows if r[2] == mode]
+        if not m:
+            continue
+        done = [r for r in m if r[3] in ("WIN", "LOSS")]
+        w = sum(1 for r in done if r[3] == "WIN")
+        pnl = sum(r[4] or 0 for r in done)
+        op = len(m) - len(done)
+        out.append(f"{name}: {len(done)} trades · {w} wins · {money(pnl)}"
+                   f"{f' · {op} open' if op else ''}")
+    miss = sum(1 for r in rows if r[2] == "MISSED")
+    blk = sum(1 for r in rows if r[2] == "BLOCKED")
+    if miss or blk:
+        out.append(f"skipped: {miss} not filled · {blk} blocked by limits")
+    if all_time:
+        days = {}
+        for r in rows:
+            if r[2] in ("LIVE", "PAPER") and r[3] in ("WIN", "LOSS"):
+                dk = datetime.fromtimestamp(_iso_to_ts(r[1]) or 0, tz=STATS_TZ).strftime("%b %d")
+                days.setdefault((dk, r[2]), 0.0)
+                days[(dk, r[2])] += r[4] or 0
+        if days:
+            out.append("━━━━━━━━━━")
+            for (dk, mode), v in sorted(days.items(), key=lambda x: x[0]):
+                out.append(f"{dk} {'real' if mode == 'LIVE' else 'paper'} {money(v)}")
+    if len(out) == 2:
+        out.append("no XRP setups yet")
+    return "\n".join(out)
+
+
 _upd = None
 
 def handle_commands():
@@ -673,6 +968,25 @@ def handle_commands():
             # optional timeframe argument: "/export 60", "/exportpaths 15m", "1h", "4h"
             parts = t.split()
             t = parts[0].split("@")[0] if parts else ""
+            if t == "/live":
+                tg(live_text(len(parts) > 1 and parts[1] == "all"))
+                continue
+            if t == "/stop":
+                kv_set("live_paused", "1")
+                tg("⏸ <b>live XRP trading STOPPED</b> — no new real trades. "
+                   "Open trades still settle. /go to resume.")
+                continue
+            if t == "/go":
+                kv_set("live_paused", "0")
+                tg("▶️ live XRP trading resumed" if LIVE_ENABLED else
+                   "▶️ unpaused — but LIVE_ENABLED is false in Railway, so it's still paper")
+                continue
+            if t == "/balance":
+                try:
+                    tg(f"💰 Polymarket cash: <b>${usdc_balance():.2f}</b> USDC")
+                except Exception as e:
+                    tg(f"⚠️ couldn't read balance: {str(e)[:200]}")
+                continue
             if t in ("/stats", "/istats"):
                 mode = parts[1] if len(parts) > 1 and parts[1] in ("all", "today") else None
                 tg(stats_text("trades" if t == "/stats" else "inv_trades", mode))
@@ -730,6 +1044,11 @@ def handle_commands():
                                  daemon=True).start()
             elif t == "/help":
                 tg("📖 <b>commands</b>  (add 15m / 1h / 4h to limit to one timeframe)\n"
+                   "<b>XRP</b>\n"
+                   "/live — XRP today, real + paper (/live all = every day)\n"
+                   "/balance — Polymarket cash\n"
+                   "/stop — stop real trades now · /go — resume\n"
+                   "<b>paper</b>\n"
                    "/stats — favorite today, per timeframe (/stats all = all time)\n"
                    "/istats — inverse today, per timeframe (/istats all = all time)\n"
                    "/status — open positions\n"
@@ -856,6 +1175,13 @@ def dip_monitor():
                                     "step": INV_RUNG_STEP_CENTS,
                                     "frac": INV_LADDER_SELL_FRAC,
                                 })
+                            if (asset == XRP_ASSET and tf == XRP_TF and
+                                    XRP_DIP_MIN <= pk - ask <= XRP_DIP_MAX):
+                                try:
+                                    xrp_signal(inv_rid, inv_dir, opp_tok, open_ts,
+                                               close_ts, pk, ask, opp_ask)
+                                except Exception as e:
+                                    log.error(f"[XRP] signal error: {e}")
                         if SEND_EACH:
                             arrow = "↑" if direction == "UP" else "↓"
                             tg(f"🔵 <b>{ASSET_EMOJI.get(asset,'')}{asset} "
@@ -898,7 +1224,7 @@ def dip_monitor():
                     s["next_rung"] = min(s["next_rung"] + s.get("step", RUNG_STEP_CENTS),
                                          RUNG_CAP_CENTS)
                 is_inv = s.get("kind") == "INV"
-                if sold_this_poll > 0 and (not is_inv or INV_SEND_EACH):
+                if sold_this_poll > 0 and PAPER_ALERTS:
                     tg(f"🪜 <b>{'INV ' if is_inv else ''}{ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                        f"{label_for(s['tf'])}</b> — sold {sold_this_poll:.0f} sh "
                        f"@ {bid:.0f}¢ → +${proceeds_this_poll:.2f}\n"
@@ -962,6 +1288,8 @@ def scorer():
                            f"{label_for(s['tf'])} @{s['entry_ask']:.0f}¢ · "
                            f"hold {money(hold_pnl)} · ladder {money(pnl)}")
                     continue
+                if not PAPER_ALERTS:
+                    continue
                 sb = db_scoreboard()
                 tag = "" if graded_by == "settlement" else " ⚠️ feed-graded"
                 lbl = label_for(s["tf"])
@@ -1005,6 +1333,18 @@ def main():
        f"tf={labels} · stake ${PAPER_STAKE:g}\n/stats")
     threading.Thread(target=dip_monitor, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
+    threading.Thread(target=xrp_settler, daemon=True).start()
+    live_line = "📝 XRP live trading is OFF (paper only)"
+    if LIVE_ENABLED:
+        try:
+            bal = usdc_balance()
+            live_line = (f"💵 <b>XRP LIVE ON</b> · ${LIVE_STAKE:g}/trade · "
+                         f"daily limit ${LIVE_DAILY_LOSS:g} · cash ${bal:.2f}"
+                         f"{' · ⏸ PAUSED (/go)' if live_paused() else ''}")
+        except Exception as e:
+            live_line = f"⚠️ XRP LIVE could not connect: {str(e)[:200]}"
+    tg(f"⚪ <b>XRP 15m inverse</b> (fav dips {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢)\n"
+       f"{live_line}\nOnly XRP trades message you now · /live · /help")
     while True:
         try:
             handle_commands()
