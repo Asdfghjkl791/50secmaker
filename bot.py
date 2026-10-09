@@ -38,7 +38,7 @@
 # ── LIVE XRP (added Oct 9) ─────────────────────────────────────────────────
 #   ONE real-money setup: XRP 15m, favorite dips 12-15c -> buy the OTHER side,
 #   hold to settlement. Everything else stays paper and is silent on Telegram.
-#   OFF until LIVE_ENABLED=true. Needs `py-clob-client` in requirements.txt.
+#   OFF until LIVE_ENABLED=true. Needs `py-clob-client-v2` in requirements.txt.
 #   ENV: LIVE_ENABLED=false, LIVE_STAKE=1, LIVE_MAX_OVERPAY_CENTS=2,
 #        LIVE_DAILY_LOSS_LIMIT=10, LIVE_MAX_OPEN=3,
 #        POLY_PRIVATE_KEY, POLY_FUNDER (your Polymarket wallet address),
@@ -700,6 +700,7 @@ def stats_text(table, mode=None):
 # restarts. PAPER rows = what $LIVE_STAKE would have done (fee included).
 
 _clob = None
+CLOB_V2 = True
 _clob_lock = threading.Lock()
 _live_lock = threading.Lock()
 
@@ -732,21 +733,33 @@ def clob():
             raise RuntimeError("POLY_PRIVATE_KEY is not set in Railway")
         if POLY_SIG_TYPE in (1, 2) and not POLY_FUNDER:
             raise RuntimeError("POLY_FUNDER (your Polymarket wallet address) is not set")
-        try:
-            from py_clob_client.client import ClobClient
+        global CLOB_V2
+        try:                                   # Polymarket's current client
+            from py_clob_client_v2 import ClobClient
+            CLOB_V2 = True
         except ImportError:
-            raise RuntimeError("py-clob-client is not installed — add it to requirements.txt")
-        c = ClobClient(CLOB_BASE, key=POLY_PRIVATE_KEY, chain_id=137,
+            try:                               # older client, if that's installed
+                from py_clob_client.client import ClobClient
+                CLOB_V2 = False
+            except ImportError:
+                raise RuntimeError("Polymarket client not installed — add "
+                                   "py-clob-client-v2 to requirements.txt")
+        c = ClobClient(CLOB_BASE, chain_id=137, key=POLY_PRIVATE_KEY,
                        signature_type=POLY_SIG_TYPE,
                        funder=POLY_FUNDER or None)
-        c.set_api_creds(c.create_or_derive_api_creds())
+        c.set_api_creds(c.create_or_derive_api_key() if CLOB_V2
+                        else c.create_or_derive_api_creds())
         _clob = c
+        log.info(f"[LIVE] connected ({'v2' if CLOB_V2 else 'v1'} client)")
         return c
 
 
 def usdc_balance():
     c = clob()
-    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+    if CLOB_V2:
+        from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+    else:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
     r = c.get_balance_allowance(BalanceAllowanceParams(
         asset_type=AssetType.COLLATERAL, signature_type=POLY_SIG_TYPE))
     return float(r.get("balance", 0)) / 1e6
@@ -800,14 +813,21 @@ def _insert_xrp(**kw):
 def _place_live_buy(token, seen_ask):
     """FOK market buy of LIVE_STAKE dollars, never above seen_ask + overpay.
     Returns (status, cost, shares, order_id, note)."""
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
     cap = min(round((seen_ask + LIVE_MAX_OVERPAY) / 100.0, 2), 0.95)
     c = clob()
-    mo = MarketOrderArgs(token_id=token, amount=round(LIVE_STAKE, 2), side=BUY,
-                         price=cap, order_type=OrderType.FOK)
-    signed = c.create_market_order(mo)
-    resp = c.post_order(signed, OrderType.FOK) or {}
+    if CLOB_V2:
+        from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
+        mo = MarketOrderArgs(token_id=token, amount=round(LIVE_STAKE, 2),
+                             side=Side.BUY, price=cap, order_type=OrderType.FOK)
+        resp = c.create_and_post_market_order(mo, order_type=OrderType.FOK) or {}
+    else:
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
+        mo = MarketOrderArgs(token_id=token, amount=round(LIVE_STAKE, 2), side=BUY,
+                             price=cap, order_type=OrderType.FOK)
+        resp = c.post_order(c.create_market_order(mo), OrderType.FOK) or {}
+    if not isinstance(resp, dict):
+        resp = {"success": False, "errorMsg": str(resp)[:200]}
     log.info(f"[LIVE] order resp: {str(resp)[:300]}")
     oid = resp.get("orderID") or resp.get("orderId") or ""
     if not resp.get("success", False) or resp.get("errorMsg"):
