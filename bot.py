@@ -772,7 +772,7 @@ def _today_start():
 
 def xrp_rows(since_ts=None):
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""SELECT id, created, mode, result, pnl, cost, open_ts
+    rows = conn.execute("""SELECT id, created, mode, result, pnl, cost, open_ts, asset
                            FROM xrp_trades""").fetchall()
     conn.close()
     if since_ts is not None:
@@ -852,7 +852,7 @@ def xrp_signal(inv_rid, direction, token, open_ts, close_ts, fav_peak, fav_ask, 
     dip = fav_peak - fav_ask
     arrow = "↑" if direction == "UP" else "↓"
     t_et = datetime.fromtimestamp(open_ts, tz=STATS_TZ).strftime("%H:%M")
-    head = f"⚪ <b>XRP 15m {arrow}</b> ({t_et} window) · fav dipped {fav_peak:.0f}→{fav_ask:.0f}¢"
+    head = f"⚪ <b>{XRP_ASSET} 15m {arrow}</b> ({t_et} window) · fav dipped {fav_peak:.0f}→{fav_ask:.0f}¢"
     base = dict(inv_id=inv_rid, asset=XRP_ASSET, tf=XRP_TF, direction=direction,
                 open_ts=open_ts, close_ts=close_ts, fav_peak=fav_peak,
                 fav_ask=fav_ask, dip=dip, seen_ask=opp_ask)
@@ -897,18 +897,18 @@ def xrp_settler():
             now = time.time()
             conn = sqlite3.connect(DB_PATH)
             rows = conn.execute("""SELECT id, mode, direction, open_ts, close_ts,
-                                   cost, shares, seen_ask, avg_price FROM xrp_trades
+                                   cost, shares, seen_ask, avg_price, asset, tf FROM xrp_trades
                                    WHERE result IS NULL AND mode IN ('LIVE','PAPER')
                                    AND close_ts < ?""", (now - 5,)).fetchall()
             conn.close()
-            for rid, mode, d, o, c_ts, cost, shares, seen, avg in rows:
-                outcome = fetch_polymarket_outcome(XRP_ASSET, XRP_TF, o)
+            for rid, mode, d, o, c_ts, cost, shares, seen, avg, a_, tf_ in rows:
+                outcome = fetch_polymarket_outcome(a_ or XRP_ASSET, tf_ or XRP_TF, o)
                 if outcome is None:
                     if now - c_ts > 6 * 3600:
                         conn = sqlite3.connect(DB_PATH)
                         conn.execute("UPDATE xrp_trades SET result='VOID', pnl=0 WHERE id=?", (rid,))
                         conn.commit(); conn.close()
-                        tg(f"⚠️ XRP trade #{rid} couldn't be graded after 6h — check Polymarket")
+                        tg(f"⚠️ {a_ or XRP_ASSET} trade #{rid} couldn't be graded after 6h — check Polymarket")
                     continue
                 won = outcome == d
                 p = (avg or seen) / 100.0
@@ -922,11 +922,11 @@ def xrp_settler():
                 conn.execute("UPDATE xrp_trades SET result=?, pnl=? WHERE id=?",
                              (res, round(pnl, 4), rid))
                 conn.commit(); conn.close()
-                today = [r for r in xrp_rows(_today_start()) if r[2] == mode
+                today = [r for r in xrp_rows(_today_start()) if r[2] == mode and r[7] == a_
                          and r[3] in ("WIN", "LOSS")]
                 tot = sum(r[4] or 0 for r in today)
                 tag = "💵 LIVE" if mode == "LIVE" else "📝 paper"
-                tg(f"{'✅' if won else '❌'} <b>XRP 15m {res} {money(pnl)}</b> · {tag}\n"
+                tg(f"{'✅' if won else '❌'} <b>{a_ or XRP_ASSET} 15m {res} {money(pnl)}</b> · {tag}\n"
                    f"today: {len(today)} trades · {sum(1 for r in today if r[3] == 'WIN')} wins · "
                    f"{money(tot)}")
         except Exception as e:
@@ -935,9 +935,9 @@ def xrp_settler():
 
 def live_text(all_time=False):
     since = None if all_time else _today_start()
-    rows = xrp_rows(since)
+    rows = [r for r in xrp_rows(since) if r[7] == XRP_ASSET]
     scope = "all time" if all_time else "today"
-    out = [f"⚪ <b>XRP 15m inverse · dip {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢</b> · {scope}",
+    out = [f"⚪ <b>{XRP_ASSET} 15m inverse · dip {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢</b> · {scope}",
            f"live: {'ON' if LIVE_ENABLED else 'OFF'}"
            f"{' · ⏸ PAUSED' if LIVE_ENABLED and live_paused() else ''}"
            f" · ${LIVE_STAKE:g}/trade · daily limit ${LIVE_DAILY_LOSS:g}"]
@@ -1363,7 +1363,7 @@ def main():
                          f"{' · ⏸ PAUSED (/go)' if live_paused() else ''}")
         except Exception as e:
             live_line = f"⚠️ XRP LIVE could not connect: {str(e)[:200]}"
-    tg(f"⚪ <b>XRP 15m inverse</b> (fav dips {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢)\n"
+    tg(f"⚪ <b>{XRP_ASSET} 15m inverse</b> (fav dips {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢)\n"
        f"{live_line}\nOnly XRP trades message you now · /live · /help")
     while True:
         try:
