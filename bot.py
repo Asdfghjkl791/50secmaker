@@ -113,6 +113,8 @@ LIVE_STAKE       = float(os.environ.get("LIVE_STAKE", "1"))
 LIVE_MAX_OVERPAY = float(os.environ.get("LIVE_MAX_OVERPAY_CENTS", "2"))
 LIVE_DAILY_LOSS  = float(os.environ.get("LIVE_DAILY_LOSS_LIMIT", "10"))
 LIVE_MAX_OPEN    = int(os.environ.get("LIVE_MAX_OPEN", "3"))
+# Skip setups where the side we'd buy costs more than this (0 = off). e.g. 45
+LIVE_MAX_ENTRY   = float(os.environ.get("LIVE_MAX_ENTRY_CENTS", "0"))
 POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "").strip()
 POLY_FUNDER      = os.environ.get("POLY_FUNDER", "").strip()
 POLY_SIG_TYPE    = int(os.environ.get("POLY_SIG_TYPE", "1"))
@@ -856,6 +858,10 @@ def xrp_signal(inv_rid, direction, token, open_ts, close_ts, fav_peak, fav_ask, 
     base = dict(inv_id=inv_rid, asset=XRP_ASSET, tf=XRP_TF, direction=direction,
                 open_ts=open_ts, close_ts=close_ts, fav_peak=fav_peak,
                 fav_ask=fav_ask, dip=dip, seen_ask=opp_ask)
+    if LIVE_MAX_ENTRY > 0 and opp_ask > LIVE_MAX_ENTRY:
+        _insert_xrp(mode="CAPPED", note=f"ask {opp_ask:.0f}c > cap {LIVE_MAX_ENTRY:.0f}c", **base)
+        tg(f"{head}\n🚫 skipped: price {opp_ask:.0f}¢ is above your {LIVE_MAX_ENTRY:.0f}¢ cap")
+        return
     if not LIVE_ENABLED:
         sh = LIVE_STAKE / (opp_ask / 100.0)
         _insert_xrp(mode="PAPER", cost=LIVE_STAKE, shares=sh, avg_price=opp_ask, **base)
@@ -940,7 +946,8 @@ def live_text(all_time=False):
     out = [f"⚪ <b>{XRP_ASSET} 15m inverse · dip {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢</b> · {scope}",
            f"live: {'ON' if LIVE_ENABLED else 'OFF'}"
            f"{' · ⏸ PAUSED' if LIVE_ENABLED and live_paused() else ''}"
-           f" · ${LIVE_STAKE:g}/trade · daily limit ${LIVE_DAILY_LOSS:g}"]
+           f" · ${LIVE_STAKE:g}/trade · daily limit ${LIVE_DAILY_LOSS:g}"
+           f"{f' · max price {LIVE_MAX_ENTRY:.0f}¢' if LIVE_MAX_ENTRY > 0 else ''}"]
     for mode, name in (("LIVE", "💵 real"), ("PAPER", "📝 paper")):
         m = [r for r in rows if r[2] == mode]
         if not m:
@@ -953,8 +960,10 @@ def live_text(all_time=False):
                    f"{f' · {op} open' if op else ''}")
     miss = sum(1 for r in rows if r[2] == "MISSED")
     blk = sum(1 for r in rows if r[2] == "BLOCKED")
-    if miss or blk:
-        out.append(f"skipped: {miss} not filled · {blk} blocked by limits")
+    cap = sum(1 for r in rows if r[2] == "CAPPED")
+    if miss or blk or cap:
+        out.append(f"skipped: {miss} not filled · {blk} blocked by limits"
+                   + (f" · {cap} above {LIVE_MAX_ENTRY:.0f}¢ cap" if cap else ""))
     if all_time:
         days = {}
         for r in rows:
