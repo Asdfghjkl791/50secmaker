@@ -119,6 +119,31 @@ POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "").strip()
 POLY_FUNDER      = os.environ.get("POLY_FUNDER", "").strip()
 POLY_SIG_TYPE    = int(os.environ.get("POLY_SIG_TYPE", "1"))
 FEE_RATE         = 0.07   # taker fee: shares x 0.07 x p x (1-p)
+# Which setups place REAL orders when LIVE_ENABLED=true:
+#   "dip" = the 15m inverse-dip setup above (default, unchanged behaviour)
+#   "s1"  = S1 (below) · "dip,s1" = both
+LIVE_SETUPS = {x.strip().lower() for x in os.environ.get("LIVE_SETUPS", "dip").split(",") if x.strip()}
+
+# ── S1: near-certain 1h favorite (added Oct 14) ────────────────────────────
+#   1h market, 12-24 min left, favorite costs 85-99c, and Binance shows the
+#   favorite's side ahead of the hour's start price by >= S1_Z "normal moves"
+#   (normal move = recent 1-min volatility scaled to the time left).
+#   Backtest: Oct 3-14 244 trades / 0 losses; Sep 17-29 288 trades / 1 loss.
+#   Pays ~2-3% per win, a loss costs the whole stake. One entry per coin per hour.
+#   Always paper-tracked (silent). Real orders only if LIVE_ENABLED=true AND
+#   "s1" is in LIVE_SETUPS. Command: /s1 (today) · /s1 all
+S1_ENABLED       = os.environ.get("S1_ENABLED", "true").lower() == "true"
+S1_COINS         = [c.strip().upper() for c in os.environ.get("S1_COINS", "BTC,ETH,SOL,XRP,DOGE").split(",") if c.strip()]
+S1_Z             = float(os.environ.get("S1_Z", "2.5"))
+S1_LEFT_MIN      = float(os.environ.get("S1_LEFT_MIN_SECS", "720"))    # 12 min
+S1_LEFT_MAX      = float(os.environ.get("S1_LEFT_MAX_SECS", "1440"))   # 24 min
+S1_MIN_CENTS     = float(os.environ.get("S1_MIN_CENTS", "85"))
+S1_MAX_CENTS     = float(os.environ.get("S1_MAX_CENTS", "99"))
+S1_STAKE         = float(os.environ.get("S1_STAKE", os.environ.get("LIVE_STAKE", "1")))
+S1_MAX_OVERPAY   = float(os.environ.get("S1_MAX_OVERPAY_CENTS", "1"))
+S1_MAX_OPEN      = int(os.environ.get("S1_MAX_OPEN", "5"))
+S1_POLL_SECS     = float(os.environ.get("S1_POLL_SECS", "10"))
+BINANCE_REST     = "https://data-api.binance.vision/api/v3/klines"
 # What /stats and /istats count by default:
 #   "today" (default) = since midnight in STATS_TZ, resets every day
 #   "all"             = every trade ever
@@ -323,6 +348,10 @@ def init_db():
         close_ts INTEGER, fav_peak REAL, fav_ask REAL, dip REAL, seen_ask REAL,
         cap REAL, order_id TEXT, status TEXT, cost REAL, shares REAL,
         avg_price REAL, note TEXT, result TEXT, pnl REAL)""")
+    try:   # which setup a live/paper row belongs to: NULL/'DIP' = inverse dip, 'S1'
+        conn.execute("ALTER TABLE xrp_trades ADD COLUMN setup TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)""")
     for tbl in TABLES:
         conn.execute(f"UPDATE {tbl} SET result='VOID' WHERE result='PENDING'")
@@ -774,27 +803,31 @@ def _today_start():
 
 def xrp_rows(since_ts=None):
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""SELECT id, created, mode, result, pnl, cost, open_ts, asset
-                           FROM xrp_trades""").fetchall()
+    rows = conn.execute("""SELECT id, created, mode, result, pnl, cost, open_ts, asset,
+                           COALESCE(setup, 'DIP') FROM xrp_trades""").fetchall()
     conn.close()
     if since_ts is not None:
         rows = [r for r in rows if (_iso_to_ts(r[1]) or 0) >= since_ts]
     return rows
 
 
-def live_risk_check():
-    """Returns None if a live trade is allowed, else the reason it isn't."""
+def live_risk_check(setup="DIP", stake=None):
+    """Returns None if a live trade is allowed, else the reason it isn't.
+    The daily loss limit is shared by all setups; the open-trade cap is per setup."""
+    stake = LIVE_STAKE if stake is None else stake
     if live_paused():
         return "paused (/go to resume)"
     rows = xrp_rows(_today_start())
     live = [r for r in rows if r[2] == "LIVE"]
     realized = sum(r[4] or 0 for r in live if r[3] in ("WIN", "LOSS"))
-    open_rows = [r for r in live if r[3] is None]
-    open_cost = sum(r[5] or 0 for r in open_rows)
-    if len(open_rows) >= LIVE_MAX_OPEN:
-        return f"{len(open_rows)} trades already open (max {LIVE_MAX_OPEN})"
+    open_all = [r for r in live if r[3] is None]
+    open_cost = sum(r[5] or 0 for r in open_all)
+    open_rows = [r for r in open_all if r[8] == setup]
+    max_open = S1_MAX_OPEN if setup == "S1" else LIVE_MAX_OPEN
+    if len(open_rows) >= max_open:
+        return f"{len(open_rows)} trades already open (max {max_open})"
     # worst case: every open trade loses, plus this one
-    if realized - open_cost - LIVE_STAKE < -LIVE_DAILY_LOSS - 1e-9:
+    if realized - open_cost - stake < -LIVE_DAILY_LOSS - 1e-9:
         return (f"daily loss limit ${LIVE_DAILY_LOSS:g} reached "
                 f"(today {money(realized)}, ${open_cost:.2f} still open)")
     return None
@@ -812,20 +845,22 @@ def _insert_xrp(**kw):
     return rid
 
 
-def _place_live_buy(token, seen_ask):
-    """FOK market buy of LIVE_STAKE dollars, never above seen_ask + overpay.
+def _place_live_buy(token, seen_ask, stake=None, overpay=None, max_cap=0.95):
+    """FOK market buy of `stake` dollars, never above seen_ask + overpay.
     Returns (status, cost, shares, order_id, note)."""
-    cap = min(round((seen_ask + LIVE_MAX_OVERPAY) / 100.0, 2), 0.95)
+    stake = LIVE_STAKE if stake is None else stake
+    overpay = LIVE_MAX_OVERPAY if overpay is None else overpay
+    cap = min(round((seen_ask + overpay) / 100.0, 2), max_cap)
     c = clob()
     if CLOB_V2:
         from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
-        mo = MarketOrderArgs(token_id=token, amount=round(LIVE_STAKE, 2),
+        mo = MarketOrderArgs(token_id=token, amount=round(stake, 2),
                              side=Side.BUY, price=cap, order_type=OrderType.FOK)
         resp = c.create_and_post_market_order(mo, order_type=OrderType.FOK) or {}
     else:
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
-        mo = MarketOrderArgs(token_id=token, amount=round(LIVE_STAKE, 2), side=BUY,
+        mo = MarketOrderArgs(token_id=token, amount=round(stake, 2), side=BUY,
                              price=cap, order_type=OrderType.FOK)
         resp = c.post_order(c.create_market_order(mo), OrderType.FOK) or {}
     if not isinstance(resp, dict):
@@ -843,7 +878,7 @@ def _place_live_buy(token, seen_ask):
     if status != "matched" and shares <= 0:
         return "UNFILLED", 0.0, 0.0, oid, f"status={status}"
     if cost <= 0 or shares <= 0:   # matched but amounts missing: estimate
-        cost, shares = LIVE_STAKE, LIVE_STAKE / (seen_ask / 100.0)
+        cost, shares = stake, stake / (seen_ask / 100.0)
         return "FILLED", cost, shares, oid, "amounts estimated"
     return "FILLED", cost, shares, oid, ""
 
@@ -862,10 +897,10 @@ def xrp_signal(inv_rid, direction, token, open_ts, close_ts, fav_peak, fav_ask, 
         _insert_xrp(mode="CAPPED", note=f"ask {opp_ask:.0f}c > cap {LIVE_MAX_ENTRY:.0f}c", **base)
         tg(f"{head}\n🚫 skipped: price {opp_ask:.0f}¢ is above your {LIVE_MAX_ENTRY:.0f}¢ cap")
         return
-    if not LIVE_ENABLED:
+    if not LIVE_ENABLED or "dip" not in LIVE_SETUPS:
         sh = LIVE_STAKE / (opp_ask / 100.0)
         _insert_xrp(mode="PAPER", cost=LIVE_STAKE, shares=sh, avg_price=opp_ask, **base)
-        tg(f"{head}\n📝 paper ${LIVE_STAKE:g} @ {opp_ask:.0f}¢ (live is OFF)")
+        tg(f"{head}\n📝 paper ${LIVE_STAKE:g} @ {opp_ask:.0f}¢ (live is OFF for this setup)")
         return
     with _live_lock:
         why = live_risk_check()
@@ -903,11 +938,12 @@ def xrp_settler():
             now = time.time()
             conn = sqlite3.connect(DB_PATH)
             rows = conn.execute("""SELECT id, mode, direction, open_ts, close_ts,
-                                   cost, shares, seen_ask, avg_price, asset, tf FROM xrp_trades
+                                   cost, shares, seen_ask, avg_price, asset, tf,
+                                   COALESCE(setup, 'DIP') FROM xrp_trades
                                    WHERE result IS NULL AND mode IN ('LIVE','PAPER')
                                    AND close_ts < ?""", (now - 5,)).fetchall()
             conn.close()
-            for rid, mode, d, o, c_ts, cost, shares, seen, avg, a_, tf_ in rows:
+            for rid, mode, d, o, c_ts, cost, shares, seen, avg, a_, tf_, setup in rows:
                 outcome = fetch_polymarket_outcome(a_ or XRP_ASSET, tf_ or XRP_TF, o)
                 if outcome is None:
                     if now - c_ts > 6 * 3600:
@@ -928,11 +964,18 @@ def xrp_settler():
                 conn.execute("UPDATE xrp_trades SET result=?, pnl=? WHERE id=?",
                              (res, round(pnl, 4), rid))
                 conn.commit(); conn.close()
-                today = [r for r in xrp_rows(_today_start()) if r[2] == mode and r[7] == a_
-                         and r[3] in ("WIN", "LOSS")]
+                if setup == "S1":
+                    if mode == "PAPER":
+                        continue          # S1 paper is silent — see /s1
+                    today = [r for r in xrp_rows(_today_start()) if r[2] == mode
+                             and r[8] == "S1" and r[3] in ("WIN", "LOSS")]
+                else:
+                    today = [r for r in xrp_rows(_today_start()) if r[2] == mode and r[7] == a_
+                             and r[8] == "DIP" and r[3] in ("WIN", "LOSS")]
                 tot = sum(r[4] or 0 for r in today)
                 tag = "💵 LIVE" if mode == "LIVE" else "📝 paper"
-                tg(f"{'✅' if won else '❌'} <b>{a_ or XRP_ASSET} 15m {res} {money(pnl)}</b> · {tag}\n"
+                name = f"S1 {a_} 1h" if setup == "S1" else f"{a_ or XRP_ASSET} {label_for(tf_ or XRP_TF)}"
+                tg(f"{'✅' if won else '❌'} <b>{name} {res} {money(pnl)}</b> · {tag}\n"
                    f"today: {len(today)} trades · {sum(1 for r in today if r[3] == 'WIN')} wins · "
                    f"{money(tot)}")
         except Exception as e:
@@ -941,10 +984,10 @@ def xrp_settler():
 
 def live_text(all_time=False):
     since = None if all_time else _today_start()
-    rows = [r for r in xrp_rows(since) if r[7] == XRP_ASSET]
+    rows = [r for r in xrp_rows(since) if r[7] == XRP_ASSET and r[8] == "DIP"]
     scope = "all time" if all_time else "today"
     out = [f"⚪ <b>{XRP_ASSET} 15m inverse · dip {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢</b> · {scope}",
-           f"live: {'ON' if LIVE_ENABLED else 'OFF'}"
+           f"live: {'ON' if LIVE_ENABLED and 'dip' in LIVE_SETUPS else 'OFF'}"
            f"{' · ⏸ PAUSED' if LIVE_ENABLED and live_paused() else ''}"
            f" · ${LIVE_STAKE:g}/trade · daily limit ${LIVE_DAILY_LOSS:g}"
            f"{f' · max price {LIVE_MAX_ENTRY:.0f}¢' if LIVE_MAX_ENTRY > 0 else ''}"]
@@ -980,6 +1023,161 @@ def live_text(all_time=False):
     return "\n".join(out)
 
 
+# ── S1 ─────────────────────────────────────────────────────────────────────
+_s1_open_px = {}      # (asset, open_ts) -> Binance price at the hour's open
+_s1_sig = {}          # asset -> (fetched_at, per-second variance in %^2)
+_s1_done = set()      # (asset, open_ts) already signalled this hour
+
+
+def _binance_klines(asset, start_ms=None, limit=121):
+    p = {"symbol": f"{asset}USDT", "interval": "1m", "limit": limit}
+    if start_ms is not None:
+        p["startTime"] = start_ms
+    r = requests.get(BINANCE_REST, params=p, timeout=8)
+    r.raise_for_status()
+    return r.json()
+
+
+def s1_open_price(asset, open_ts):
+    k = (asset, open_ts)
+    if k not in _s1_open_px:
+        kl = _binance_klines(asset, start_ms=open_ts * 1000, limit=1)
+        if not kl or int(kl[0][0]) // 1000 != open_ts:
+            return None
+        _s1_open_px[k] = float(kl[0][1])          # open of the hour's first minute
+    return _s1_open_px[k]
+
+
+def s1_var_per_sec(asset):
+    """Mean squared 1-min % return over the last 2 hours, per second (cached 2 min)."""
+    hit = _s1_sig.get(asset)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    kl = _binance_klines(asset, limit=121)
+    closes = [float(x[4]) for x in kl[:-1]]        # completed minutes only
+    rets = [(closes[i] / closes[i - 1] - 1) * 100 for i in range(1, len(closes))]
+    if len(rets) < 60:
+        return None
+    v = sum(r * r for r in rets) / len(rets) / 60.0
+    _s1_sig[asset] = (time.time(), v)
+    return v
+
+
+def s1_signal(asset, direction, token, open_ts, close_ts, ask, z, left):
+    arrow = "↑" if direction == "UP" else "↓"
+    t_et = datetime.fromtimestamp(open_ts, tz=STATS_TZ).strftime("%H:%M")
+    head = (f"🎯 <b>S1 {ASSET_EMOJI.get(asset, '')}{asset} 1h {arrow}</b> ({t_et} hour) · "
+            f"{ask:.0f}¢ · {z:.1f}× ahead · {left / 60:.0f} min left")
+    base = dict(setup="S1", asset=asset, tf=60, direction=direction, open_ts=open_ts,
+                close_ts=close_ts, seen_ask=ask, dip=round(z, 2), note=f"z={z:.2f} left={left:.0f}s")
+    if not LIVE_ENABLED or "s1" not in LIVE_SETUPS:
+        sh = S1_STAKE / (ask / 100.0)
+        _insert_xrp(mode="PAPER", cost=S1_STAKE, shares=sh, avg_price=ask, **base)
+        return                                     # paper is silent — /s1
+    with _live_lock:
+        why = live_risk_check("S1", S1_STAKE)
+        if why:
+            _insert_xrp(mode="BLOCKED", **{**base, "note": why})
+            tg(f"{head}\n⛔ skipped: {why}")
+            return
+        try:
+            status, cost, shares, oid, note = _place_live_buy(
+                token, ask, stake=S1_STAKE, overpay=S1_MAX_OVERPAY, max_cap=0.99)
+        except Exception as e:
+            log.error(f"[S1] order error: {e}")
+            _insert_xrp(mode="MISSED", status="ERROR", **{**base, "note": str(e)[:200]})
+            tg(f"{head}\n⚠️ order failed: {str(e)[:200]}")
+            return
+        if status != "FILLED":
+            _insert_xrp(mode="MISSED", status=status, order_id=oid, **{**base, "note": note})
+            tg(f"{head}\n⏭ not filled at ≤{min(ask + S1_MAX_OVERPAY, 99):.0f}¢")
+            return
+        avg = cost / shares * 100.0
+        _insert_xrp(mode="LIVE", status=status, order_id=oid, cost=cost, shares=shares,
+                    avg_price=avg, cap=min(ask + S1_MAX_OVERPAY, 99), **base)
+        tg(f"{head}\n💵 <b>LIVE</b> ${cost:.2f} @ {avg:.1f}¢ · win pays +${shares - cost:.2f}")
+
+
+def s1_monitor():
+    """Every S1_POLL_SECS during minutes 36-48 of each hour: check each coin's
+    1h market and fire once if the favorite is far enough ahead."""
+    while True:
+        try:
+            time.sleep(S1_POLL_SECS)
+            open_ts, close_ts, left = window_times(60)
+            if not (S1_LEFT_MIN <= left <= S1_LEFT_MAX):
+                continue
+            for asset in S1_COINS:
+                if (asset, open_ts) in _s1_done:
+                    continue
+                now_px = prices_ref.get(asset)
+                if not now_px or time.time() - ref_last.get(asset, 0) > 15:
+                    continue                       # no fresh Binance price
+                toks = resolve_tokens(asset, 60, open_ts)
+                if not toks:
+                    continue
+                up_ask, dn_ask = best_ask_cents(toks[0]), best_ask_cents(toks[1])
+                if up_ask is None or dn_ask is None:
+                    continue
+                direction, tok, ask = (("UP", toks[0], up_ask) if up_ask >= dn_ask
+                                       else ("DOWN", toks[1], dn_ask))
+                if not (S1_MIN_CENTS <= ask <= S1_MAX_CENTS):
+                    continue
+                o = s1_open_price(asset, open_ts)
+                v = s1_var_per_sec(asset)
+                if not o or not v:
+                    continue
+                move = (now_px / o - 1) * 100 * (1 if direction == "UP" else -1)
+                z = move / ((v * left) ** 0.5)
+                if z < S1_Z:
+                    continue
+                _s1_done.add((asset, open_ts))
+                log.info(f"[S1] {asset} {direction} ask={ask:.1f} z={z:.2f} left={left:.0f}")
+                s1_signal(asset, direction, tok, open_ts, close_ts, ask, z, left)
+            for k in [k for k in _s1_open_px if k[1] < open_ts - 7200]:
+                del _s1_open_px[k]
+            _s1_done.difference_update([k for k in _s1_done if k[1] < open_ts - 7200])
+        except Exception as e:
+            log.error(f"[S1] {e}")
+
+
+def s1_text(all_time=False):
+    since = None if all_time else _today_start()
+    rows = [r for r in xrp_rows(since) if r[8] == "S1"]
+    live_on = LIVE_ENABLED and "s1" in LIVE_SETUPS
+    out = [f"🎯 <b>S1 · 1h favorite far ahead</b> · {'all time' if all_time else 'today'}",
+           f"live: {'ON' if live_on else 'OFF (paper)'}"
+           f"{' · ⏸ PAUSED' if live_on and live_paused() else ''}"
+           f" · ${S1_STAKE:g}/trade · {S1_MIN_CENTS:.0f}-{S1_MAX_CENTS:.0f}¢ · ≥{S1_Z:g}× · "
+           f"{S1_LEFT_MIN / 60:.0f}-{S1_LEFT_MAX / 60:.0f} min left"]
+    for mode, name in (("LIVE", "💵 real"), ("PAPER", "📝 paper")):
+        m = [r for r in rows if r[2] == mode]
+        if not m:
+            continue
+        done = [r for r in m if r[3] in ("WIN", "LOSS")]
+        w = sum(1 for r in done if r[3] == "WIN")
+        op = len(m) - len(done)
+        out.append(f"{name}: {len(done)} trades · {w} wins · {len(done) - w} losses · "
+                   f"{money(sum(r[4] or 0 for r in done))}{f' · {op} open' if op else ''}")
+    miss = sum(1 for r in rows if r[2] == "MISSED")
+    blk = sum(1 for r in rows if r[2] == "BLOCKED")
+    if miss or blk:
+        out.append(f"skipped: {miss} not filled · {blk} blocked by limits")
+    if all_time:
+        days = {}
+        for r in rows:
+            if r[2] in ("LIVE", "PAPER") and r[3] in ("WIN", "LOSS"):
+                dk = datetime.fromtimestamp(_iso_to_ts(r[1]) or 0, tz=STATS_TZ).strftime("%b %d")
+                days[(dk, r[2])] = days.get((dk, r[2]), 0.0) + (r[4] or 0)
+        if days:
+            out.append("━━━━━━━━━━")
+            for (dk, mode), v in sorted(days.items()):
+                out.append(f"{dk} {'real' if mode == 'LIVE' else 'paper'} {money(v)}")
+    if len(out) == 2:
+        out.append("no S1 setups yet (they only appear 12-24 min before each hour ends)")
+    return "\n".join(out)
+
+
 _upd = None
 
 def handle_commands():
@@ -1000,14 +1198,17 @@ def handle_commands():
             if t == "/live":
                 tg(live_text(len(parts) > 1 and parts[1] == "all"))
                 continue
+            if t == "/s1":
+                tg(s1_text(len(parts) > 1 and parts[1] == "all"))
+                continue
             if t == "/stop":
                 kv_set("live_paused", "1")
-                tg("⏸ <b>live XRP trading STOPPED</b> — no new real trades. "
+                tg("⏸ <b>live trading STOPPED</b> (all setups) — no new real trades. "
                    "Open trades still settle. /go to resume.")
                 continue
             if t == "/go":
                 kv_set("live_paused", "0")
-                tg("▶️ live XRP trading resumed" if LIVE_ENABLED else
+                tg("▶️ live trading resumed" if LIVE_ENABLED else
                    "▶️ unpaused — but LIVE_ENABLED is false in Railway, so it's still paper")
                 continue
             if t == "/balance":
@@ -1075,6 +1276,7 @@ def handle_commands():
                 tg("📖 <b>commands</b>  (add 15m / 1h / 4h to limit to one timeframe)\n"
                    "<b>XRP</b>\n"
                    "/live — XRP today, real + paper (/live all = every day)\n"
+                   "/s1 — S1 (1h favorite far ahead) today (/s1 all = every day)\n"
                    "/balance — Polymarket cash\n"
                    "/stop — stop real trades now · /go — resume\n"
                    "<b>paper</b>\n"
@@ -1363,17 +1565,24 @@ def main():
     threading.Thread(target=dip_monitor, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
     threading.Thread(target=xrp_settler, daemon=True).start()
-    live_line = "📝 XRP live trading is OFF (paper only)"
+    if S1_ENABLED:
+        threading.Thread(target=s1_monitor, daemon=True).start()
+    live_line = "📝 live trading is OFF (paper only)"
     if LIVE_ENABLED:
         try:
             bal = usdc_balance()
-            live_line = (f"💵 <b>XRP LIVE ON</b> · ${LIVE_STAKE:g}/trade · "
+            live_line = (f"💵 <b>LIVE ON</b> for: {', '.join(sorted(LIVE_SETUPS)) or 'nothing'} · "
                          f"daily limit ${LIVE_DAILY_LOSS:g} · cash ${bal:.2f}"
                          f"{' · ⏸ PAUSED (/go)' if live_paused() else ''}")
         except Exception as e:
-            live_line = f"⚠️ XRP LIVE could not connect: {str(e)[:200]}"
-    tg(f"⚪ <b>{XRP_ASSET} 15m inverse</b> (fav dips {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢)\n"
-       f"{live_line}\nOnly XRP trades message you now · /live · /help")
+            live_line = f"⚠️ LIVE could not connect: {str(e)[:200]}"
+    dip_on = LIVE_ENABLED and "dip" in LIVE_SETUPS
+    s1_on = LIVE_ENABLED and "s1" in LIVE_SETUPS
+    tg(f"⚪ <b>{XRP_ASSET} 15m inverse</b> (fav dips {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢) · "
+       f"{'💵 live $' + format(LIVE_STAKE, 'g') if dip_on else '📝 paper'}\n"
+       f"🎯 <b>S1</b> 1h favorite far ahead · "
+       f"{('💵 live $' + format(S1_STAKE, 'g')) if s1_on else ('📝 paper (silent)' if S1_ENABLED else 'off')}\n"
+       f"{live_line}\n/live · /s1 · /help")
     while True:
         try:
             handle_commands()
