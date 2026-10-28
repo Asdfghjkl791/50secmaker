@@ -1,1594 +1,723 @@
 #!/usr/bin/env python3
-# PAPER FAVORITE-DIP LADDER — buys dips on the FAVORITE side, ladders out as it
-# recovers (no money)
+# LIVE BTC JUMP SNIPER (Oct 27 2026) - replaces the fav-dip bot in the 50secmaker service.
 #
-# THE IDEA
-#   The longshot ladder banked money by selling into spikes on CHEAP (1-5c)
-#   longshots — but those books are thin, so live fills diverged from paper
-#   (share-count mismatches, stalled rungs, missed spikes on 3s polling).
-#   This applies the SAME banking mechanic to the FAVORITE side instead: when
-#   a side that's clearly become the favorite (ask has traded well above 50c)
-#   dips DOWN by a defined amount, buy the dip; as it climbs back toward $1,
-#   sell fixed-cent increments on the way, banking profit. The bet: favorites
-#   dip and recover constantly, and 60-95c books are deep, so fills should be
-#   clean — no slippage, no stuck rungs, no missed spikes.
+# THE RULE (from the paper jump logger; passed its fair test)
+#   When BTC moves >= JUMP_BPS within JUMP_WINDOW seconds on Binance, look at the live BTC 5m and 15m
+#   up/down markets. For the side the jump favours:
+#     fair  = model chance that side wins (BTC vs the window's start price, BTC's recent volatility, time left)
+#     edge  = fair - ask (ask read EDGE_DELAY seconds after the jump)
+#   Trade when edge >= MIN_EDGE, ask < MAX_ASK, and (ask >= CHEAP_CENTS or edge >= CHEAP_EDGE), ask 5-95c.
+#   Buy LIVE_STAKE dollars (fill-or-kill, never above ask + LIVE_MAX_OVERPAY_CENTS), sell HOLD_SECS later
+#   (fill-or-kill, never below bid - LIVE_SELL_SLIP_CENTS; retries; if it still can't sell, it holds to the end).
 #
-# HOW THIS DIFFERS FROM THE LONGSHOT LADDER
-#   - Entry is a DIP on an established favorite, not a cheap buy near the open
-#   - Entry can fire ANY TIME in the window, not just the first N seconds
-#   - Ladder rungs are ADDITIVE (fixed-cent steps) — a 74c position can't
-#     double, it's capped near the exchange's own 99c ceiling
-#   - No stop-loss on further drops, on purpose: this project's measured
-#     finding is that early exits mostly sell positions that would have
-#     recovered (both the bid-trigger and spot-reversal exits were ruled out
-#     by live data). If the dip keeps falling, it rides to settlement.
+# SAFETY
+#   - OFF until LIVE_ENABLED=true. While off it runs the same logic on paper and messages every signal.
+#   - Daily loss limit (LIVE_DAILY_LOSS_LIMIT, counts the worst case of anything still open), max trades per
+#     hour, one position per market at a time. /stop pauses instantly, /go resumes.
+#   - Every trade is shown next to what paper would have made, plus the real USDC balance change.
 #
-# HONEST LIMITS
-#   - UNTESTED. No paper data exists yet for this mechanic — this run IS the
-#     test. Do not draw conclusions before ~100+ settled trades.
-#   - Per-trade payout is small (you're buying something already likely to
-#     win) — a run of bad reversals can outweigh many small dip-buys. This
-#     can't be rescued by one lucky longshot the way the old ladder could.
-#   - FAVORITE_MIN_CENTS / DIP_DROP_CENTS / RUNG_STEP_CENTS below are starting
-#     guesses, not measured optima. Tune them AFTER real data exists, not
-#     before — and one change at a time, same discipline as every other bot.
-#   - Feed-fallback settlement grading carries the same ~0.5% fog as every
-#     other bot in this project.
+# COMMANDS: /status · /trades · /today · /balance · /stop · /go · /export · /help
 #
-# ── LIVE XRP (added Oct 9) ─────────────────────────────────────────────────
-#   ONE real-money setup: XRP 15m, favorite dips 12-15c -> buy the OTHER side,
-#   hold to settlement. Everything else stays paper and is silent on Telegram.
-#   OFF until LIVE_ENABLED=true. Needs `py-clob-client-v2` in requirements.txt.
-#   ENV: LIVE_ENABLED=false, LIVE_STAKE=1, LIVE_MAX_OVERPAY_CENTS=2,
-#        LIVE_DAILY_LOSS_LIMIT=10, LIVE_MAX_OPEN=3,
-#        POLY_PRIVATE_KEY, POLY_FUNDER (your Polymarket wallet address),
-#        POLY_SIG_TYPE=1 (1 = email login, 2 = browser-wallet login)
-#   Commands: /live [all] · /balance · /stop · /go
-#   Paper fav/inverse trades no longer message you (PAPER_ALERTS=false);
-#   /stats, /istats and /export still work.
-#
-# ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# ENV (optional): PAPER_STAKE=5, TIMEFRAMES=15,60,240, FAVORITE_MIN_CENTS=65,
-#   DIP_DROP_CENTS=10, DIP_FLOOR_CENTS=50, ENTRY_CUTOFF_SECS=30, MAX_STACK=1,
-#   RUNG_STEP_CENTS=8, LADDER_SELL_FRAC=0.5, RUNG_CAP_CENTS=99,
-#   MONITOR_POLL_SECS=2, SETTLE_POLL_SECS=15, SETTLE_TIMEOUT_SECS=1800,
-#   DB_PATH=paper_favorite_dip.db, SEND_EACH=true
+# ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, POLY_PRIVATE_KEY, POLY_FUNDER, POLY_SIG_TYPE
+# ENV (optional): LIVE_ENABLED=false  LIVE_STAKE=5  LIVE_MAX_OVERPAY_CENTS=2  LIVE_SELL_SLIP_CENTS=2
+#   LIVE_DAILY_LOSS_LIMIT=15  LIVE_MAX_TRADES_HOUR=20  HOLD_SECS=5  JL_TFS=5,15  JUMP_BPS=5  JUMP_WINDOW=2
+#   JUMP_COOLDOWN=10  EDGE_DELAY=0.25  MIN_EDGE=10  MAX_ASK=85  CHEAP_CENTS=20  CHEAP_EDGE=15
+#   DB_PATH=/data/live_jumper.db
 
-import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip
-from datetime import datetime, timezone
+import os, time, json, math, sqlite3, logging, threading, requests, csv, io, gzip, re
+from collections import deque
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-try:
-    import websocket
-    WEBSOCKET_AVAILABLE = True
-except ImportError:
-    WEBSOCKET_AVAILABLE = False
+import websocket
 
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-PAPER_STAKE      = float(os.environ.get("PAPER_STAKE", "5"))
-DB_PATH          = os.environ.get("DB_PATH", "paper_favorite_dip.db")
-# Per-trade Telegram messages for the PAPER favorite/inverse trades.
-# Off by default now — only the XRP setup messages you (see LIVE below).
-PAPER_ALERTS     = os.environ.get("PAPER_ALERTS", "false").lower() == "true"
-SEND_EACH        = PAPER_ALERTS
-
-# 5m excluded by default — too little runway for a dip to recover and ladder.
-TFS = [int(x) for x in os.environ.get("TIMEFRAMES", "15,60,240").split(",")]
-
-# ── ENTRY: dip on an established favorite ───────────────────────────────────
-FAVORITE_MIN_CENTS = float(os.environ.get("FAVORITE_MIN_CENTS", "65"))
-DIP_DROP_CENTS     = float(os.environ.get("DIP_DROP_CENTS", "10"))
-DIP_FLOOR_CENTS    = float(os.environ.get("DIP_FLOOR_CENTS", "50"))
-ENTRY_CUTOFF_SECS  = float(os.environ.get("ENTRY_CUTOFF_SECS", "30"))
-MAX_STACK          = int(os.environ.get("MAX_STACK", "1"))
-# One entry per market: once either side is bought, the other side is never
-# bought in that same market (avoids holding both sides of one outcome).
-ONE_PER_MARKET     = os.environ.get("ONE_PER_MARKET", "true").lower() == "true"
-
-# ── LADDER: sell a fixed-cent increment each time the bid climbs a rung ────
-RUNG_STEP_CENTS  = float(os.environ.get("RUNG_STEP_CENTS", "8"))
-LADDER_SELL_FRAC = float(os.environ.get("LADDER_SELL_FRAC", "0.5"))
-# Polymarket's own order price ceiling is 99c (confirmed elsewhere in this
-# project — buys above 0.99 get rejected live). Rungs never climb past it;
-# once the bid reaches it, the whole remainder sells rather than dangling.
-RUNG_CAP_CENTS   = float(os.environ.get("RUNG_CAP_CENTS", "99"))
-
-# ── INVERSE: on every favorite-dip trigger, also paper-buy the OTHER side ──
-# Filled at the other side's REAL best ask at that moment (never 100-minus-
-# favorite), so wide 1h/4h books cost what they really cost. Tracked in its
-# own table (inv_trades) with both hold-to-settle and ladder P&L.
-INV_ENABLED         = os.environ.get("INV_ENABLED", "true").lower() == "true"
-INV_RUNG_STEP_CENTS = float(os.environ.get("INV_RUNG_STEP_CENTS", "8"))
-INV_LADDER_SELL_FRAC = float(os.environ.get("INV_LADDER_SELL_FRAC", "0.5"))
-INV_SEND_EACH       = PAPER_ALERTS
-TABLES = ("trades", "inv_trades")
-
-# ── LIVE: the one real-money setup ─────────────────────────────────────────
-XRP_ASSET        = os.environ.get("XRP_ASSET", "XRP")
-XRP_TF           = int(os.environ.get("XRP_TF", "15"))
-XRP_DIP_MIN      = float(os.environ.get("XRP_DIP_MIN", "12"))
-XRP_DIP_MAX      = float(os.environ.get("XRP_DIP_MAX", "15"))
-LIVE_ENABLED     = os.environ.get("LIVE_ENABLED", "false").lower() == "true"
-LIVE_STAKE       = float(os.environ.get("LIVE_STAKE", "1"))
-LIVE_MAX_OVERPAY = float(os.environ.get("LIVE_MAX_OVERPAY_CENTS", "2"))
-LIVE_DAILY_LOSS  = float(os.environ.get("LIVE_DAILY_LOSS_LIMIT", "10"))
-LIVE_MAX_OPEN    = int(os.environ.get("LIVE_MAX_OPEN", "3"))
-# Skip setups where the side we'd buy costs more than this (0 = off). e.g. 45
-LIVE_MAX_ENTRY   = float(os.environ.get("LIVE_MAX_ENTRY_CENTS", "0"))
+DB_PATH = os.environ.get("DB_PATH", "live_jumper.db")
+env_f = lambda k, d: float(os.environ.get(k, d))
+LIVE_ENABLED = os.environ.get("LIVE_ENABLED", "false").strip().lower() == "true"
+LIVE_STAKE = env_f("LIVE_STAKE", "5")
+LIVE_MAX_OVERPAY = env_f("LIVE_MAX_OVERPAY_CENTS", "2")
+LIVE_SELL_SLIP = env_f("LIVE_SELL_SLIP_CENTS", "2")
+LIVE_DAILY_LOSS = env_f("LIVE_DAILY_LOSS_LIMIT", "15")
+LIVE_MAX_TRADES_HOUR = int(env_f("LIVE_MAX_TRADES_HOUR", "20"))
+HOLD_SECS = env_f("HOLD_SECS", "5")
+TFS = [int(x) for x in os.environ.get("JL_TFS", "5,15").split(",") if x.strip()]
+JUMP_BPS = env_f("JUMP_BPS", "5")
+JUMP_WINDOW = env_f("JUMP_WINDOW", "2")
+JUMP_COOLDOWN = env_f("JUMP_COOLDOWN", "10")
+EDGE_DELAY = env_f("EDGE_DELAY", "0.25")
+MIN_EDGE = env_f("MIN_EDGE", "10")
+MAX_ASK = env_f("MAX_ASK", "85")
+CHEAP_CENTS = env_f("CHEAP_CENTS", "20")
+CHEAP_EDGE = env_f("CHEAP_EDGE", "15")
 POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "").strip()
-POLY_FUNDER      = os.environ.get("POLY_FUNDER", "").strip()
-POLY_SIG_TYPE    = int(os.environ.get("POLY_SIG_TYPE", "1"))
-FEE_RATE         = 0.07   # taker fee: shares x 0.07 x p x (1-p)
-# Which setups place REAL orders when LIVE_ENABLED=true:
-#   "dip" = the 15m inverse-dip setup above (default, unchanged behaviour)
-#   "s1"  = S1 (below) · "dip,s1" = both
-LIVE_SETUPS = {x.strip().lower() for x in os.environ.get("LIVE_SETUPS", "dip").split(",") if x.strip()}
-
-# ── S1: near-certain 1h favorite (added Oct 14) ────────────────────────────
-#   1h market, 12-24 min left, favorite costs 85-99c, and Binance shows the
-#   favorite's side ahead of the hour's start price by >= S1_Z "normal moves"
-#   (normal move = recent 1-min volatility scaled to the time left).
-#   Backtest: Oct 3-14 244 trades / 0 losses; Sep 17-29 288 trades / 1 loss.
-#   Pays ~2-3% per win, a loss costs the whole stake. One entry per coin per hour.
-#   Always paper-tracked (silent). Real orders only if LIVE_ENABLED=true AND
-#   "s1" is in LIVE_SETUPS. Command: /s1 (today) · /s1 all
-S1_ENABLED       = os.environ.get("S1_ENABLED", "true").lower() == "true"
-S1_COINS         = [c.strip().upper() for c in os.environ.get("S1_COINS", "BTC,ETH,SOL,XRP,DOGE").split(",") if c.strip()]
-S1_Z             = float(os.environ.get("S1_Z", "2.5"))
-S1_LEFT_MIN      = float(os.environ.get("S1_LEFT_MIN_SECS", "720"))    # 12 min
-S1_LEFT_MAX      = float(os.environ.get("S1_LEFT_MAX_SECS", "1440"))   # 24 min
-S1_MIN_CENTS     = float(os.environ.get("S1_MIN_CENTS", "85"))
-S1_MAX_CENTS     = float(os.environ.get("S1_MAX_CENTS", "99"))
-S1_STAKE         = float(os.environ.get("S1_STAKE", os.environ.get("LIVE_STAKE", "1")))
-S1_MAX_OVERPAY   = float(os.environ.get("S1_MAX_OVERPAY_CENTS", "1"))
-S1_MAX_OPEN      = int(os.environ.get("S1_MAX_OPEN", "5"))
-S1_POLL_SECS     = float(os.environ.get("S1_POLL_SECS", "10"))
-BINANCE_REST     = "https://data-api.binance.vision/api/v3/klines"
-# What /stats and /istats count by default:
-#   "today" (default) = since midnight in STATS_TZ, resets every day
-#   "all"             = every trade ever
-#   an ISO time       = from that moment on, e.g. 2026-10-01T09:00-04:00
-# "/stats all" always shows everything, whatever this is set to.
-STATS_SINCE = os.environ.get("STATS_SINCE", "today").strip().lower()
-STATS_TZ    = ZoneInfo(os.environ.get("STATS_TZ", "America/Thunder_Bay"))
-
-MONITOR_POLL_SECS   = float(os.environ.get("MONITOR_POLL_SECS", "2"))
-SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
-SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "1800"))
-
-ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
-ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
-               "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
-ASSET_FULLNAME = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
-                  "DOGE": "dogecoin", "BNB": "bnb", "XRP": "xrp", "HYPE": "hype"}
+POLY_FUNDER = os.environ.get("POLY_FUNDER", "").strip()
+POLY_SIG_TYPE = int(os.environ.get("POLY_SIG_TYPE", "1"))
+FEE_RATE = 0.07
+ASSET = "BTC"
 CLOB_BASE = "https://clob.polymarket.com"
-GAMMA_BASE = "https://gamma-api.polymarket.com"
+GAMMA = "https://gamma-api.polymarket.com"
+MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BINANCE_WS = "wss://data-stream.binance.vision/stream?streams=btcusdt@bookTicker"
+BINANCE_REST = "https://data-api.binance.vision/api/v3/klines"
 ET = ZoneInfo("America/New_York")
-BINANCE_WS = ("wss://data-stream.binance.vision/stream?streams=" +
-              "/".join(f"{s}usdt@bookTicker" for s in
-                       ["btc", "eth", "sol", "doge", "bnb", "xrp"]))
-BINANCE_SYM_TO_ASSET = {f"{s.upper()}USDT": s.upper()
-                        for s in ["btc", "eth", "sol", "doge", "bnb", "xrp"]}
+TZ = ZoneInfo("America/Toronto")
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("paper-favorite-dip")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("live-jumper")
 
-prices_ref = {}
-ref_last = {}
+lock = threading.RLock()          # books / markets
+jlock = threading.Lock()          # price state
+db_lock = threading.Lock()
+trade_lock = threading.Lock()     # one live order at a time
+books = {}                        # token -> {"bids": {c: sz}, "asks": {c: sz}}
+markets = {}                      # (tf, open_ts) -> (up_tok, dn_tok)
+opens = {}                        # (tf, open_ts) -> window start price
+busy = set()                      # (tf, open_ts) with an open position
+price = {"px": None, "ts": 0.0}
+ticks = deque(maxlen=5000)        # (ts, px), last JUMP_WINDOW seconds
+px1s = deque(maxlen=1200)         # (ts, px) ~1/s
+state = {"last_jump": 0.0, "jumps": 0, "signals": 0, "started": time.time(), "bn": 0, "pm": 0, "err": ""}
+_clob = None
+
+
+def fee(sh, p):
+    return sh * FEE_RATE * p * (1 - p)
 
 
 def money(x):
-    """+$2.10 / −$5.00 — sign before the dollar, always two decimals."""
     return f"{'+' if x >= 0 else chr(0x2212)}${abs(x):.2f}"
 
 
-def label_for(tf):
-    return "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
-
-
-def binance_ref_worker():
-    while True:
-        ws = None
-        try:
-            ws = websocket.create_connection(BINANCE_WS, timeout=10)
-            ws.settimeout(30)
-            log.info("[REF] Binance.vision reference feed connected")
-            while True:
-                msg = ws.recv()
-                if not msg:
-                    continue
-                d = json.loads(msg).get("data", {})
-                a = BINANCE_SYM_TO_ASSET.get(d.get("s"))
-                if a:
-                    b, k = float(d.get("b", 0)), float(d.get("a", 0))
-                    if b > 0 and k > 0:
-                        prices_ref[a] = (b + k) / 2.0
-                        ref_last[a] = time.time()
-        except Exception as e:
-            log.warning(f"[REF] error: {e} — reconnecting")
-        finally:
-            try:
-                ws and ws.close()
-            except Exception:
-                pass
-        time.sleep(3)
-
-
-def window_times(tf):
-    now = time.time()
-    if tf == 60:
-        now_et = datetime.now(timezone.utc).astimezone(ET)
-        start_et = now_et.replace(minute=0, second=0, microsecond=0)
-        o = int(start_et.timestamp())
-        return o, o + 3600, o + 3600 - now
-    if tf == 240:
-        now_et = datetime.now(timezone.utc).astimezone(ET)
-        block_hour = (now_et.hour // 4) * 4
-        start_et = now_et.replace(hour=block_hour, minute=0, second=0, microsecond=0)
-        o = int(start_et.timestamp())
-        return o, o + 14400, o + 14400 - now
-    L = tf * 60
-    o = int(now // L) * L
-    return o, o + L, o + L - now
-
-
-def build_slug(asset, tf, open_ts):
-    if tf == 240:
-        return f"{asset.lower()}-updown-4h-{open_ts}"
-    if tf == 60:
-        dt_et = datetime.fromtimestamp(open_ts, tz=ET)
-        month = dt_et.strftime("%B").lower()
-        day = dt_et.day
-        year = dt_et.year
-        hour12 = dt_et.strftime("%I").lstrip("0") or "12"
-        ampm = dt_et.strftime("%p").lower()
-        return f"{ASSET_FULLNAME[asset]}-up-or-down-{month}-{day}-{year}-{hour12}{ampm}-et"
-    return f"{asset.lower()}-updown-{tf}m-{open_ts}"
-
-
-_market_cache = {}
-
-def resolve_tokens(asset, tf, open_ts):
-    key = (asset, tf, open_ts)
-    if key in _market_cache:
-        return _market_cache[key]
-    slug = build_slug(asset, tf, open_ts)
-    try:
-        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=8)
-        arr = r.json()
-        ev = arr[0] if isinstance(arr, list) and arr else arr
-        markets = ev.get("markets", []) if isinstance(ev, dict) else []
-        if markets:
-            toks = json.loads(markets[0].get("clobTokenIds", "[]"))
-            if len(toks) == 2:
-                _market_cache[key] = (toks[0], toks[1])
-                return _market_cache[key]
-    except Exception as e:
-        log.debug(f"[RESOLVE] {slug}: {e}")
-    _market_cache[key] = None
-    return None
-
-
-def best_ask_cents(token_id):
-    try:
-        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
-        b = r.json()
-        prices = [float(a["price"]) for a in b.get("asks", [])
-                  if float(a.get("size", 0)) > 0]
-        return min(prices) * 100.0 if prices else None
-    except Exception:
-        return None
-
-
-def best_bid_cents(token_id):
-    try:
-        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
-        b = r.json()
-        prices = [float(x["price"]) for x in b.get("bids", [])
-                  if float(x.get("size", 0)) > 0]
-        return max(prices) * 100.0 if prices else None
-    except Exception:
-        return None
-
-
-def fetch_polymarket_outcome(asset, tf, open_ts):
-    slug = build_slug(asset, tf, open_ts)
-    try:
-        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
-        data = r.json()
-        if not data or not isinstance(data, list):
-            return None
-        markets = data[0].get("markets", [])
-        if not markets:
-            return None
-        op = markets[0].get("outcomePrices")
-        if isinstance(op, str):
-            try:
-                op = json.loads(op)
-            except Exception:
-                pass
-        if not op or len(op) < 2:
-            return None
-        up_p, down_p = float(op[0]), float(op[1])
-        if up_p >= 0.99:
-            return "UP"
-        if down_p >= 0.99:
-            return "DOWN"
-        return None
-    except Exception as e:
-        log.warning(f"[OUTCOME] {slug}: {e}")
-        return None
+# ── database ────────────────────────────────────────────────────────────────
+def db():
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.row_factory = sqlite3.Row
+    return c
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, asset TEXT, tf INTEGER,
-        direction TEXT, open_ts INTEGER, close_ts INTEGER, entry_ask REAL,
-        peak_at_entry REAL, result TEXT, pnl REAL, ladder_sold REAL DEFAULT 0,
-        ladder_proceeds REAL DEFAULT 0, hold_pnl REAL)""")
-    # New columns for inverse analysis (only filled for trades from now on).
-    for col in ("opp_ask REAL", "opp_bid REAL", "entry_bid REAL",
-                "peak_bid_after REAL", "min_bid_after REAL"):
-        try:
-            conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
-        except sqlite3.OperationalError:
-            pass   # already exists
-    conn.execute("""CREATE TABLE IF NOT EXISTS inv_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, fav_id INTEGER,
-        asset TEXT, tf INTEGER, direction TEXT, open_ts INTEGER, close_ts INTEGER,
-        entry_ask REAL, entry_bid REAL, fav_ask REAL, fav_bid REAL,
-        peak_at_entry REAL, result TEXT, pnl REAL, ladder_sold REAL DEFAULT 0,
-        ladder_proceeds REAL DEFAULT 0, hold_pnl REAL, peak_bid_after REAL,
-        min_bid_after REAL)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS xrp_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, inv_id INTEGER,
-        mode TEXT, asset TEXT, tf INTEGER, direction TEXT, open_ts INTEGER,
-        close_ts INTEGER, fav_peak REAL, fav_ask REAL, dip REAL, seen_ask REAL,
-        cap REAL, order_id TEXT, status TEXT, cost REAL, shares REAL,
-        avg_price REAL, note TEXT, result TEXT, pnl REAL)""")
-    try:   # which setup a live/paper row belongs to: NULL/'DIP' = inverse dip, 'S1'
-        conn.execute("ALTER TABLE xrp_trades ADD COLUMN setup TEXT")
-    except sqlite3.OperationalError:
-        pass
-    conn.execute("""CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)""")
-    for tbl in TABLES:
-        conn.execute(f"UPDATE {tbl} SET result='VOID' WHERE result='PENDING'")
-    conn.commit()
-    conn.close()
+    with db_lock:
+        c = db()
+        c.execute("""CREATE TABLE IF NOT EXISTS lj_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, tf INTEGER,
+            open_ts INTEGER, side TEXT, bps REAL, fair REAL, ask REAL, bid0 REAL, edge REAL, mode TEXT, status TEXT,
+            buy_cost REAL, buy_shares REAL, buy_px REAL, buy_ts REAL, sell_proceeds REAL, sell_shares REAL,
+            sell_px REAL, sell_ts REAL, paper_bid REAL, paper_pnl REAL, pnl REAL, bal_before REAL, bal_after REAL,
+            result TEXT, note TEXT)""")
+        c.execute("CREATE TABLE IF NOT EXISTS lj_kv (k TEXT PRIMARY KEY, v TEXT)")
+        c.commit()
+        c.close()
 
 
-def db_insert_inv(fav_id, asset, tf, direction, open_ts, close_ts, entry_ask,
-                  entry_bid, fav_ask, fav_bid, peak_at_entry):
-    """direction = the side BOUGHT (opposite of the favorite)."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""INSERT INTO inv_trades (created,fav_id,asset,tf,direction,open_ts,
-                 close_ts,entry_ask,entry_bid,fav_ask,fav_bid,peak_at_entry,result)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'PENDING')""",
-              (datetime.now(timezone.utc).isoformat(), fav_id, asset, tf,
-               direction, open_ts, close_ts, entry_ask, entry_bid, fav_ask,
-               fav_bid, peak_at_entry))
-    rid = c.lastrowid
-    conn.commit()
-    conn.close()
-    return rid
+def db_exec(sql, args=()):
+    with db_lock:
+        c = db()
+        cur = c.execute(sql, args)
+        c.commit()
+        rid = cur.lastrowid
+        c.close()
+        return rid
 
 
-def db_insert(asset, tf, direction, open_ts, close_ts, entry_ask, peak_at_entry,
-              opp_ask=None, opp_bid=None, entry_bid=None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""INSERT INTO trades (created,asset,tf,direction,open_ts,close_ts,
-                 entry_ask,peak_at_entry,result,opp_ask,opp_bid,entry_bid)
-                 VALUES (?,?,?,?,?,?,?,?, 'PENDING',?,?,?)""",
-              (datetime.now(timezone.utc).isoformat(), asset, tf, direction,
-               open_ts, close_ts, entry_ask, peak_at_entry,
-               opp_ask, opp_bid, entry_bid))
-    rid = c.lastrowid
-    conn.commit()
-    conn.close()
-    return rid
+def db_query(sql, args=()):
+    with db_lock:
+        c = db()
+        r = c.execute(sql, args).fetchall()
+        c.close()
+        return r
 
 
-def db_resolve(rid, result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
-               peak_bid_after=None, min_bid_after=None, table="trades"):
-    assert table in TABLES
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(f"""UPDATE {table} SET result=?, pnl=?, ladder_sold=?,
-                    ladder_proceeds=?, hold_pnl=?, peak_bid_after=?,
-                    min_bid_after=? WHERE id=?""",
-                 (result, pnl, ladder_sold, ladder_proceeds, hold_pnl,
-                  peak_bid_after, min_bid_after, rid))
-    conn.commit()
-    conn.close()
-
-
-def db_scoreboard(table="trades", since_ts=None):
-    assert table in TABLES
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(f"""SELECT result, pnl, tf, hold_pnl, entry_ask, created FROM {table}
-                  WHERE result IN ('WIN','LOSS')""")
-    rows = c.fetchall()
-    conn.close()
-    if since_ts is not None:
-        rows = [r for r in rows if (_iso_to_ts(r[5]) or 0) >= since_ts]
-    wins = sum(1 for r in rows if r[0] == "WIN")
-    pnl = sum(r[1] or 0 for r in rows)
-    hold = sum(r[3] or 0 for r in rows)
-    wr = (wins / len(rows) * 100) if rows else None
-    by_tf = {}
-    for r in rows:
-        d = by_tf.setdefault(r[2], {"n": 0, "w": 0, "pnl": 0.0, "hold": 0.0,
-                                    "px": 0.0})
-        d["n"] += 1
-        d["w"] += 1 if r[0] == "WIN" else 0
-        d["pnl"] += r[1] or 0
-        d["hold"] += r[3] or 0
-        d["px"] += r[4] or 0
-    return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl, "hold": hold,
-            "by_tf": by_tf}
-
-
-def tg(msg):
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                                "parse_mode": "HTML"}, timeout=8)
-        body = {}
-        try:
-            body = r.json()
-        except Exception:
-            pass
-        if getattr(r, "status_code", 200) != 200 or not body.get("ok", False):
-            log.error(f"[TG] REJECTED {getattr(r,'status_code','?')}: {str(body)[:150]}")
-            return
-        log.info(f"[TG] {msg[:80]}")
-    except Exception as e:
-        log.error(f"TG error: {e}")
-
-
-# ── DATA EXPORT (for offline analysis / inverse-strategy engineering) ───────
-
-def tg_document(filename, text, caption=""):
-    """Send a text file (CSV) to the Telegram chat as a downloadable document."""
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]},
-            files={"document": (filename, text.encode("utf-8"), "text/csv")},
-            timeout=120)
-        ok = False
-        try:
-            ok = r.json().get("ok", False)
-        except Exception:
-            pass
-        if r.status_code != 200 or not ok:
-            log.error(f"[TG-DOC] REJECTED {r.status_code}: {r.text[:150]}")
-            tg(f"⚠️ upload of {filename} failed ({r.status_code})")
-    except Exception as e:
-        log.error(f"[TG-DOC] {e}")
-        tg(f"⚠️ upload of {filename} failed: {e}")
-
-
-def _iso_to_ts(s):
-    try:
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return None
-
-
-def build_trades_csv(table="trades", tf=None):
-    """Every row of a table (optionally one timeframe) + derived timing columns."""
-    assert table in TABLES
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    if tf:
-        rows = conn.execute(f"SELECT * FROM {table} WHERE tf=? ORDER BY id",
-                            (tf,)).fetchall()
-    else:
-        rows = conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
-    conn.close()
-    if not rows:
-        return None, 0
-    cols = list(rows[0].keys())
-    extra = ["entry_ts", "window_secs", "secs_into_window", "secs_left_at_entry",
-             "dip_cents", "shares_total"]
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(cols + extra)
-    for r in rows:
-        ets = _iso_to_ts(r["created"])
-        win = (r["close_ts"] - r["open_ts"]) if r["close_ts"] and r["open_ts"] else None
-        into = round(ets - r["open_ts"], 1) if ets and r["open_ts"] else None
-        left = round(r["close_ts"] - ets, 1) if ets and r["close_ts"] else None
-        fav_px = r["fav_ask"] if "fav_ask" in cols else r["entry_ask"]
-        dip = (round(r["peak_at_entry"] - fav_px, 2)
-               if r["peak_at_entry"] is not None and fav_px else None)
-        sh = (round(PAPER_STAKE / (r["entry_ask"] / 100.0), 4)
-              if r["entry_ask"] else None)
-        w.writerow([r[c] for c in cols] +
-                   [round(ets, 1) if ets else None, win, into, left, dip, sh])
-    return buf.getvalue(), len(rows)
-
-
-def fetch_price_history(token_id, start_ts, end_ts):
-    """Polymarket's per-token price history (1-minute points). Returns
-    [(t, price_cents), ...] — may be empty for older/closed markets."""
-    for params in ({"market": token_id, "startTs": int(start_ts),
-                    "endTs": int(end_ts), "fidelity": 1},
-                   {"market": token_id, "interval": "max", "fidelity": 1}):
-        try:
-            r = requests.get(f"{CLOB_BASE}/prices-history", params=params,
-                             timeout=15)
-            hist = r.json().get("history", []) if r.status_code == 200 else []
-            pts = [(int(h["t"]), float(h["p"]) * 100.0) for h in hist
-                   if "t" in h and "p" in h
-                   and start_ts - 60 <= int(h["t"]) <= end_ts + 60]
-            if pts:
-                return pts
-        except Exception as e:
-            log.debug(f"[HIST] {token_id[:10]}: {e}")
-    return []
-
-
-_export_lock = threading.Lock()
-_paths_io_lock = threading.Lock()
-_paths_pause = threading.Event()   # set by /pausepaths, checked between markets
-EXPORT_DIR = os.path.dirname(os.path.abspath(DB_PATH))
-PATHS_CSV = os.path.join(EXPORT_DIR, "favdip_paths.csv")
-PATHS_DONE = os.path.join(EXPORT_DIR, "favdip_paths_done.txt")
-PATHS_HEADER = ["asset", "tf", "open_ts", "token_dir", "t",
-                "secs_into_window", "price_cents"]
-TG_PART_BYTES = 40 * 1024 * 1024   # Telegram bot upload limit is 50MB
-
-
-def _market_key(asset, tf, open_ts):
-    return f"{asset}|{tf}|{open_ts}"
-
-
-def export_paths_worker(tf=None):
-    """Price path of BOTH sides for every market the bot traded, one row per
-    minute. Stored per MARKET (not per trade) so markets traded on both sides
-    aren't fetched twice; join to trades on asset+tf+open_ts.
-    Written to the volume as it goes and RESUMABLE: re-running /exportpaths
-    after a restart skips markets already done."""
-    if not _export_lock.acquire(blocking=False):
-        tg("⏳ path export already running — /sendpaths sends what's done so far")
-        return
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        q = "SELECT DISTINCT asset, tf, open_ts, close_ts FROM trades"
-        mkts = (conn.execute(q + " WHERE tf=? ORDER BY open_ts", (tf,)).fetchall()
-                if tf else conn.execute(q + " ORDER BY open_ts").fetchall())
-        conn.close()
-        scope = f" {label_for(tf)}" if tf else ""
-        done = set()
-        if os.path.exists(PATHS_DONE):
-            with open(PATHS_DONE) as f:
-                done = {ln.strip() for ln in f if ln.strip()}
-        todo = [m for m in mkts if _market_key(m[0], m[1], m[2]) not in done]
-        if not todo:
-            tg(f"✅ all {len(mkts)}{scope} markets already pulled — sending")
-            send_paths_files(tf)
-            return
-        tg(f"⏳ pulling{scope} paths: {len(todo)} markets left of {len(mkts)} "
-           f"(~{max(1, len(todo) * 7 // 600)} min). Saved as it goes — "
-           f"safe to restart, just /exportpaths again.")
-        new_file = not os.path.exists(PATHS_CSV)
-        got = empty = 0
-        for i, (asset, mtf, open_ts, close_ts) in enumerate(todo, 1):
-            if _paths_pause.is_set():
-                tg(f"⏸ paths paused at {i - 1}/{len(todo)} · progress saved\n"
-                   f"/resumepaths to continue · /sendpaths to send what's done")
-                return
-            toks = resolve_tokens(asset, mtf, open_ts)
-            rows = []
-            if toks:
-                for token_dir, tok in (("UP", toks[0]), ("DOWN", toks[1])):
-                    for (t, p) in fetch_price_history(tok, open_ts, close_ts):
-                        rows.append([asset, mtf, open_ts, token_dir, t,
-                                     t - open_ts, round(p, 2)])
-                    time.sleep(0.1)
-            _market_cache.pop((asset, mtf, open_ts), None)   # keep memory flat
-            with _paths_io_lock:
-                with open(PATHS_CSV, "a", newline="") as f:
-                    w = csv.writer(f)
-                    if new_file:
-                        w.writerow(PATHS_HEADER)
-                        new_file = False
-                    w.writerows(rows)
-                with open(PATHS_DONE, "a") as f:
-                    f.write(_market_key(asset, mtf, open_ts) + "\n")
-            got += 1 if rows else 0
-            empty += 0 if rows else 1
-            if i % 1000 == 0:
-                tg(f"⏳ paths {i}/{len(todo)} · {got} with data · {empty} empty")
-        tg(f"✅{scope} paths done · {got} markets with data · {empty} empty — sending")
-        send_paths_files(tf)
-    except Exception as e:
-        log.error(f"[EXPORT] {e}")
-        tg(f"⚠️ path export stopped: {e} — /exportpaths resumes it")
-    finally:
-        _export_lock.release()
-
-
-def send_paths_files(tf=None):
-    """Gzip the paths CSV into parts under Telegram's limit and send each.
-    Each part is a complete .csv.gz with its own header."""
-    if not os.path.exists(PATHS_CSV):
-        tg("no paths file yet — run /exportpaths")
-        return
-    parts, part_no = [], 0
-    with _paths_io_lock:
-        with open(PATHS_CSV, newline="") as src:
-            header = src.readline()
-            out = gz = None
-            tf_col = PATHS_HEADER.index("tf")
-            for line in src:
-                if tf and line.split(",")[tf_col] != str(tf):
-                    continue
-                if gz is None or out.tell() >= TG_PART_BYTES:
-                    if gz:
-                        gz.close(); out.close()
-                    part_no += 1
-                    path = os.path.join(EXPORT_DIR,
-                                        f"favdip_paths{'_' + label_for(tf) if tf else ''}"
-                                        f"_part{part_no}.csv.gz")
-                    out = open(path, "wb")
-                    gz = gzip.GzipFile(fileobj=out, mode="wb")
-                    gz.write(header.encode())
-                    parts.append(path)
-                gz.write(line.encode())
-            if gz:
-                gz.close(); out.close()
-    if not parts:
-        tg("no paths pulled for that timeframe yet" if tf
-           else "paths file is empty so far")
-        return
-    for n, path in enumerate(parts, 1):
-        try:
-            with open(path, "rb") as f:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-                    data={"chat_id": TELEGRAM_CHAT_ID,
-                          "caption": f"paths part {n}/{len(parts)}"},
-                    files={"document": (os.path.basename(path), f,
-                                        "application/gzip")},
-                    timeout=300)
-            if r.status_code != 200:
-                tg(f"⚠️ part {n} upload failed ({r.status_code})")
-        except Exception as e:
-            tg(f"⚠️ part {n} upload failed: {e}")
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-
-
-def _parse_tf(s):
-    s = s.strip().lower()
-    return {"15": 15, "15m": 15, "60": 60, "1h": 60, "60m": 60,
-            "240": 240, "4h": 240, "240m": 240}.get(s)
-
-
-def _since_ts(mode=None):
-    mode = (mode or STATS_SINCE or "all").lower()
-    if mode == "all":
-        return None
-    if mode == "today":
-        now = datetime.now(STATS_TZ)
-        return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    try:
-        return datetime.fromisoformat(mode.upper() if "t" in mode else mode).timestamp()
-    except Exception:
-        return None
-
-
-def stats_text(table, mode=None):
-    """Same layout for both strategies: totals, then one block per timeframe,
-    then the other strategy's totals as a footer."""
-    other = "trades" if table == "inv_trades" else "inv_trades"
-    since = _since_ts(mode)
-    sb, ob = db_scoreboard(table, since), db_scoreboard(other, since)
-    if table == "inv_trades":
-        title = "🔄 <b>INVERSE · PAPER</b>  (fills at the other side's real ask)"
-        foot_name = "favorite"
-    else:
-        title = "📊 <b>FAVORITE DIP · PAPER</b>"
-        foot_name = "inverse"
-    scope = "all time"
-    if since is not None:
-        st = datetime.fromtimestamp(since, tz=STATS_TZ)
-        scope = ("today" if st.hour == 0 and st.minute == 0
-                 and st.date() == datetime.now(STATS_TZ).date()
-                 else "since " + st.strftime("%b %d %H:%M"))
-    title += f" · {scope}"
-    if sb["n"] == 0:
-        return f"{title}\nno settled trades yet"
-    lines = [title,
-             f"{sb['n']} trades · {sb['wr']:.1f}% win",
-             f"hold {money(sb['hold'])} · ladder {money(sb['pnl'])}", "━━━━━━━━━━"]
-    for tf, d in sorted(sb["by_tf"].items()):
-        n = d["n"]
-        lines.append(f"<b>{label_for(tf)}</b> {n} · {d['w'] / n * 100:.0f}% win · "
-                     f"avg @{d['px'] / n:.0f}¢\n  hold {money(d['hold'])} "
-                     f"({d['hold'] / n / PAPER_STAKE * 100:+.1f}%/trade) · "
-                     f"ladder {money(d['pnl'])}")
-    lines.append("━━━━━━━━━━")
-    lines.append(f"{foot_name} ({scope}): hold {money(ob['hold'])} · "
-                 f"ladder {money(ob['pnl'])}")
-    return "\n".join(lines)
-
-
-# ═══ LIVE XRP ═══════════════════════════════════════════════════════════════
-# One setup only: XRP 15m, favorite dipped 12-15c below its peak -> buy the
-# OTHER side. Every signal is logged in xrp_trades (mode LIVE / PAPER /
-# MISSED / BLOCKED) and settled from Polymarket's own result, even across
-# restarts. PAPER rows = what $LIVE_STAKE would have done (fee included).
-
-_clob = None
-CLOB_V2 = True
-_clob_lock = threading.Lock()
-_live_lock = threading.Lock()
-
-
-def kv_get(k, default=None):
-    conn = sqlite3.connect(DB_PATH)
-    r = conn.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
-    conn.close()
-    return r[0] if r else default
+def kv_get(k, d=None):
+    r = db_query("SELECT v FROM lj_kv WHERE k=?", (k,))
+    return r[0]["v"] if r else d
 
 
 def kv_set(k, v):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", (k, str(v)))
-    conn.commit()
-    conn.close()
+    db_exec("INSERT OR REPLACE INTO lj_kv (k, v) VALUES (?, ?)", (k, str(v)))
 
 
-def live_paused():
-    return kv_get("live_paused", "0") == "1"
+def paused():
+    return kv_get("paused", "0") == "1"
 
 
+# ── telegram ────────────────────────────────────────────────────────────────
+def tg(msg):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000], "parse_mode": "HTML"}, timeout=8)
+        if r.status_code != 200:
+            log.error(f"tg {r.status_code}: {r.text[:150]}")
+            plain = re.sub(r"</?b>|</?i>", "", msg).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": plain[:4000]}, timeout=8)
+    except Exception as e:
+        log.error(f"tg: {e}")
+
+
+def tg_document(name, data, caption=""):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                      data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]},
+                      files={"document": (name, data, "application/gzip")}, timeout=120)
+    except Exception as e:
+        tg(f"⚠️ upload failed: {e}")
+
+
+# ── Polymarket client (same setup the fav-dip bot used on this account) ─────
 def clob():
-    """Signed Polymarket client, built once. Raises with a readable reason."""
     global _clob
-    with _clob_lock:
-        if _clob is not None:
-            return _clob
-        if not POLY_PRIVATE_KEY:
-            raise RuntimeError("POLY_PRIVATE_KEY is not set in Railway")
-        if POLY_SIG_TYPE in (1, 2) and not POLY_FUNDER:
-            raise RuntimeError("POLY_FUNDER (your Polymarket wallet address) is not set")
-        global CLOB_V2
-        try:                                   # Polymarket's current client
-            from py_clob_client_v2 import ClobClient
-            CLOB_V2 = True
-        except ImportError:
-            try:                               # older client, if that's installed
-                from py_clob_client.client import ClobClient
-                CLOB_V2 = False
-            except ImportError:
-                raise RuntimeError("Polymarket client not installed — add "
-                                   "py-clob-client-v2 to requirements.txt")
-        c = ClobClient(CLOB_BASE, chain_id=137, key=POLY_PRIVATE_KEY,
-                       signature_type=POLY_SIG_TYPE,
-                       funder=POLY_FUNDER or None)
-        c.set_api_creds(c.create_or_derive_api_key() if CLOB_V2
-                        else c.create_or_derive_api_creds())
-        _clob = c
-        log.info(f"[LIVE] connected ({'v2' if CLOB_V2 else 'v1'} client)")
-        return c
+    if _clob is not None:
+        return _clob
+    if not POLY_PRIVATE_KEY:
+        raise RuntimeError("POLY_PRIVATE_KEY is not set in Railway")
+    if POLY_SIG_TYPE in (1, 2) and not POLY_FUNDER:
+        raise RuntimeError("POLY_FUNDER (your Polymarket wallet address) is not set")
+    from py_clob_client_v2 import ClobClient
+    c = ClobClient(CLOB_BASE, chain_id=137, key=POLY_PRIVATE_KEY, signature_type=POLY_SIG_TYPE,
+                   funder=POLY_FUNDER or None)
+    c.set_api_creds(c.create_or_derive_api_key())
+    _clob = c
+    log.info("[LIVE] connected")
+    return c
 
 
 def usdc_balance():
-    c = clob()
-    if CLOB_V2:
-        from py_clob_client_v2 import BalanceAllowanceParams, AssetType
-    else:
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-    r = c.get_balance_allowance(BalanceAllowanceParams(
-        asset_type=AssetType.COLLATERAL, signature_type=POLY_SIG_TYPE))
+    from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+    r = clob().get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
+                                                             signature_type=POLY_SIG_TYPE))
     return float(r.get("balance", 0)) / 1e6
 
 
-def _today_start():
-    now = datetime.now(STATS_TZ)
-    return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+def token_balance(token):
+    from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+    p = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token, signature_type=POLY_SIG_TYPE)
+    try:
+        clob().update_balance_allowance(p)
+    except Exception:
+        pass
+    r = clob().get_balance_allowance(p)
+    return float(r.get("balance", 0)) / 1e6
 
 
-def xrp_rows(since_ts=None):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""SELECT id, created, mode, result, pnl, cost, open_ts, asset,
-                           COALESCE(setup, 'DIP') FROM xrp_trades""").fetchall()
-    conn.close()
-    if since_ts is not None:
-        rows = [r for r in rows if (_iso_to_ts(r[1]) or 0) >= since_ts]
-    return rows
+def _amounts(resp):
+    try:
+        return float(resp.get("makingAmount") or 0), float(resp.get("takingAmount") or 0)
+    except Exception:
+        return 0.0, 0.0
 
 
-def live_risk_check(setup="DIP", stake=None):
-    """Returns None if a live trade is allowed, else the reason it isn't.
-    The daily loss limit is shared by all setups; the open-trade cap is per setup."""
-    stake = LIVE_STAKE if stake is None else stake
-    if live_paused():
-        return "paused (/go to resume)"
-    rows = xrp_rows(_today_start())
-    live = [r for r in rows if r[2] == "LIVE"]
-    realized = sum(r[4] or 0 for r in live if r[3] in ("WIN", "LOSS"))
-    open_all = [r for r in live if r[3] is None]
-    open_cost = sum(r[5] or 0 for r in open_all)
-    open_rows = [r for r in open_all if r[8] == setup]
-    max_open = S1_MAX_OPEN if setup == "S1" else LIVE_MAX_OPEN
-    if len(open_rows) >= max_open:
-        return f"{len(open_rows)} trades already open (max {max_open})"
-    # worst case: every open trade loses, plus this one
-    if realized - open_cost - stake < -LIVE_DAILY_LOSS - 1e-9:
-        return (f"daily loss limit ${LIVE_DAILY_LOSS:g} reached "
-                f"(today {money(realized)}, ${open_cost:.2f} still open)")
+def market_order(token, side, amount, limit_c):
+    """Fill-or-kill market order. BUY: amount = dollars, limit = most we pay. SELL: amount = shares,
+    limit = least we accept. Returns (ok, resp, note)."""
+    from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
+    lim = max(0.01, min(0.99, round(limit_c / 100.0, 2)))
+    mo = MarketOrderArgs(token_id=token, amount=round(amount, 2), side=Side.BUY if side == "BUY" else Side.SELL,
+                         price=lim, order_type=OrderType.FOK)
+    resp = clob().create_and_post_market_order(mo, order_type=OrderType.FOK) or {}
+    if not isinstance(resp, dict):
+        resp = {"success": False, "errorMsg": str(resp)[:200]}
+    log.info(f"[LIVE] {side} resp: {str(resp)[:300]}")
+    if not resp.get("success", False) or resp.get("errorMsg"):
+        return False, resp, str(resp.get("errorMsg") or resp)[:200]
+    mk, tk = _amounts(resp)
+    if str(resp.get("status", "")).lower() != "matched" and tk <= 0:
+        return False, resp, f"status={resp.get('status')}"
+    return True, resp, ""
+
+
+# ── markets ─────────────────────────────────────────────────────────────────
+def window(tf, now):
+    L = tf * 60
+    o = int(now // L) * L
+    return o, o + L
+
+
+def resolve(tf, open_ts):
+    try:
+        arr = requests.get(f"{GAMMA}/events", params={"slug": f"btc-updown-{tf}m-{open_ts}"}, timeout=8).json()
+        ev = arr[0] if isinstance(arr, list) and arr else None
+        mk = (ev or {}).get("markets", [])
+        if mk:
+            t = json.loads(mk[0].get("clobTokenIds", "[]"))
+            if len(t) == 2:
+                return str(t[0]), str(t[1])
+    except Exception as e:
+        log.debug(f"resolve {tf} {open_ts}: {e}")
     return None
 
 
-def _insert_xrp(**kw):
-    cols = ",".join(kw)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(f"INSERT INTO xrp_trades (created,{cols}) VALUES (?{',?' * len(kw)})",
-              (datetime.now(timezone.utc).isoformat(), *kw.values()))
-    rid = c.lastrowid
-    conn.commit()
-    conn.close()
-    return rid
-
-
-def _place_live_buy(token, seen_ask, stake=None, overpay=None, max_cap=0.95):
-    """FOK market buy of `stake` dollars, never above seen_ask + overpay.
-    Returns (status, cost, shares, order_id, note)."""
-    stake = LIVE_STAKE if stake is None else stake
-    overpay = LIVE_MAX_OVERPAY if overpay is None else overpay
-    cap = min(round((seen_ask + overpay) / 100.0, 2), max_cap)
-    c = clob()
-    if CLOB_V2:
-        from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
-        mo = MarketOrderArgs(token_id=token, amount=round(stake, 2),
-                             side=Side.BUY, price=cap, order_type=OrderType.FOK)
-        resp = c.create_and_post_market_order(mo, order_type=OrderType.FOK) or {}
-    else:
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
-        mo = MarketOrderArgs(token_id=token, amount=round(stake, 2), side=BUY,
-                             price=cap, order_type=OrderType.FOK)
-        resp = c.post_order(c.create_market_order(mo), OrderType.FOK) or {}
-    if not isinstance(resp, dict):
-        resp = {"success": False, "errorMsg": str(resp)[:200]}
-    log.info(f"[LIVE] order resp: {str(resp)[:300]}")
-    oid = resp.get("orderID") or resp.get("orderId") or ""
-    if not resp.get("success", False) or resp.get("errorMsg"):
-        return "REJECTED", 0.0, 0.0, oid, str(resp.get("errorMsg") or resp)[:200]
-    status = str(resp.get("status", "")).lower()
+def outcome(tf, open_ts):
     try:
-        cost = float(resp.get("makingAmount") or 0)
-        shares = float(resp.get("takingAmount") or 0)
-    except Exception:
-        cost, shares = 0.0, 0.0
-    if status != "matched" and shares <= 0:
-        return "UNFILLED", 0.0, 0.0, oid, f"status={status}"
-    if cost <= 0 or shares <= 0:   # matched but amounts missing: estimate
-        cost, shares = stake, stake / (seen_ask / 100.0)
-        return "FILLED", cost, shares, oid, "amounts estimated"
-    return "FILLED", cost, shares, oid, ""
+        arr = requests.get(f"{GAMMA}/events", params={"slug": f"btc-updown-{tf}m-{open_ts}"}, timeout=10).json()
+        mk = (arr[0] if isinstance(arr, list) and arr else {}).get("markets", [])
+        op = mk[0].get("outcomePrices") if mk else None
+        op = json.loads(op) if isinstance(op, str) else op
+        if op and len(op) >= 2:
+            if float(op[0]) >= 0.99:
+                return "UP"
+            if float(op[1]) >= 0.99:
+                return "DOWN"
+    except Exception as e:
+        log.warning(f"outcome {tf} {open_ts}: {e}")
+    return None
 
 
-def xrp_signal(inv_rid, direction, token, open_ts, close_ts, fav_peak, fav_ask, opp_ask):
-    """Called the moment the paper bot opens an inverse trade that matches the
-    XRP setup. Places the real order (if live) and always logs + messages."""
-    dip = fav_peak - fav_ask
-    arrow = "↑" if direction == "UP" else "↓"
-    t_et = datetime.fromtimestamp(open_ts, tz=STATS_TZ).strftime("%H:%M")
-    head = f"⚪ <b>{XRP_ASSET} 15m {arrow}</b> ({t_et} window) · fav dipped {fav_peak:.0f}→{fav_ask:.0f}¢"
-    base = dict(inv_id=inv_rid, asset=XRP_ASSET, tf=XRP_TF, direction=direction,
-                open_ts=open_ts, close_ts=close_ts, fav_peak=fav_peak,
-                fav_ask=fav_ask, dip=dip, seen_ask=opp_ask)
-    if LIVE_MAX_ENTRY > 0 and opp_ask > LIVE_MAX_ENTRY:
-        _insert_xrp(mode="CAPPED", note=f"ask {opp_ask:.0f}c > cap {LIVE_MAX_ENTRY:.0f}c", **base)
-        tg(f"{head}\n🚫 skipped: price {opp_ask:.0f}¢ is above your {LIVE_MAX_ENTRY:.0f}¢ cap")
-        return
-    if not LIVE_ENABLED or "dip" not in LIVE_SETUPS:
-        sh = LIVE_STAKE / (opp_ask / 100.0)
-        _insert_xrp(mode="PAPER", cost=LIVE_STAKE, shares=sh, avg_price=opp_ask, **base)
-        tg(f"{head}\n📝 paper ${LIVE_STAKE:g} @ {opp_ask:.0f}¢ (live is OFF for this setup)")
-        return
-    with _live_lock:
-        why = live_risk_check()
-        if why:
-            _insert_xrp(mode="BLOCKED", note=why, **base)
-            tg(f"{head}\n⛔ skipped: {why}")
-            return
-        try:
-            status, cost, shares, oid, note = _place_live_buy(token, opp_ask)
-        except Exception as e:
-            log.error(f"[LIVE] order error: {e}")
-            _insert_xrp(mode="MISSED", status="ERROR", note=str(e)[:200], **base)
-            tg(f"{head}\n⚠️ order failed: {str(e)[:200]}")
-            return
-        if status != "FILLED":
-            _insert_xrp(mode="MISSED", status=status, order_id=oid, note=note, **base)
-            why = (f"no shares at or under {opp_ask + LIVE_MAX_OVERPAY:.0f}¢"
-                   if status == "UNFILLED" else "order rejected")
-            tg(f"{head}\n⏭ not filled — {why}\n<i>{note[:150]}</i>")
-            return
-        avg = cost / shares * 100.0
-        _insert_xrp(mode="LIVE", status=status, order_id=oid, cost=cost,
-                    shares=shares, avg_price=avg,
-                    cap=opp_ask + LIVE_MAX_OVERPAY, note=note, **base)
-        tg(f"{head}\n💵 <b>LIVE</b> bought {shares:.2f} sh for ${cost:.2f} "
-           f"@ {avg:.1f}¢ (saw {opp_ask:.0f}¢)\nwin pays +${shares - cost:.2f}")
-
-
-def xrp_settler():
-    """Settles every open xrp_trades row from Polymarket's result. Independent
-    of the paper scorer, so live trades survive a restart."""
-    while True:
-        try:
-            time.sleep(20)
-            now = time.time()
-            conn = sqlite3.connect(DB_PATH)
-            rows = conn.execute("""SELECT id, mode, direction, open_ts, close_ts,
-                                   cost, shares, seen_ask, avg_price, asset, tf,
-                                   COALESCE(setup, 'DIP') FROM xrp_trades
-                                   WHERE result IS NULL AND mode IN ('LIVE','PAPER')
-                                   AND close_ts < ?""", (now - 5,)).fetchall()
-            conn.close()
-            for rid, mode, d, o, c_ts, cost, shares, seen, avg, a_, tf_, setup in rows:
-                outcome = fetch_polymarket_outcome(a_ or XRP_ASSET, tf_ or XRP_TF, o)
-                if outcome is None:
-                    if now - c_ts > 6 * 3600:
-                        conn = sqlite3.connect(DB_PATH)
-                        conn.execute("UPDATE xrp_trades SET result='VOID', pnl=0 WHERE id=?", (rid,))
-                        conn.commit(); conn.close()
-                        tg(f"⚠️ {a_ or XRP_ASSET} trade #{rid} couldn't be graded after 6h — check Polymarket")
-                    continue
-                won = outcome == d
-                p = (avg or seen) / 100.0
-                if mode == "PAPER":   # include the taker fee, like real trading
-                    fee = shares * FEE_RATE * p * (1 - p)
-                    pnl = (shares - cost - fee) if won else (-cost - fee)
-                else:                 # real fill amounts already net of what we paid
-                    pnl = (shares - cost) if won else -cost
-                res = "WIN" if won else "LOSS"
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("UPDATE xrp_trades SET result=?, pnl=? WHERE id=?",
-                             (res, round(pnl, 4), rid))
-                conn.commit(); conn.close()
-                if setup == "S1":
-                    if mode == "PAPER":
-                        continue          # S1 paper is silent — see /s1
-                    today = [r for r in xrp_rows(_today_start()) if r[2] == mode
-                             and r[8] == "S1" and r[3] in ("WIN", "LOSS")]
-                else:
-                    today = [r for r in xrp_rows(_today_start()) if r[2] == mode and r[7] == a_
-                             and r[8] == "DIP" and r[3] in ("WIN", "LOSS")]
-                tot = sum(r[4] or 0 for r in today)
-                tag = "💵 LIVE" if mode == "LIVE" else "📝 paper"
-                name = f"S1 {a_} 1h" if setup == "S1" else f"{a_ or XRP_ASSET} {label_for(tf_ or XRP_TF)}"
-                tg(f"{'✅' if won else '❌'} <b>{name} {res} {money(pnl)}</b> · {tag}\n"
-                   f"today: {len(today)} trades · {sum(1 for r in today if r[3] == 'WIN')} wins · "
-                   f"{money(tot)}")
-        except Exception as e:
-            log.error(f"[XRP-SETTLE] {e}")
-
-
-def live_text(all_time=False):
-    since = None if all_time else _today_start()
-    rows = [r for r in xrp_rows(since) if r[7] == XRP_ASSET and r[8] == "DIP"]
-    scope = "all time" if all_time else "today"
-    out = [f"⚪ <b>{XRP_ASSET} 15m inverse · dip {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢</b> · {scope}",
-           f"live: {'ON' if LIVE_ENABLED and 'dip' in LIVE_SETUPS else 'OFF'}"
-           f"{' · ⏸ PAUSED' if LIVE_ENABLED and live_paused() else ''}"
-           f" · ${LIVE_STAKE:g}/trade · daily limit ${LIVE_DAILY_LOSS:g}"
-           f"{f' · max price {LIVE_MAX_ENTRY:.0f}¢' if LIVE_MAX_ENTRY > 0 else ''}"]
-    for mode, name in (("LIVE", "💵 real"), ("PAPER", "📝 paper")):
-        m = [r for r in rows if r[2] == mode]
-        if not m:
-            continue
-        done = [r for r in m if r[3] in ("WIN", "LOSS")]
-        w = sum(1 for r in done if r[3] == "WIN")
-        pnl = sum(r[4] or 0 for r in done)
-        op = len(m) - len(done)
-        out.append(f"{name}: {len(done)} trades · {w} wins · {money(pnl)}"
-                   f"{f' · {op} open' if op else ''}")
-    miss = sum(1 for r in rows if r[2] == "MISSED")
-    blk = sum(1 for r in rows if r[2] == "BLOCKED")
-    cap = sum(1 for r in rows if r[2] == "CAPPED")
-    if miss or blk or cap:
-        out.append(f"skipped: {miss} not filled · {blk} blocked by limits"
-                   + (f" · {cap} above {LIVE_MAX_ENTRY:.0f}¢ cap" if cap else ""))
-    if all_time:
-        days = {}
-        for r in rows:
-            if r[2] in ("LIVE", "PAPER") and r[3] in ("WIN", "LOSS"):
-                dk = datetime.fromtimestamp(_iso_to_ts(r[1]) or 0, tz=STATS_TZ).strftime("%b %d")
-                days.setdefault((dk, r[2]), 0.0)
-                days[(dk, r[2])] += r[4] or 0
-        if days:
-            out.append("━━━━━━━━━━")
-            for (dk, mode), v in sorted(days.items(), key=lambda x: x[0]):
-                out.append(f"{dk} {'real' if mode == 'LIVE' else 'paper'} {money(v)}")
-    if len(out) == 2:
-        out.append("no XRP setups yet")
-    return "\n".join(out)
-
-
-# ── S1 ─────────────────────────────────────────────────────────────────────
-_s1_open_px = {}      # (asset, open_ts) -> Binance price at the hour's open
-_s1_sig = {}          # asset -> (fetched_at, per-second variance in %^2)
-_s1_done = set()      # (asset, open_ts) already signalled this hour
-
-
-def _binance_klines(asset, start_ms=None, limit=121):
-    p = {"symbol": f"{asset}USDT", "interval": "1m", "limit": limit}
-    if start_ms is not None:
-        p["startTime"] = start_ms
-    r = requests.get(BINANCE_REST, params=p, timeout=8)
-    r.raise_for_status()
-    return r.json()
-
-
-def s1_open_price(asset, open_ts):
-    k = (asset, open_ts)
-    if k not in _s1_open_px:
-        kl = _binance_klines(asset, start_ms=open_ts * 1000, limit=1)
-        if not kl or int(kl[0][0]) // 1000 != open_ts:
-            return None
-        _s1_open_px[k] = float(kl[0][1])          # open of the hour's first minute
-    return _s1_open_px[k]
-
-
-def s1_var_per_sec(asset):
-    """Mean squared 1-min % return over the last 2 hours, per second (cached 2 min)."""
-    hit = _s1_sig.get(asset)
-    if hit and time.time() - hit[0] < 120:
-        return hit[1]
-    kl = _binance_klines(asset, limit=121)
-    closes = [float(x[4]) for x in kl[:-1]]        # completed minutes only
-    rets = [(closes[i] / closes[i - 1] - 1) * 100 for i in range(1, len(closes))]
-    if len(rets) < 60:
-        return None
-    v = sum(r * r for r in rets) / len(rets) / 60.0
-    _s1_sig[asset] = (time.time(), v)
-    return v
-
-
-def s1_signal(asset, direction, token, open_ts, close_ts, ask, z, left):
-    arrow = "↑" if direction == "UP" else "↓"
-    t_et = datetime.fromtimestamp(open_ts, tz=STATS_TZ).strftime("%H:%M")
-    head = (f"🎯 <b>S1 {ASSET_EMOJI.get(asset, '')}{asset} 1h {arrow}</b> ({t_et} hour) · "
-            f"{ask:.0f}¢ · {z:.1f}× ahead · {left / 60:.0f} min left")
-    base = dict(setup="S1", asset=asset, tf=60, direction=direction, open_ts=open_ts,
-                close_ts=close_ts, seen_ask=ask, dip=round(z, 2), note=f"z={z:.2f} left={left:.0f}s")
-    if not LIVE_ENABLED or "s1" not in LIVE_SETUPS:
-        sh = S1_STAKE / (ask / 100.0)
-        _insert_xrp(mode="PAPER", cost=S1_STAKE, shares=sh, avg_price=ask, **base)
-        return                                     # paper is silent — /s1
-    with _live_lock:
-        why = live_risk_check("S1", S1_STAKE)
-        if why:
-            _insert_xrp(mode="BLOCKED", **{**base, "note": why})
-            tg(f"{head}\n⛔ skipped: {why}")
-            return
-        try:
-            status, cost, shares, oid, note = _place_live_buy(
-                token, ask, stake=S1_STAKE, overpay=S1_MAX_OVERPAY, max_cap=0.99)
-        except Exception as e:
-            log.error(f"[S1] order error: {e}")
-            _insert_xrp(mode="MISSED", status="ERROR", **{**base, "note": str(e)[:200]})
-            tg(f"{head}\n⚠️ order failed: {str(e)[:200]}")
-            return
-        if status != "FILLED":
-            _insert_xrp(mode="MISSED", status=status, order_id=oid, **{**base, "note": note})
-            tg(f"{head}\n⏭ not filled at ≤{min(ask + S1_MAX_OVERPAY, 99):.0f}¢")
-            return
-        avg = cost / shares * 100.0
-        _insert_xrp(mode="LIVE", status=status, order_id=oid, cost=cost, shares=shares,
-                    avg_price=avg, cap=min(ask + S1_MAX_OVERPAY, 99), **base)
-        tg(f"{head}\n💵 <b>LIVE</b> ${cost:.2f} @ {avg:.1f}¢ · win pays +${shares - cost:.2f}")
-
-
-def s1_monitor():
-    """Every S1_POLL_SECS during minutes 36-48 of each hour: check each coin's
-    1h market and fire once if the favorite is far enough ahead."""
-    while True:
-        try:
-            time.sleep(S1_POLL_SECS)
-            open_ts, close_ts, left = window_times(60)
-            if not (S1_LEFT_MIN <= left <= S1_LEFT_MAX):
-                continue
-            for asset in S1_COINS:
-                if (asset, open_ts) in _s1_done:
-                    continue
-                now_px = prices_ref.get(asset)
-                if not now_px or time.time() - ref_last.get(asset, 0) > 15:
-                    continue                       # no fresh Binance price
-                toks = resolve_tokens(asset, 60, open_ts)
-                if not toks:
-                    continue
-                up_ask, dn_ask = best_ask_cents(toks[0]), best_ask_cents(toks[1])
-                if up_ask is None or dn_ask is None:
-                    continue
-                direction, tok, ask = (("UP", toks[0], up_ask) if up_ask >= dn_ask
-                                       else ("DOWN", toks[1], dn_ask))
-                if not (S1_MIN_CENTS <= ask <= S1_MAX_CENTS):
-                    continue
-                o = s1_open_price(asset, open_ts)
-                v = s1_var_per_sec(asset)
-                if not o or not v:
-                    continue
-                move = (now_px / o - 1) * 100 * (1 if direction == "UP" else -1)
-                z = move / ((v * left) ** 0.5)
-                if z < S1_Z:
-                    continue
-                _s1_done.add((asset, open_ts))
-                log.info(f"[S1] {asset} {direction} ask={ask:.1f} z={z:.2f} left={left:.0f}")
-                s1_signal(asset, direction, tok, open_ts, close_ts, ask, z, left)
-            for k in [k for k in _s1_open_px if k[1] < open_ts - 7200]:
-                del _s1_open_px[k]
-            _s1_done.difference_update([k for k in _s1_done if k[1] < open_ts - 7200])
-        except Exception as e:
-            log.error(f"[S1] {e}")
-
-
-def s1_text(all_time=False):
-    since = None if all_time else _today_start()
-    rows = [r for r in xrp_rows(since) if r[8] == "S1"]
-    live_on = LIVE_ENABLED and "s1" in LIVE_SETUPS
-    out = [f"🎯 <b>S1 · 1h favorite far ahead</b> · {'all time' if all_time else 'today'}",
-           f"live: {'ON' if live_on else 'OFF (paper)'}"
-           f"{' · ⏸ PAUSED' if live_on and live_paused() else ''}"
-           f" · ${S1_STAKE:g}/trade · {S1_MIN_CENTS:.0f}-{S1_MAX_CENTS:.0f}¢ · ≥{S1_Z:g}× · "
-           f"{S1_LEFT_MIN / 60:.0f}-{S1_LEFT_MAX / 60:.0f} min left"]
-    for mode, name in (("LIVE", "💵 real"), ("PAPER", "📝 paper")):
-        m = [r for r in rows if r[2] == mode]
-        if not m:
-            continue
-        done = [r for r in m if r[3] in ("WIN", "LOSS")]
-        w = sum(1 for r in done if r[3] == "WIN")
-        op = len(m) - len(done)
-        out.append(f"{name}: {len(done)} trades · {w} wins · {len(done) - w} losses · "
-                   f"{money(sum(r[4] or 0 for r in done))}{f' · {op} open' if op else ''}")
-    miss = sum(1 for r in rows if r[2] == "MISSED")
-    blk = sum(1 for r in rows if r[2] == "BLOCKED")
-    if miss or blk:
-        out.append(f"skipped: {miss} not filled · {blk} blocked by limits")
-    if all_time:
-        days = {}
-        for r in rows:
-            if r[2] in ("LIVE", "PAPER") and r[3] in ("WIN", "LOSS"):
-                dk = datetime.fromtimestamp(_iso_to_ts(r[1]) or 0, tz=STATS_TZ).strftime("%b %d")
-                days[(dk, r[2])] = days.get((dk, r[2]), 0.0) + (r[4] or 0)
-        if days:
-            out.append("━━━━━━━━━━")
-            for (dk, mode), v in sorted(days.items()):
-                out.append(f"{dk} {'real' if mode == 'LIVE' else 'paper'} {money(v)}")
-    if len(out) == 2:
-        out.append("no S1 setups yet (they only appear 12-24 min before each hour ends)")
-    return "\n".join(out)
-
-
-_upd = None
-
-def handle_commands():
-    global _upd
+def kline_open(open_ts):
     try:
-        p = {"timeout": 1}
-        if _upd:
-            p["offset"] = _upd
-        for u in requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                              params=p, timeout=5).json().get("result", []):
-            _upd = u["update_id"] + 1
-            t = u.get("message", {}).get("text", "").strip().lower()
-            if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
-                continue
-            # optional timeframe argument: "/export 60", "/exportpaths 15m", "1h", "4h"
-            parts = t.split()
-            t = parts[0].split("@")[0] if parts else ""
-            if t == "/live":
-                tg(live_text(len(parts) > 1 and parts[1] == "all"))
-                continue
-            if t == "/s1":
-                tg(s1_text(len(parts) > 1 and parts[1] == "all"))
-                continue
-            if t == "/stop":
-                kv_set("live_paused", "1")
-                tg("⏸ <b>live trading STOPPED</b> (all setups) — no new real trades. "
-                   "Open trades still settle. /go to resume.")
-                continue
-            if t == "/go":
-                kv_set("live_paused", "0")
-                tg("▶️ live trading resumed" if LIVE_ENABLED else
-                   "▶️ unpaused — but LIVE_ENABLED is false in Railway, so it's still paper")
-                continue
-            if t == "/balance":
-                try:
-                    tg(f"💰 Polymarket cash: <b>${usdc_balance():.2f}</b> USDC")
-                except Exception as e:
-                    tg(f"⚠️ couldn't read balance: {str(e)[:200]}")
-                continue
-            if t in ("/stats", "/istats"):
-                mode = parts[1] if len(parts) > 1 and parts[1] in ("all", "today") else None
-                tg(stats_text("trades" if t == "/stats" else "inv_trades", mode))
-                continue
-            arg_tf = _parse_tf(parts[1]) if len(parts) > 1 else None
-            if len(parts) > 1 and arg_tf is None:
-                tg(f"unknown timeframe '{parts[1]}' — use 15m, 1h or 4h")
-                continue
-            if t == "/istats":
-                tg(stats_text("inv_trades"))
-            elif t == "/stats":
-                tg(stats_text("trades"))
-            elif t == "/status":
-                with pending_lock:
-                    snap = [dict(asset=p["asset"], tf=p["tf"], direction=p["direction"],
-                                 entry=p["entry_ask"], banked=p["ladder_proceeds"],
-                                 left=p["shares_left"], rung=p["next_rung"],
-                                 peak_after=p.get("peak_bid", 0.0),
-                                 kind=p.get("kind", "FAV"))
-                            for p in pending]
-                head = f"📊 <b>FAVORITE DIP status</b>\n{len(snap)} open"
-                lines = []
-                for p in snap:
-                    ar = "↑" if p["direction"] == "UP" else "↓"
-                    st = (f"banked ${p['banked']:.2f}" if p["banked"] > 0
-                          else "no rungs yet")
-                    pk = f" · peak {p['peak_after']:.0f}¢" if p["peak_after"] else ""
-                    lines.append(f"{'INV ' if p['kind'] == 'INV' else ''}"
-                                 f"{ASSET_EMOJI.get(p['asset'],'')}{p['asset']} "
-                                 f"{label_for(p['tf'])} {ar} @{p['entry']:.0f}¢\n"
-                                 f"  {st} · {p['left']:.0f} riding · "
-                                 f"next {p['rung']:.0f}¢{pk}")
-                tg(head + ("\n\n" + "\n".join(lines) if lines else "\n\nno open positions"))
-            elif t == "/export":
-                sfx = f"_{label_for(arg_tf)}" if arg_tf else ""
-                for table, name in (("trades", "favdip_trades"),
-                                    ("inv_trades", "favdip_inverse")):
-                    text, n = build_trades_csv(table, arg_tf)
-                    if text:
-                        tg_document(f"{name}{sfx}.csv", text, f"{n} rows · {table}")
-                    else:
-                        tg(f"no rows in {table}{' for ' + label_for(arg_tf) if arg_tf else ''} yet")
-            elif t in ("/exportpaths", "/resumepaths"):
-                _paths_pause.clear()
-                threading.Thread(target=export_paths_worker, args=(arg_tf,),
-                                 daemon=True).start()
-            elif t == "/pausepaths":
-                if _export_lock.locked():
-                    _paths_pause.set()
-                    tg("⏸ pausing after the current market…")
-                else:
-                    tg("no path export running")
-            elif t == "/sendpaths":
-                threading.Thread(target=send_paths_files, args=(arg_tf,),
-                                 daemon=True).start()
-            elif t == "/help":
-                tg("📖 <b>commands</b>  (add 15m / 1h / 4h to limit to one timeframe)\n"
-                   "<b>XRP</b>\n"
-                   "/live — XRP today, real + paper (/live all = every day)\n"
-                   "/s1 — S1 (1h favorite far ahead) today (/s1 all = every day)\n"
-                   "/balance — Polymarket cash\n"
-                   "/stop — stop real trades now · /go — resume\n"
-                   "<b>paper</b>\n"
-                   "/stats — favorite today, per timeframe (/stats all = all time)\n"
-                   "/istats — inverse today, per timeframe (/istats all = all time)\n"
-                   "/status — open positions\n"
-                   "/export [tf] — favorite + inverse trades as CSV\n"
-                   "/exportpaths [tf] — pull both sides' price paths (resumable)\n"
-                   "/pausepaths — pause the path export\n"
-                   "/resumepaths [tf] — continue where it stopped\n"
-                   "/sendpaths [tf] — send the paths pulled so far\n"
-                   "/help — this list")
-    except Exception:
-        pass
+        j = requests.get(BINANCE_REST, params=dict(symbol="BTCUSDT", interval="1m", startTime=open_ts * 1000,
+                                                   endTime=open_ts * 1000 + 59000, limit=1), timeout=8).json()
+        if isinstance(j, list) and j:
+            return float(j[0][1])
+    except Exception as e:
+        log.warning(f"kline {open_ts}: {e}")
+    return None
 
 
-# (asset,tf,open_ts,direction) -> highest ask seen so far this window
-peak_ask = {}
-# (asset,tf,open_ts,direction) already entered this window
-fired = set()
-# (asset,tf,open_ts) markets already entered on either side
-entered_markets = set()
-# ("REF",tf,open_ts) -> {asset: underlying ref price at window start},
-# captured ONLY for settlement-fallback grading — never used for entry
-open_windows = {}
-pending = []
-pending_lock = threading.Lock()
-
-
-def _cleanup_stale(now):
-    cutoff = now - 5 * 3600   # generous buffer past the longest (4h) window
-    for k in [k for k in peak_ask if k[2] < cutoff]:
-        del peak_ask[k]
-    for k in [k for k in open_windows if k[2] < cutoff]:
-        del open_windows[k]
-    fired.difference_update([k for k in fired if k[2] < cutoff])
-    entered_markets.difference_update([k for k in entered_markets if k[2] < cutoff])
-
-
-def dip_monitor():
-    """Every MONITOR_POLL_SECS: track each side's peak ask, fire a dip-entry
-    when conditions are met, and ladder-sell any open position whose bid has
-    climbed to the next rung. Dip detection doesn't need the longshot bot's
-    fast 0.5s cadence — favorites dip on their own schedule, not in a narrow
-    entry window at window-open."""
-    last_cleanup = 0.0
+def resolver_worker():
     while True:
         try:
-            time.sleep(MONITOR_POLL_SECS)
             now = time.time()
-            if now - last_cleanup > 900:
-                _cleanup_stale(now)
-                last_cleanup = now
-
             for tf in TFS:
-                open_ts, close_ts, secs_left = window_times(tf)
-                ref_key = ("REF", tf, open_ts)
-                if ref_key not in open_windows:
-                    open_windows[ref_key] = dict(prices_ref)
-                if secs_left < ENTRY_CUTOFF_SECS:
-                    continue
-                for asset in ASSET_LIST:
-                    toks = resolve_tokens(asset, tf, open_ts)
-                    if not toks:
-                        continue
-                    for direction, tok in (("UP", toks[0]), ("DOWN", toks[1])):
-                        key = (asset, tf, open_ts, direction)
-                        ask = best_ask_cents(tok)
-                        if ask is None:
-                            continue
-                        pk = peak_ask.get(key, 0.0)
-                        if ask > pk:
-                            peak_ask[key] = ask
-                            pk = ask
-                        if key in fired:
-                            continue
-                        if ONE_PER_MARKET and (asset, tf, open_ts) in entered_markets:
-                            continue
-                        if pk < FAVORITE_MIN_CENTS:
-                            continue
-                        if ask < DIP_FLOOR_CENTS:
-                            continue
-                        if pk - ask < DIP_DROP_CENTS:
-                            continue
-                        # ── ENTRY: dip on an established favorite ──
-                        fired.add(key)
-                        entered_markets.add((asset, tf, open_ts))
-                        opp_tok = toks[1] if direction == "UP" else toks[0]
-                        opp_ask = best_ask_cents(opp_tok)
-                        opp_bid = best_bid_cents(opp_tok)
-                        entry_bid = best_bid_cents(tok)
-                        rid = db_insert(asset, tf, direction, open_ts, close_ts,
-                                        ask, pk, opp_ask, opp_bid, entry_bid)
-                        shares_total = PAPER_STAKE / (ask / 100.0)
-                        with pending_lock:
-                            pending.append({
-                                "rid": rid, "asset": asset, "tf": tf,
-                                "direction": direction, "open_ts": open_ts,
-                                "close_ts": close_ts, "entry_ask": ask,
-                                "peak_at_entry": pk, "token": tok,
-                                "shares_total": shares_total,
-                                "shares_left": shares_total,
-                                "next_rung": min(ask + RUNG_STEP_CENTS, RUNG_CAP_CENTS),
-                                "ladder_proceeds": 0.0, "ladder_sold": 0.0,
-                                "peak_bid": ask, "min_bid": None,
-                                "table": "trades", "kind": "FAV",
-                                "step": RUNG_STEP_CENTS, "frac": LADDER_SELL_FRAC,
-                            })
-                        if INV_ENABLED and opp_ask and 0 < opp_ask < RUNG_CAP_CENTS:
-                            inv_dir = "DOWN" if direction == "UP" else "UP"
-                            inv_rid = db_insert_inv(rid, asset, tf, inv_dir, open_ts,
-                                                    close_ts, opp_ask, opp_bid, ask,
-                                                    entry_bid, pk)
-                            inv_sh = PAPER_STAKE / (opp_ask / 100.0)
-                            with pending_lock:
-                                pending.append({
-                                    "rid": inv_rid, "asset": asset, "tf": tf,
-                                    "direction": inv_dir, "open_ts": open_ts,
-                                    "close_ts": close_ts, "entry_ask": opp_ask,
-                                    "peak_at_entry": pk, "token": opp_tok,
-                                    "shares_total": inv_sh, "shares_left": inv_sh,
-                                    "next_rung": min(opp_ask + INV_RUNG_STEP_CENTS,
-                                                     RUNG_CAP_CENTS),
-                                    "ladder_proceeds": 0.0, "ladder_sold": 0.0,
-                                    "peak_bid": opp_ask, "min_bid": None,
-                                    "table": "inv_trades", "kind": "INV",
-                                    "step": INV_RUNG_STEP_CENTS,
-                                    "frac": INV_LADDER_SELL_FRAC,
-                                })
-                            if (asset == XRP_ASSET and tf == XRP_TF and
-                                    XRP_DIP_MIN <= pk - ask <= XRP_DIP_MAX):
-                                try:
-                                    xrp_signal(inv_rid, inv_dir, opp_tok, open_ts,
-                                               close_ts, pk, ask, opp_ask)
-                                except Exception as e:
-                                    log.error(f"[XRP] signal error: {e}")
-                        if SEND_EACH:
-                            arrow = "↑" if direction == "UP" else "↓"
-                            tg(f"🔵 <b>{ASSET_EMOJI.get(asset,'')}{asset} "
-                               f"{label_for(tf)} {arrow} (favorite)</b>"
-                               f" — ${PAPER_STAKE:g} @ {ask:.0f}¢\n"
-                               f"{shares_total:.0f} sh · dipped from {pk:.0f}¢ · "
-                               f"win pays +${shares_total - PAPER_STAKE:.0f}")
-                        log.info(f"[DIP] {asset} {tf} {direction} entered "
-                                 f"{ask:.1f}c (peak {pk:.1f}c)")
-
-            with pending_lock:
-                items = list(pending)
-            for s in items:
-                if now >= s["close_ts"]:
-                    continue
-                bid = best_bid_cents(s["token"])
-                if bid is None:
-                    continue
-                if bid > s.get("peak_bid", 0.0):
-                    s["peak_bid"] = bid
-                if s.get("min_bid") is None or bid < s["min_bid"]:
-                    s["min_bid"] = bid
-                if s["shares_left"] < 1:
-                    continue
-                sold_this_poll = 0.0
-                proceeds_this_poll = 0.0
-                while bid >= s["next_rung"] and s["shares_left"] >= 1:
-                    at_cap = s["next_rung"] >= RUNG_CAP_CENTS
-                    sell_shares = s["shares_left"] * s.get("frac", LADDER_SELL_FRAC)
-                    if sell_shares < 1 or at_cap:
-                        sell_shares = s["shares_left"]   # sweep dust / the cap
-                    proceeds = sell_shares * (bid / 100.0)
-                    s["ladder_proceeds"] += proceeds
-                    s["ladder_sold"] += sell_shares
-                    s["shares_left"] -= sell_shares
-                    sold_this_poll += sell_shares
-                    proceeds_this_poll += proceeds
-                    if at_cap:
-                        break
-                    s["next_rung"] = min(s["next_rung"] + s.get("step", RUNG_STEP_CENTS),
-                                         RUNG_CAP_CENTS)
-                is_inv = s.get("kind") == "INV"
-                if sold_this_poll > 0 and PAPER_ALERTS:
-                    tg(f"🪜 <b>{'INV ' if is_inv else ''}{ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                       f"{label_for(s['tf'])}</b> — sold {sold_this_poll:.0f} sh "
-                       f"@ {bid:.0f}¢ → +${proceeds_this_poll:.2f}\n"
-                       f"banked ${s['ladder_proceeds']:.2f} · "
-                       f"{s['shares_left']:.0f} riding · "
-                       f"next {s['next_rung']:.0f}¢")
-                    log.info(f"[LADDER] {s['asset']} {s['tf']} sold "
-                             f"{sold_this_poll:.1f} @ {bid:.0f}c banked "
-                             f"${s['ladder_proceeds']:.2f} left "
-                             f"{s['shares_left']:.1f}")
+                cur = window(tf, now)[0]
+                if (tf, cur) not in opens and now >= cur + 60:
+                    op = kline_open(cur)               # didn't see the open live: use Binance's 1m open
+                    if op:
+                        opens[(tf, cur)] = op
+                for o in (cur, window(tf, now + 90)[0]):
+                    if (tf, o) not in markets:
+                        t = resolve(tf, o)
+                        if t:
+                            with lock:
+                                markets[(tf, o)] = t
+            with lock:
+                for k in [k for k in markets if k[1] + k[0] * 60 < now - 600]:
+                    for t in markets.pop(k):
+                        books.pop(t, None)
+            for k in [k for k in opens if k[1] + k[0] * 60 < now - 3600]:
+                opens.pop(k, None)
         except Exception as e:
-            log.error(f"[MONITOR] {e}")
+            state["err"] = f"resolver: {e}"
+            log.error(state["err"])
+        time.sleep(3)
 
 
-def scorer():
+# ── feeds ───────────────────────────────────────────────────────────────────
+def pm_handle(raw):
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return
+    for m in (data if isinstance(data, list) else [data]):
+        if not isinstance(m, dict):
+            continue
+        state["pm"] += 1
+        et = m.get("event_type")
+        with lock:
+            if et == "book":
+                tok = str(m.get("asset_id"))
+                books[tok] = {"bids": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])},
+                              "asks": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}}
+            elif et == "price_change":
+                for ch in (m.get("price_changes") or m.get("changes") or []):
+                    tok = str(ch.get("asset_id") or m.get("asset_id"))
+                    b = books.setdefault(tok, {"bids": {}, "asks": {}})
+                    lvl = b["bids"] if str(ch.get("side", "")).upper() == "BUY" else b["asks"]
+                    px, sz = round(float(ch["price"]) * 100, 3), float(ch.get("size", 0))
+                    if sz <= 0:
+                        lvl.pop(px, None)
+                    else:
+                        lvl[px] = sz
+
+
+def pm_worker():
     while True:
         try:
-            time.sleep(1.0)
-            now = time.time()
-            with pending_lock:
-                items = list(pending)
-            for s in items:
-                if now < s["close_ts"] + 2:
-                    continue
-                if now - s.get("last_chk", 0) < SETTLE_POLL_SECS:
-                    continue
-                s["last_chk"] = now
-                outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
-                graded_by = "settlement"
-                if outcome is None:
-                    if now <= s["close_ts"] + SETTLE_TIMEOUT_SECS:
-                        continue
-                    ow = open_windows.get(("REF", s["tf"], s["open_ts"]), {})
-                    op = ow.get(s["asset"])
-                    settle_px = prices_ref.get(s["asset"])
-                    if op is None or settle_px is None or abs((settle_px - op) / op) < 1e-6:
-                        db_resolve(s["rid"], "VOID", 0, s["ladder_sold"],
-                                   s["ladder_proceeds"], 0,
-                                   s.get("peak_bid"), s.get("min_bid"),
-                                   s.get("table", "trades"))
-                        with pending_lock:
-                            s in pending and pending.remove(s)
-                        continue
-                    outcome = "UP" if settle_px > op else "DOWN"
-                    graded_by = "feed-fallback"
-                won = (s["direction"] == outcome)
-                stake = PAPER_STAKE
-                hold_pnl = (s["shares_total"] * 1.0 - stake) if won else -stake
-                remaining_settle = (s["shares_left"] * 1.0) if won else 0.0
-                pnl = round(s["ladder_proceeds"] + remaining_settle - stake, 4)
-                result = "WIN" if won else "LOSS"
-                db_resolve(s["rid"], result, pnl, s["ladder_sold"],
-                           round(s["ladder_proceeds"], 4), round(hold_pnl, 4),
-                           s.get("peak_bid"), s.get("min_bid"),
-                           s.get("table", "trades"))
-                with pending_lock:
-                    s in pending and pending.remove(s)
-                if s.get("kind") == "INV":
-                    if INV_SEND_EACH:
-                        tg(f"{'✅' if won else '❌'} INV {s['asset']} "
-                           f"{label_for(s['tf'])} @{s['entry_ask']:.0f}¢ · "
-                           f"hold {money(hold_pnl)} · ladder {money(pnl)}")
-                    continue
-                if not PAPER_ALERTS:
-                    continue
-                sb = db_scoreboard()
-                tag = "" if graded_by == "settlement" else " ⚠️ feed-graded"
-                lbl = label_for(s["tf"])
-                em = ASSET_EMOJI.get(s["asset"], "")
-                foot = f"━ {sb['n']} trades · {money(sb['pnl'])} total"
-                ctx = f"entered {s['entry_ask']:.0f}¢ (dip from {s['peak_at_entry']:.0f}¢)"
-                if won:
-                    detail = (f"${s['ladder_proceeds']:.2f} banked + "
-                              f"{s['shares_left']:.0f} sh paid out"
-                              if s["ladder_proceeds"] > 0 else
-                              f"{s['shares_left']:.0f} sh paid out")
-                    tg(f"✅ <b>{em}{s['asset']} {lbl} WIN {money(pnl)}</b>{tag}\n"
-                       f"{ctx}\n{detail}\n{foot}")
-                elif pnl > 0:
-                    tg(f"💰 <b>{em}{s['asset']} {lbl}</b> — settled against us, "
-                       f"ladder banked it{tag}\n{ctx}\n"
-                       f"net {money(pnl)} · (holding = {money(hold_pnl)})\n{foot}")
-                elif s["ladder_sold"] > 0:
-                    tg(f"❌ <b>{em}{s['asset']} {lbl}</b> — ladder softened it{tag}\n"
-                       f"{ctx}\nbanked ${s['ladder_proceeds']:.2f} · "
-                       f"net {money(pnl)} · (holding = {money(hold_pnl)})\n{foot}")
-                else:
-                    tg(f"❌ <b>{em}{s['asset']} {lbl}</b> — no rungs hit · "
-                       f"{money(pnl)}{tag}\n{ctx}\n{foot}")
+            with lock:
+                toks = tuple(sorted(t for v in markets.values() for t in v))
+            if not toks:
+                time.sleep(2)
+                continue
+            stop = threading.Event()
+
+            def on_open(ws):
+                ws.send(json.dumps({"assets_ids": list(toks), "type": "market"}))
+
+                def pinger():
+                    while not stop.is_set():
+                        time.sleep(10)
+                        try:
+                            ws.send("PING")
+                        except Exception:
+                            return
+                threading.Thread(target=pinger, daemon=True).start()
+
+            def on_message(ws, msg):
+                if msg in ("PONG", "pong"):
+                    return
+                pm_handle(msg)
+                with lock:
+                    cur = tuple(sorted(t for v in markets.values() for t in v))
+                if cur != toks:
+                    ws.close()
+
+            ws = websocket.WebSocketApp(MARKET_WS, on_open=on_open, on_message=on_message)
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+            stop.set()
         except Exception as e:
-            log.error(f"[SCORER] {e}")
+            log.warning(f"pm ws: {e}")
+        time.sleep(1)
+
+
+def on_tick(now, px):
+    with jlock:
+        price["px"], price["ts"] = px, now
+        if not px1s or now - px1s[-1][0] >= 1.0:
+            px1s.append((now, px))
+        ticks.append((now, px))
+        while ticks and ticks[0][0] < now - JUMP_WINDOW:
+            ticks.popleft()
+        for tf in TFS:                                  # remember the price at each window's open (like the scanner)
+            o = window(tf, now)[0]
+            if (tf, o) not in opens and now - o <= 5:
+                opens[(tf, o)] = px
+        if now - state["last_jump"] < JUMP_COOLDOWN or len(ticks) < 2:
+            return
+        bps = (px / ticks[0][1] - 1) * 1e4
+        if abs(bps) < JUMP_BPS:
+            return
+        state["last_jump"] = now
+        state["jumps"] += 1
+    threading.Thread(target=on_jump, args=(now, bps, px), daemon=True).start()
+
+
+def bn_worker():
+    while True:
+        try:
+            ws = websocket.create_connection(BINANCE_WS, timeout=10)
+            ws.settimeout(30)
+            log.info("binance connected")
+            while True:
+                d = json.loads(ws.recv()).get("data", {})
+                b, a = float(d.get("b", 0)), float(d.get("a", 0))
+                if b > 0 and a > 0:
+                    state["bn"] += 1
+                    on_tick(time.time(), (b + a) / 2)
+        except Exception as e:
+            log.warning(f"binance: {e}")
+        time.sleep(3)
+
+
+# ── model ───────────────────────────────────────────────────────────────────
+def norm_cdf(z):
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+def sigma():
+    pts = [p for p in list(px1s) if p[0] >= time.time() - 900]
+    r = [(math.log(b / a)) ** 2 / (t1 - t0) for (t0, a), (t1, b) in zip(pts, pts[1:]) if t1 > t0 and a > 0 and b > 0]
+    if len(r) < 30:
+        return 6e-5
+    return max(2e-5, math.sqrt(sum(r) / len(r)))
+
+
+def fair_up(tf, o, now, px):
+    op = opens.get((tf, o))
+    left = o + tf * 60 - now
+    if not op or not px or left <= 0:
+        return None
+    return 100.0 * norm_cdf(math.log(px / op) / (sigma() * math.sqrt(left)))
+
+
+def best(tok, kind):
+    with lock:
+        b = books.get(tok)
+        if not b or not b[kind]:
+            return None
+        return max(b[kind]) if kind == "bids" else min(b[kind])
+
+
+# ── the trade ───────────────────────────────────────────────────────────────
+def risk_check():
+    if paused():
+        return "paused (/go to resume)"
+    t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    rows = db_query("SELECT pnl, buy_cost, status, t0 FROM lj_trades WHERE mode='LIVE' AND t0>=?", (t_day,))
+    realized = sum(r["pnl"] or 0 for r in rows if r["pnl"] is not None)
+    open_cost = sum(r["buy_cost"] or 0 for r in rows if r["pnl"] is None and r["status"] in ("BOUGHT", "HOLDING"))
+    if realized - open_cost - LIVE_STAKE < -LIVE_DAILY_LOSS - 1e-9:
+        return f"daily loss limit ${LIVE_DAILY_LOSS:g} reached (today {money(realized)})"
+    last_hour = sum(1 for r in rows if r["t0"] >= time.time() - 3600)
+    if last_hour >= LIVE_MAX_TRADES_HOUR:
+        return f"{last_hour} live trades in the last hour (max {LIVE_MAX_TRADES_HOUR})"
+    return None
+
+
+def on_jump(t0, bps, px0):
+    up = bps > 0
+    fairs = {}
+    with lock:
+        live = [(k, v) for k, v in markets.items() if k[1] <= t0 < k[1] + k[0] * 60]
+    for (tf, o), toks in live:
+        f = fair_up(tf, o, t0, px0)
+        if f is not None:
+            fairs[(tf, o)] = (toks, f if up else 100 - f)
+    time.sleep(max(0.0, t0 + EDGE_DELAY - time.time()))
+    for (tf, o), (toks, fair) in fairs.items():
+        tok = toks[0] if up else toks[1]
+        ask, bid = best(tok, "asks"), best(tok, "bids")
+        if ask is None or bid is None or not (5 <= ask <= 95):
+            continue
+        edge = fair - ask
+        if not (edge >= MIN_EDGE and ask < MAX_ASK and (ask >= CHEAP_CENTS or edge >= CHEAP_EDGE)):
+            continue
+        state["signals"] += 1
+        threading.Thread(target=trade, args=(t0, tf, o, tok, "UP" if up else "DOWN", bps, fair, ask, bid, edge),
+                         daemon=True).start()
+
+
+def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
+    key = (tf, o)
+    head = (f"⚡ <b>BTC {tf}m {side}</b> · jump {bps:+.1f}bp · fair {fair:.0f}¢ vs ask {ask:g}¢ "
+            f"(<b>edge {edge:+.0f}¢</b>)")
+    mode = "LIVE" if LIVE_ENABLED else "PAPER"
+    rid = db_exec("INSERT INTO lj_trades (t0,tf,open_ts,side,bps,fair,ask,bid0,edge,mode,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (t0, tf, o, side, bps, fair, ask, bid, edge, mode, "SIGNAL"))
+    if mode == "LIVE":
+        with trade_lock:
+            if key in busy:
+                db_exec("UPDATE lj_trades SET mode='SKIPPED', status='SKIPPED', note=? WHERE id=?", ("position already open", rid))
+                return
+            why = risk_check()
+            if why:
+                db_exec("UPDATE lj_trades SET mode='BLOCKED', status='BLOCKED', note=? WHERE id=?", (why, rid))
+                tg(f"{head}\n⛔ skipped: {why}")
+                return
+            busy.add(key)
+        try:
+            live_round_trip(rid, head, tf, o, tok, side, ask)
+        finally:
+            busy.discard(key)
+    else:
+        time.sleep(max(0.0, t0 + EDGE_DELAY + HOLD_SECS - time.time()))
+        b = best(tok, "bids")
+        st = LIVE_STAKE
+        sh = st / (ask / 100)
+        pp = None if b is None else sh * b / 100 - st - fee(sh, ask / 100) - fee(sh, b / 100)
+        db_exec("UPDATE lj_trades SET status='PAPER', paper_bid=?, paper_pnl=?, pnl=? WHERE id=?", (b, pp, pp, rid))
+        tg(f"{head}\n📝 paper ${st:g}: buy {ask:g}¢ → sell {b if b is not None else '—'}¢ after {HOLD_SECS:g}s = "
+           f"<b>{money(pp) if pp is not None else 'n/a'}</b>  (live is OFF)")
+
+
+def live_round_trip(rid, head, tf, o, tok, side, ask):
+    bal0 = state.get("bal")                      # cached balance (fetching it here would slow the buy down)
+    # BUY
+    try:
+        ok, resp, note = market_order(tok, "BUY", LIVE_STAKE, ask + LIVE_MAX_OVERPAY)
+    except Exception as e:
+        ok, resp, note = False, {}, f"error: {str(e)[:150]}"
+    if not ok:
+        db_exec("UPDATE lj_trades SET mode='MISSED', status='MISSED', note=?, bal_before=? WHERE id=?", (note, bal0, rid))
+        tg(f"{head}\n⏭ not filled at ≤{ask + LIVE_MAX_OVERPAY:g}¢ — {note[:150]}")
+        return
+    cost, shares = _amounts(resp)
+    if cost <= 0 or shares <= 0:
+        cost, shares = LIVE_STAKE, LIVE_STAKE / (ask / 100)
+    bpx = cost / shares * 100
+    t_buy = time.time()
+    db_exec("UPDATE lj_trades SET status='BOUGHT', buy_cost=?, buy_shares=?, buy_px=?, buy_ts=?, bal_before=? WHERE id=?",
+            (cost, shares, bpx, t_buy, bal0, rid))
+    # wait, then SELL (fill-or-kill with a floor; a few retries)
+    time.sleep(max(0.0, t_buy + HOLD_SECS - time.time()))
+    paper_bid = best(tok, "bids")
+    sold, proceeds, s_sh, note = False, 0.0, 0.0, ""
+    for attempt in range(6):
+        b = best(tok, "bids")
+        if b is None:
+            time.sleep(1)
+            continue
+        try:
+            have = token_balance(tok)
+        except Exception as e:
+            have = shares
+            note = f"balance check: {str(e)[:80]}"
+        qty = math.floor(min(have, shares) * 100) / 100
+        if qty <= 0:
+            note = "no shares in the wallet yet"
+            time.sleep(1)
+            continue
+        try:
+            ok, resp, note = market_order(tok, "SELL", qty, max(1, b - LIVE_SELL_SLIP))
+        except Exception as e:
+            ok, note = False, f"error: {str(e)[:150]}"
+        if ok:
+            mk, tk = _amounts(resp)
+            s_sh, proceeds = (mk, tk) if mk > 0 and tk > 0 else (qty, qty * b / 100)
+            sold = True
+            break
+        time.sleep(1)
+    try:
+        bal1 = usdc_balance()
+    except Exception:
+        bal1 = None
+    pp = None if paper_bid is None else (shares * paper_bid / 100 - cost - fee(shares, ask / 100) - fee(shares, paper_bid / 100))
+    if sold:
+        pnl = proceeds - cost
+        spx = proceeds / s_sh * 100 if s_sh > 0 else 0
+        db_exec("UPDATE lj_trades SET status='SOLD', sell_proceeds=?, sell_shares=?, sell_px=?, sell_ts=?, paper_bid=?, "
+                "paper_pnl=?, pnl=?, bal_after=?, result=?, note=? WHERE id=?",
+                (proceeds, s_sh, spx, time.time(), paper_bid, pp, pnl, bal1, "WIN" if pnl > 0 else "LOSS", note, rid))
+        cash = f" · wallet {money(bal1 - bal0)}" if bal0 is not None and bal1 is not None else ""
+        tg(f"{head}\n💵 <b>LIVE</b> bought {shares:.2f} sh @ {bpx:.1f}¢ (${cost:.2f}) → sold @ {spx:.1f}¢ "
+           f"after {time.time() - t_buy:.1f}s = <b>{money(pnl)}</b>{cash}\n"
+           f"<i>paper would have made {money(pp) if pp is not None else 'n/a'}</i>")
+    else:
+        db_exec("UPDATE lj_trades SET status='HOLDING', paper_bid=?, paper_pnl=?, bal_after=?, note=? WHERE id=?",
+                (paper_bid, pp, bal1, note, rid))
+        tg(f"{head}\n💵 <b>LIVE</b> bought {shares:.2f} sh @ {bpx:.1f}¢ but couldn't sell after {HOLD_SECS:g}s — "
+           f"holding to the end.\n<i>{note[:150]}</i>")
+
+
+def balance_worker():
+    """keep a recent USDC balance on hand without slowing down orders"""
+    while True:
+        try:
+            if LIVE_ENABLED and not busy:
+                state["bal"] = usdc_balance()
+        except Exception as e:
+            log.warning(f"balance: {e}")
+        time.sleep(20)
+
+
+def settler():
+    while True:
+        try:
+            now = time.time()
+            for r in db_query("SELECT * FROM lj_trades WHERE status='HOLDING' AND open_ts + tf*60 < ?", (now - 90,)):
+                out = outcome(r["tf"], r["open_ts"])
+                if not out:
+                    continue
+                won = out == r["side"]
+                pnl = (r["buy_shares"] if won else 0) - r["buy_cost"]
+                db_exec("UPDATE lj_trades SET status='SETTLED', pnl=?, result=? WHERE id=?", (pnl, "WIN" if won else "LOSS", r["id"]))
+                tg(f"{'✅' if won else '❌'} held BTC {r['tf']}m {r['side']} settled {out}: <b>{money(pnl)}</b>")
+        except Exception as e:
+            log.warning(f"settler: {e}")
+        time.sleep(30)
+
+
+# ── reports ─────────────────────────────────────────────────────────────────
+def summary(since, label):
+    rows = db_query("SELECT * FROM lj_trades WHERE t0>=? ORDER BY t0", (since,))
+    live = [r for r in rows if r["mode"] == "LIVE" and r["pnl"] is not None]
+    paper = [r for r in rows if r["mode"] == "PAPER" and r["pnl"] is not None]
+    missed = sum(1 for r in rows if r["mode"] == "MISSED")
+    blocked = sum(1 for r in rows if r["mode"] == "BLOCKED")
+    L = [f"<b>{label}</b>"]
+    if live:
+        w = sum(1 for r in live if r["pnl"] > 0)
+        pp = sum(r["paper_pnl"] or 0 for r in live)
+        L.append(f"💵 live: {len(live)} trades · {w} wins · <b>{money(sum(r['pnl'] for r in live))}</b> "
+                 f"(paper on the same trades {money(pp)})")
+        L.append(f"   avg buy slip {sum((r['buy_px'] or r['ask']) - r['ask'] for r in live) / len(live):+.1f}¢ · "
+                 f"holding {sum(1 for r in rows if r['status'] == 'HOLDING')}")
+    if paper:
+        L.append(f"📝 paper: {len(paper)} trades · {sum(1 for r in paper if r['pnl'] > 0)} wins · "
+                 f"<b>{money(sum(r['pnl'] for r in paper))}</b>")
+    L.append(f"not filled {missed} · blocked {blocked} · signals {len(rows)}")
+    return "\n".join(L)
+
+
+def status_text():
+    t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    with lock:
+        nm = len(markets)
+    L = [f"⚡ <b>LIVE BTC JUMP SNIPER</b> · {'🟢 LIVE' if LIVE_ENABLED else '📝 PAPER (LIVE_ENABLED=false)'}"
+         f"{' · ⏸ PAUSED' if paused() else ''}",
+         f"rule: jump ≥{JUMP_BPS:g}bp/{JUMP_WINDOW:g}s · edge ≥{MIN_EDGE:g}¢ · ask &lt;{MAX_ASK:g}¢ · under {CHEAP_CENTS:g}¢ needs "
+         f"edge ≥{CHEAP_EDGE:g}¢ · ${LIVE_STAKE:g} · sell after {HOLD_SECS:g}s",
+         f"limits: ${LIVE_DAILY_LOSS:g}/day · {LIVE_MAX_TRADES_HOUR}/hour · buy ≤ask+{LIVE_MAX_OVERPAY:g}¢ · sell ≥bid−{LIVE_SELL_SLIP:g}¢",
+         f"up {(time.time() - state['started']) / 3600:.1f}h · BTC {price['px'] or 0:,.0f} · markets {nm} · jumps {state['jumps']} · "
+         f"signals {state['signals']} · σ {sigma() * 1e5:.1f}e-5/s" + (f" · last error: {state['err'][:80]}" if state["err"] else ""),
+         summary(t_day, "today")]
+    return "\n".join(L)
+
+
+def trades_text(n=12):
+    rows = db_query("SELECT * FROM lj_trades ORDER BY t0 DESC LIMIT ?", (n,))
+    if not rows:
+        return "no signals yet"
+    L = ["<b>last signals</b>"]
+    for r in rows:
+        t = datetime.fromtimestamp(r["t0"], TZ).strftime("%a %H:%M:%S")
+        p = r["pnl"]
+        L.append(f"{t} {r['tf']}m {r['side']} ask {r['ask']:g}¢ edge {r['edge']:+.0f} · {r['mode']} {r['status']} "
+                 f"{money(p) if p is not None else ''} {('(paper ' + money(r['paper_pnl']) + ')') if r['mode'] == 'LIVE' and r['paper_pnl'] is not None else ''}")
+    return "\n".join(L)
+
+
+def telegram_worker():
+    off = 0
+    while True:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                             params={"offset": off, "timeout": 30}, timeout=40).json()
+            for u in r.get("result", []):
+                off = u["update_id"] + 1
+                msg = u.get("message") or {}
+                if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+                    continue
+                t = (msg.get("text") or "").strip().split()[0].lower() if msg.get("text") else ""
+                if t == "/status":
+                    tg(status_text())
+                elif t == "/trades":
+                    tg(trades_text())
+                elif t == "/today":
+                    tg(summary(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp(), "today"))
+                elif t == "/all":
+                    tg(summary(0, "all time"))
+                elif t == "/balance":
+                    try:
+                        tg(f"💰 USDC balance: <b>${usdc_balance():,.2f}</b>")
+                    except Exception as e:
+                        tg(f"⚠️ balance failed: {str(e)[:200]}")
+                elif t == "/stop":
+                    kv_set("paused", "1")
+                    tg("⏸ paused — no new live trades. /go to resume.")
+                elif t == "/go":
+                    kv_set("paused", "0")
+                    tg("▶️ resumed.")
+                elif t == "/export":
+                    rows = db_query("SELECT * FROM lj_trades ORDER BY t0")
+                    if rows:
+                        buf = io.StringIO()
+                        w = csv.writer(buf)
+                        w.writerow(rows[0].keys())
+                        w.writerows([list(x) for x in rows])
+                        tg_document("live_jumper.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} signals")
+                    else:
+                        tg("no signals yet")
+                elif t in ("/help", "/start"):
+                    tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
+                       "/balance — USDC in the account\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)")
+        except Exception as e:
+            log.warning(f"telegram: {e}")
+            time.sleep(5)
 
 
 def main():
-    if not WEBSOCKET_AVAILABLE:
-        log.error("websocket-client not installed")
-        return
     init_db()
-    threading.Thread(target=binance_ref_worker, daemon=True).start()
-    labels = ", ".join(label_for(t) for t in TFS)
-    tg(f"🔵 <b>FAVORITE DIP LADDER · PAPER</b> — no money, untested\n"
-       f"{'🔄 inverse ON: each dip also buys the other side at its real ask · /istats' + chr(10) if INV_ENABLED else ''}"
-       f"buys dips ≥{DIP_DROP_CENTS:.0f}¢ below peak on sides that reached "
-       f"≥{FAVORITE_MIN_CENTS:.0f}¢ · floor {DIP_FLOOR_CENTS:.0f}¢\n"
-       f"ladder: sell {LADDER_SELL_FRAC:.0%} every {RUNG_STEP_CENTS:.0f}¢ climb\n"
-       f"tf={labels} · stake ${PAPER_STAKE:g}\n/stats")
-    threading.Thread(target=dip_monitor, daemon=True).start()
-    threading.Thread(target=scorer, daemon=True).start()
-    threading.Thread(target=xrp_settler, daemon=True).start()
-    if S1_ENABLED:
-        threading.Thread(target=s1_monitor, daemon=True).start()
-    live_line = "📝 live trading is OFF (paper only)"
+    for fn in (resolver_worker, pm_worker, bn_worker, settler, telegram_worker, balance_worker):
+        threading.Thread(target=fn, daemon=True).start()
+    bal = ""
     if LIVE_ENABLED:
         try:
-            bal = usdc_balance()
-            live_line = (f"💵 <b>LIVE ON</b> for: {', '.join(sorted(LIVE_SETUPS)) or 'nothing'} · "
-                         f"daily limit ${LIVE_DAILY_LOSS:g} · cash ${bal:.2f}"
-                         f"{' · ⏸ PAUSED (/go)' if live_paused() else ''}")
+            bal = f" · USDC ${usdc_balance():,.2f}"
         except Exception as e:
-            live_line = f"⚠️ LIVE could not connect: {str(e)[:200]}"
-    dip_on = LIVE_ENABLED and "dip" in LIVE_SETUPS
-    s1_on = LIVE_ENABLED and "s1" in LIVE_SETUPS
-    tg(f"⚪ <b>{XRP_ASSET} 15m inverse</b> (fav dips {XRP_DIP_MIN:.0f}-{XRP_DIP_MAX:.0f}¢) · "
-       f"{'💵 live $' + format(LIVE_STAKE, 'g') if dip_on else '📝 paper'}\n"
-       f"🎯 <b>S1</b> 1h favorite far ahead · "
-       f"{('💵 live $' + format(S1_STAKE, 'g')) if s1_on else ('📝 paper (silent)' if S1_ENABLED else 'off')}\n"
-       f"{live_line}\n/live · /s1 · /help")
+            bal = f" · ⚠️ couldn't connect to Polymarket: {str(e)[:150]}"
+    tg(f"⚡ live BTC jump sniper started — {'🟢 LIVE' if LIVE_ENABLED else '📝 PAPER (LIVE_ENABLED=false)'} · "
+       f"${LIVE_STAKE:g}/trade{bal}. Send /status.")
     while True:
-        try:
-            handle_commands()
-        except Exception as e:
-            log.error(f"main: {e}")
-        time.sleep(1)
+        time.sleep(60)
 
 
 if __name__ == "__main__":
