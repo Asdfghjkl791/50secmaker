@@ -108,6 +108,11 @@ def init_db():
             result TEXT, note TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS lj_kv (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS lj_early (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, feed TEXT, data TEXT)")
+        for col in ("fair_iv REAL", "sig REAL", "sig_iv REAL", "cl_open REAL", "bn_open REAL"):
+            try:
+                c.execute(f"ALTER TABLE lj_trades ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
         c.commit()
         c.close()
 
@@ -550,11 +555,13 @@ def early_capture(t0, feed, bps):
         with flock:
             last = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
         px = last.get("vis") or price["px"]
-        rec = {"t0": t0, "feed": feed, "bps": round(bps, 2), "px": last, "sig": sigma(), "mk": {}}
+        rec = {"t0": t0, "feed": feed, "bps": round(bps, 2), "px": last, "sig": sigma(), "sig_iv": sigma_iv(), "mk": {}}
         for (tf, o), toks in live:
             f = fair_up(tf, o, t0, px)
             tok = toks[0] if up else toks[1]
-            rec["mk"][str(tf)] = {"o": o, "open": opens.get((tf, o)), "cl_open": cl_opens.get((tf, o)), "left": round(o + tf * 60 - t0, 1),
+            fi = fair_up_iv(tf, o, t0, px)
+            rec["mk"][str(tf)] = {"o": o, "open": opens.get((tf, o)), "cl_open": cl_opens.get((tf, o)),
+                                  "fair_iv": None if fi is None else round(fi if up else 100 - fi, 2), "left": round(o + tf * 60 - t0, 1),
                                   "fair": None if f is None else round(f if up else 100 - f, 2), "snaps": {}}
             a, b = _ladder(tok)
             rec["mk"][str(tf)]["snaps"]["0"] = {"a": a, "b": b}
@@ -665,6 +672,64 @@ def early_feed_worker(name):
         time.sleep(5)
 
 
+# ── options volatility (paper comparison only) ─────────────────────────────
+DERIBIT = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
+ivs = {"iv": None, "ts": 0.0, "exp_h": None, "err": ""}
+
+
+def deribit_atm_iv():
+    """at-the-money implied vol of the nearest BTC options expiry at least 2h away (annual, e.g. 0.36)"""
+    r = requests.get(DERIBIT, params={"currency": "BTC", "kind": "option"}, timeout=15).json()
+    now = time.time()
+    by = {}
+    for x in r.get("result", []):
+        p = (x.get("instrument_name") or "").split("-")
+        if len(p) != 4 or not x.get("mark_iv"):
+            continue
+        try:
+            e = datetime.strptime(p[1], "%d%b%y").replace(hour=8, tzinfo=timezone.utc).timestamp()
+            K, F = float(p[2]), float(x.get("underlying_price") or 0)
+        except Exception:
+            continue
+        if e - now < 7200 or F <= 0:
+            continue
+        by.setdefault(e, {"F": F, "pts": []})["pts"].append((abs(K / F - 1), float(x["mark_iv"]) / 100.0))
+    if not by:
+        return None, None
+    e = min(by)
+    allp = sorted(by[e]["pts"])
+    pts = [x for x in allp if x[0] <= 0.03][:4] or allp[:2]   # options within 3% of the price (closest 2 if none)
+    return sum(v for _, v in pts) / len(pts), (e - now) / 3600
+
+
+def deribit_worker():
+    while True:
+        try:
+            iv, eh = deribit_atm_iv()
+            if iv:
+                ivs.update(iv=iv, ts=time.time(), exp_h=eh, err="")
+        except Exception as e:
+            ivs["err"] = str(e)[:100]
+            log.warning(f"deribit: {e}")
+        time.sleep(60)
+
+
+def sigma_iv():
+    if not ivs["iv"] or time.time() - ivs["ts"] > 600:
+        return None
+    return ivs["iv"] / math.sqrt(365 * 86400)
+
+
+def fair_up_iv(tf, o, now, px):
+    """same fair price, but using the options market's volatility instead of the last 15 minutes"""
+    s = sigma_iv()
+    op = opens.get((tf, o))
+    left = o + tf * 60 - now
+    if not s or not op or not px or left <= 0:
+        return None
+    return 100.0 * norm_cdf(math.log(px / op) / (s * math.sqrt(left)))
+
+
 # ── model ───────────────────────────────────────────────────────────────────
 def norm_cdf(z):
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
@@ -713,6 +778,8 @@ def risk_check(pending=0):
 
 def on_jump(t0, bps, px0):
     up = bps > 0
+    for k in [k for k in list(extra) if k[0] < t0 - 60]:
+        extra.pop(k, None)
     fairs = {}
     with lock:
         live = [(k, v) for k, v in markets.items() if k[1] <= t0 < k[1] + k[0] * 60]
@@ -720,6 +787,9 @@ def on_jump(t0, bps, px0):
         f = fair_up(tf, o, t0, px0)
         if f is not None:
             fairs[(tf, o)] = (toks, f if up else 100 - f)
+            fi = fair_up_iv(tf, o, t0, px0)
+            extra[(t0, tf)] = {"fair_iv": None if fi is None else (fi if up else 100 - fi), "sig": sigma(),
+                               "sig_iv": sigma_iv(), "cl_open": cl_opens.get((tf, o)), "bn_open": opens.get((tf, o))}
     time.sleep(max(0.0, t0 + EDGE_DELAY - time.time()))
     sigs = []
     for (tf, o), (toks, fair) in fairs.items():
@@ -745,6 +815,9 @@ def on_jump(t0, bps, px0):
         threading.Thread(target=trade, args=s, daemon=True).start()
 
 
+extra = {}                                  # (t0, tf) -> options fair & friends, picked up when the signal is logged
+
+
 def _head(tf, side, bps, fair, ask, edge):
     return f"{tf}m {side} {edge:+.0f}¢"
 
@@ -761,8 +834,11 @@ def short_why(note, cap):
 def admit(t0, tf, o, tok, side, bps, fair, ask, bid, edge, mode, pending=0):
     """log the signal; for LIVE, check the limits and lock the market. Returns (rid, head, allowed)."""
     head = _head(tf, side, bps, fair, ask, edge)
-    rid = db_exec("INSERT INTO lj_trades (t0,tf,open_ts,side,bps,fair,ask,bid0,edge,mode,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                  (t0, tf, o, side, bps, fair, ask, bid, edge, mode, "SIGNAL"))
+    x = extra.pop((t0, tf), {})
+    rid = db_exec("INSERT INTO lj_trades (t0,tf,open_ts,side,bps,fair,ask,bid0,edge,mode,status,fair_iv,sig,sig_iv,cl_open,bn_open) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (t0, tf, o, side, bps, fair, ask, bid, edge, mode, "SIGNAL", x.get("fair_iv"), x.get("sig"),
+                   x.get("sig_iv"), x.get("cl_open"), x.get("bn_open")))
     if mode != "LIVE":
         return rid, head, True
     with trade_lock:
@@ -1023,7 +1099,8 @@ def status_text():
          f"limits: ${LIVE_DAILY_LOSS:g}/day · {LIVE_MAX_TRADES_HOUR}/hour · buy ≤ min(ask+{SMART_MAX:g}¢, fair−{KEEP_EDGE:g}¢) · "
          f"sell ≥bid−{LIVE_SELL_SLIP:g}¢ · decide after {EDGE_DELAY:g}s",
          f"up {(time.time() - state['started']) / 3600:.1f}h · BTC {price['px'] or 0:,.0f} · markets {nm} · jumps {state['jumps']} · "
-         f"signals {state['signals']} · σ {sigma() * 1e5:.1f}e-5/s · early log {early_state['n']} (feeds {early_state['ticks']})"
+         f"signals {state['signals']} · σ {sigma() * 1e5:.1f}e-5/s · options σ "
+         f"{(sigma_iv() or 0) * 1e5:.1f}e-5/s · early log {early_state['n']} (feeds {early_state['ticks']})"
          + (f" · chainlink: {early_state['cl_err'][:60]}" if early_state["cl_err"] else "") + (f" · last error: {state['err'][:80]}" if state["err"] else ""),
          summary(t_day, "today")]
     return "\n".join(L)
@@ -1128,6 +1205,7 @@ def main():
         for nm in EARLY_FEEDS:
             threading.Thread(target=early_feed_worker, args=(nm,), daemon=True).start()
         threading.Thread(target=chainlink_worker, daemon=True).start()
+        threading.Thread(target=deribit_worker, daemon=True).start()
     bal = ""
     if LIVE_ENABLED:
         try:
