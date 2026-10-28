@@ -206,17 +206,49 @@ def _amounts(resp):
         return 0.0, 0.0
 
 
+ORDER_TYPE = os.environ.get("ORDER_TYPE", "FAK").strip().upper()     # FAK = fill what you can, cancel the rest
+warmed = set()
+timing = {}                                                          # last order: build / post seconds
+
+
+def warm(token):
+    """Build (and sign) a throwaway order for a token WITHOUT sending it, so market info, fee info and the
+    signing code are all loaded before a real trade needs them."""
+    if not LIVE_ENABLED or token in warmed:
+        return
+    try:
+        from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
+        t0 = time.time()
+        clob().create_market_order(MarketOrderArgs(token_id=token, amount=1.0, side=Side.BUY, price=0.01,
+                                                   order_type=OrderType.FOK))
+        warmed.add(token)
+        log.info(f"[LIVE] warmed {token[:10]}… in {time.time() - t0:.2f}s")
+    except Exception as e:
+        log.warning(f"[LIVE] warm {token[:10]}…: {e}")
+
+
 def market_order(token, side, amount, limit_c):
-    """Fill-or-kill market order. BUY: amount = dollars, limit = most we pay. SELL: amount = shares,
-    limit = least we accept. Returns (ok, resp, note)."""
+    """Market order with a price limit. BUY: amount = dollars, limit = most we pay. SELL: amount = shares,
+    limit = least we accept. FAK fills what it can at or better than the limit and cancels the rest.
+    Returns (ok, resp, note)."""
     from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
+    ot = OrderType.FAK if ORDER_TYPE == "FAK" else OrderType.FOK
     lim = max(0.01, min(0.99, round(limit_c / 100.0, 2)))
     mo = MarketOrderArgs(token_id=token, amount=round(amount, 2), side=Side.BUY if side == "BUY" else Side.SELL,
-                         price=lim, order_type=OrderType.FOK)
-    resp = clob().create_and_post_market_order(mo, order_type=OrderType.FOK) or {}
+                         price=lim, order_type=ot)
+    c = clob()
+    t0 = time.time()
+    order = c.create_market_order(mo)
+    t1 = time.time()
+    try:
+        resp = c.post_order(order, ot) or {}
+    except Exception as e:
+        resp = {"success": False, "errorMsg": str(e)[:200]}
+    t2 = time.time()
+    timing.update(build=t1 - t0, post=t2 - t1, sent=t1)
     if not isinstance(resp, dict):
         resp = {"success": False, "errorMsg": str(resp)[:200]}
-    log.info(f"[LIVE] {side} resp: {str(resp)[:300]}")
+    log.info(f"[LIVE] {side} build {t1 - t0:.2f}s post {t2 - t1:.2f}s resp: {str(resp)[:300]}")
     if not resp.get("success", False) or resp.get("errorMsg"):
         return False, resp, str(resp.get("errorMsg") or resp)[:200]
     mk, tk = _amounts(resp)
@@ -289,6 +321,8 @@ def resolver_worker():
                         if t:
                             with lock:
                                 markets[(tf, o)] = t
+                            for tok in t:
+                                warm(tok)
             with lock:
                 for k in [k for k in markets if k[1] + k[0] * 60 < now - 600]:
                     for t in markets.pop(k):
@@ -494,7 +528,7 @@ def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
                 return
             busy.add(key)
         try:
-            live_round_trip(rid, head, tf, o, tok, side, ask)
+            live_round_trip(rid, head, tf, o, tok, side, ask, t0)
         finally:
             busy.discard(key)
     else:
@@ -508,24 +542,26 @@ def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
            f"<b>{money(pp) if pp is not None else 'n/a'}</b>  (live is OFF)")
 
 
-def live_round_trip(rid, head, tf, o, tok, side, ask):
+def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0):
     bal0 = state.get("bal")                      # cached balance (fetching it here would slow the buy down)
     # BUY
     try:
         ok, resp, note = market_order(tok, "BUY", LIVE_STAKE, ask + LIVE_MAX_OVERPAY)
     except Exception as e:
         ok, resp, note = False, {}, f"error: {str(e)[:150]}"
+    lag = (f"order reached Polymarket {timing.get('sent', 0) + timing.get('post', 0) - t_jump:.2f}s after the jump "
+           f"(build {timing.get('build', 0) * 1000:.0f}ms · send {timing.get('post', 0) * 1000:.0f}ms)")
     if not ok:
-        db_exec("UPDATE lj_trades SET mode='MISSED', status='MISSED', note=?, bal_before=? WHERE id=?", (note, bal0, rid))
-        tg(f"{head}\n⏭ not filled at ≤{ask + LIVE_MAX_OVERPAY:g}¢ — {note[:150]}")
+        db_exec("UPDATE lj_trades SET mode='MISSED', status='MISSED', note=?, bal_before=? WHERE id=?", (f"{note} | {lag}", bal0, rid))
+        tg(f"{head}\n⏭ not filled at ≤{ask + LIVE_MAX_OVERPAY:g}¢ — {note[:150]}\n<i>{lag}</i>")
         return
     cost, shares = _amounts(resp)
     if cost <= 0 or shares <= 0:
         cost, shares = LIVE_STAKE, LIVE_STAKE / (ask / 100)
     bpx = cost / shares * 100
     t_buy = time.time()
-    db_exec("UPDATE lj_trades SET status='BOUGHT', buy_cost=?, buy_shares=?, buy_px=?, buy_ts=?, bal_before=? WHERE id=?",
-            (cost, shares, bpx, t_buy, bal0, rid))
+    db_exec("UPDATE lj_trades SET status='BOUGHT', buy_cost=?, buy_shares=?, buy_px=?, buy_ts=?, bal_before=?, note=? WHERE id=?",
+            (cost, shares, bpx, t_buy, bal0, lag, rid))
     # wait, then SELL (fill-or-kill with a floor; a few retries)
     time.sleep(max(0.0, t_buy + HOLD_SECS - time.time()))
     paper_bid = best(tok, "bids")
@@ -569,7 +605,7 @@ def live_round_trip(rid, head, tf, o, tok, side, ask):
         cash = f" · wallet {money(bal1 - bal0)}" if bal0 is not None and bal1 is not None else ""
         tg(f"{head}\n💵 <b>LIVE</b> bought {shares:.2f} sh @ {bpx:.1f}¢ (${cost:.2f}) → sold @ {spx:.1f}¢ "
            f"after {time.time() - t_buy:.1f}s = <b>{money(pnl)}</b>{cash}\n"
-           f"<i>paper would have made {money(pp) if pp is not None else 'n/a'}</i>")
+           f"<i>paper would have made {money(pp) if pp is not None else 'n/a'} · {lag}</i>")
     else:
         db_exec("UPDATE lj_trades SET status='HOLDING', paper_bid=?, paper_pnl=?, bal_after=?, note=? WHERE id=?",
                 (paper_bid, pp, bal1, note, rid))
@@ -711,7 +747,7 @@ def main():
     bal = ""
     if LIVE_ENABLED:
         try:
-            bal = f" · USDC ${usdc_balance():,.2f}"
+            bal = f" · USDC ${usdc_balance():,.2f} · orders {ORDER_TYPE}"
         except Exception as e:
             bal = f" · ⚠️ couldn't connect to Polymarket: {str(e)[:150]}"
     tg(f"⚡ live BTC jump sniper started — {'🟢 LIVE' if LIVE_ENABLED else '📝 PAPER (LIVE_ENABLED=false)'} · "
