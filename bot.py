@@ -559,6 +559,7 @@ def on_jump(t0, bps, px0):
         sigs.append((t0, tf, o, tok, "UP" if up else "DOWN", bps, fair, ask, bid, edge))
     if not sigs:
         return
+    sigs.sort(key=lambda s: -s[9])                 # biggest edge goes out first
     if LIVE_ENABLED and BATCH_ORDERS and len(sigs) > 1:
         live_group(sigs)
         return
@@ -756,17 +757,31 @@ def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0, fair=0.0, buy=
         bal1 = None
     pp = None if paper_bid is None else (shares * paper_bid / 100 - cost - fee(shares, ask / 100) - fee(shares, paper_bid / 100))
     if sold:
-        pnl = proceeds - cost
         spx = proceeds / s_sh * 100 if s_sh > 0 else 0
+        fees = fee(shares, bpx / 100) + fee(s_sh, spx / 100)       # Polymarket takes these from the wallet separately
+        pnl = proceeds - cost - fees
         db_exec("UPDATE lj_trades SET status='SOLD', sell_proceeds=?, sell_shares=?, sell_px=?, sell_ts=?, paper_bid=?, "
                 "paper_pnl=?, pnl=?, bal_after=?, result=?, note=? WHERE id=?",
-                (proceeds, s_sh, spx, time.time(), paper_bid, pp, pnl, bal1, "WIN" if pnl > 0 else "LOSS", note, rid))
+                (proceeds, s_sh, spx, time.time(), paper_bid, pp, pnl, bal1, "WIN" if pnl > 0 else "LOSS",
+                 lag_full + (f" | {note}" if note else ""), rid))
         tg(f"{'✅' if pnl > 0 else '❌'} {head} · {bpx:.0f}→{spx:.0f}¢ · <b>{money(pnl)}</b>"
            f" (paper {money(pp) if pp is not None else 'n/a'}) · {lag}")
     else:
         db_exec("UPDATE lj_trades SET status='HOLDING', paper_bid=?, paper_pnl=?, bal_after=?, note=? WHERE id=?",
-                (paper_bid, pp, bal1, note, rid))
+                (paper_bid, pp, bal1, lag_full + (f" | {note}" if note else ""), rid))
         tg(f"⏳ {head} · bought {bpx:.0f}¢, couldn't sell · holding to the end")
+
+
+def keep_warm():
+    """Touch Polymarket every 3s over the same connection orders use, so it never goes idle and has to reconnect
+    when a jump comes (the library drops idle connections after 5s)."""
+    while True:
+        try:
+            if LIVE_ENABLED:
+                clob().get_server_time()
+        except Exception as e:
+            log.debug(f"keep_warm: {e}")
+        time.sleep(3)
 
 
 def balance_worker():
@@ -789,7 +804,7 @@ def settler():
                 if not out:
                     continue
                 won = out == r["side"]
-                pnl = (r["buy_shares"] if won else 0) - r["buy_cost"]
+                pnl = (r["buy_shares"] if won else 0) - r["buy_cost"] - fee(r["buy_shares"], (r["buy_px"] or 50) / 100)
                 db_exec("UPDATE lj_trades SET status='SETTLED', pnl=?, result=? WHERE id=?", (pnl, "WIN" if won else "LOSS", r["id"]))
                 tg(f"{'✅' if won else '❌'} held {r['tf']}m {r['side']} settled {out} · <b>{money(pnl)}</b>")
         except Exception as e:
@@ -882,8 +897,16 @@ def telegram_worker():
                             ms.append((time.time() - a_) * 1000)
                         except Exception:
                             pass
-                    tg(f"🏓 Polymarket round trip from this server: {', '.join(f'{x:.0f}' for x in ms)} ms "
-                       f"(median {sorted(ms)[len(ms) // 2]:.0f} ms)" if ms else "🏓 couldn't reach Polymarket")
+                    mo = []
+                    for _ in range(5):
+                        a_ = time.time()
+                        try:
+                            clob().get_server_time()
+                            mo.append((time.time() - a_) * 1000)
+                        except Exception:
+                            pass
+                    med = lambda v: f"{sorted(v)[len(v) // 2]:.0f}ms" if v else "failed"
+                    tg(f"🏓 simple: {med(ms)} · order line: {med(mo)} ({', '.join(f'{x:.0f}' for x in mo)})")
                 elif t == "/stop":
                     kv_set("paused", "1")
                     tg("⏸ paused — no new live trades. /go to resume.")
@@ -910,7 +933,7 @@ def telegram_worker():
 
 def main():
     init_db()
-    for fn in (resolver_worker, pm_worker, bn_worker, settler, telegram_worker, balance_worker):
+    for fn in (resolver_worker, pm_worker, bn_worker, settler, telegram_worker, balance_worker, keep_warm):
         threading.Thread(target=fn, daemon=True).start()
     bal = ""
     if LIVE_ENABLED:
