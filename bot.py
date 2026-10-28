@@ -45,7 +45,9 @@ TFS = [int(x) for x in os.environ.get("JL_TFS", "5,15").split(",") if x.strip()]
 JUMP_BPS = env_f("JUMP_BPS", "5")
 JUMP_WINDOW = env_f("JUMP_WINDOW", "2")
 JUMP_COOLDOWN = env_f("JUMP_COOLDOWN", "10")
-EDGE_DELAY = env_f("EDGE_DELAY", "0.25")
+EDGE_DELAY = env_f("EDGE_DELAY", "0")            # decide on the book at the jump itself (fastest)
+KEEP_EDGE = env_f("KEEP_EDGE_CENTS", "8")          # smart cap: may pay up to fair - 8c ...
+SMART_MAX = env_f("SMART_MAX_OVERPAY_CENTS", "8")  # ... but never more than ask + 8c
 MIN_EDGE = env_f("MIN_EDGE", "10")
 MAX_ASK = env_f("MAX_ASK", "85")
 CHEAP_CENTS = env_f("CHEAP_CENTS", "20")
@@ -528,7 +530,7 @@ def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
                 return
             busy.add(key)
         try:
-            live_round_trip(rid, head, tf, o, tok, side, ask, t0)
+            live_round_trip(rid, head, tf, o, tok, side, ask, t0, fair)
         finally:
             busy.discard(key)
     else:
@@ -542,18 +544,19 @@ def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
            f"<b>{money(pp) if pp is not None else 'n/a'}</b>  (live is OFF)")
 
 
-def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0):
+def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0, fair=0.0):
     bal0 = state.get("bal")                      # cached balance (fetching it here would slow the buy down)
     # BUY
     try:
-        ok, resp, note = market_order(tok, "BUY", LIVE_STAKE, ask + LIVE_MAX_OVERPAY)
+        cap = max(ask + LIVE_MAX_OVERPAY, min(ask + SMART_MAX, fair - KEEP_EDGE))
+        ok, resp, note = market_order(tok, "BUY", LIVE_STAKE, cap)
     except Exception as e:
         ok, resp, note = False, {}, f"error: {str(e)[:150]}"
     lag = (f"order reached Polymarket {timing.get('sent', 0) + timing.get('post', 0) - t_jump:.2f}s after the jump "
            f"(build {timing.get('build', 0) * 1000:.0f}ms · send {timing.get('post', 0) * 1000:.0f}ms)")
     if not ok:
         db_exec("UPDATE lj_trades SET mode='MISSED', status='MISSED', note=?, bal_before=? WHERE id=?", (f"{note} | {lag}", bal0, rid))
-        tg(f"{head}\n⏭ not filled at ≤{ask + LIVE_MAX_OVERPAY:g}¢ — {note[:150]}\n<i>{lag}</i>")
+        tg(f"{head}\n⏭ not filled at ≤{cap:.0f}¢ — {note[:150]}\n<i>{lag}</i>")
         return
     cost, shares = _amounts(resp)
     if cost <= 0 or shares <= 0:
@@ -671,7 +674,8 @@ def status_text():
          f"{' · ⏸ PAUSED' if paused() else ''}",
          f"rule: jump ≥{JUMP_BPS:g}bp/{JUMP_WINDOW:g}s · edge ≥{MIN_EDGE:g}¢ · ask &lt;{MAX_ASK:g}¢ · under {CHEAP_CENTS:g}¢ needs "
          f"edge ≥{CHEAP_EDGE:g}¢ · ${LIVE_STAKE:g} · sell after {HOLD_SECS:g}s",
-         f"limits: ${LIVE_DAILY_LOSS:g}/day · {LIVE_MAX_TRADES_HOUR}/hour · buy ≤ask+{LIVE_MAX_OVERPAY:g}¢ · sell ≥bid−{LIVE_SELL_SLIP:g}¢",
+         f"limits: ${LIVE_DAILY_LOSS:g}/day · {LIVE_MAX_TRADES_HOUR}/hour · buy ≤ min(ask+{SMART_MAX:g}¢, fair−{KEEP_EDGE:g}¢) · "
+         f"sell ≥bid−{LIVE_SELL_SLIP:g}¢ · decide after {EDGE_DELAY:g}s",
          f"up {(time.time() - state['started']) / 3600:.1f}h · BTC {price['px'] or 0:,.0f} · markets {nm} · jumps {state['jumps']} · "
          f"signals {state['signals']} · σ {sigma() * 1e5:.1f}e-5/s" + (f" · last error: {state['err'][:80]}" if state["err"] else ""),
          summary(t_day, "today")]
@@ -716,6 +720,17 @@ def telegram_worker():
                         tg(f"💰 USDC balance: <b>${usdc_balance():,.2f}</b>")
                     except Exception as e:
                         tg(f"⚠️ balance failed: {str(e)[:200]}")
+                elif t == "/ping":
+                    ms = []
+                    for _ in range(5):
+                        a_ = time.time()
+                        try:
+                            requests.get(f"{CLOB_BASE}/time", timeout=5)
+                            ms.append((time.time() - a_) * 1000)
+                        except Exception:
+                            pass
+                    tg(f"🏓 Polymarket round trip from this server: {', '.join(f'{x:.0f}' for x in ms)} ms "
+                       f"(median {sorted(ms)[len(ms) // 2]:.0f} ms)" if ms else "🏓 couldn't reach Polymarket")
                 elif t == "/stop":
                     kv_set("paused", "1")
                     tg("⏸ paused — no new live trades. /go to resume.")
@@ -734,7 +749,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
