@@ -503,10 +503,13 @@ EARLY_FEEDS = {"spot": "wss://stream.binance.com:9443/stream?streams=btcusdt@boo
                "fut": "wss://fstream.binance.com/stream?streams=btcusdt@bookTicker"}
 EARLY_BPS, EARLY_WIN, EARLY_COOL = 3.0, 2.0, 10.0
 EARLY_SNAPS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
-feeds = {k: deque(maxlen=3000) for k in ("vis", "spot", "fut")}     # (t, mid) per feed
+feeds = {k: deque(maxlen=3000) for k in ("vis", "spot", "fut", "cl")}     # (t, mid) per feed
 cross = deque(maxlen=200)                                          # (t, feed, level, sign) first crossings
 flock = threading.Lock()
-early_state = {"last": {1: 0.0, -1: 0.0}, "n": 0, "ticks": {"spot": 0, "fut": 0}}
+early_state = {"last": {1: 0.0, -1: 0.0}, "n": 0, "ticks": {"spot": 0, "fut": 0, "cl": 0}, "cl_err": ""}
+CL_WS = "wss://ws-live-v2.polymarket.com/ws"     # Polymarket's live feed of the Chainlink price the markets settle on
+cl_hist = deque(maxlen=4000)                      # (chainlink_ts, received_ts, value)
+cl_opens = {}                                     # (tf, open_ts) -> Chainlink price at the window start
 
 
 def feed_tick(name, now, px):
@@ -522,7 +525,7 @@ def feed_tick(name, now, px):
                 sg = 1 if bps > 0 else -1
                 if not any(f == name and l == lvl and s == sg and now - t_ < 5 for t_, f, l, s in cross):
                     cross.append((now, name, lvl, sg))
-        if not EARLY_LOG or abs(bps) < EARLY_BPS:
+        if not EARLY_LOG or abs(bps) < EARLY_BPS or name == "cl":
             return
         sg = 1 if bps > 0 else -1
         if now - early_state["last"][sg] < EARLY_COOL:
@@ -551,7 +554,7 @@ def early_capture(t0, feed, bps):
         for (tf, o), toks in live:
             f = fair_up(tf, o, t0, px)
             tok = toks[0] if up else toks[1]
-            rec["mk"][str(tf)] = {"o": o, "open": opens.get((tf, o)), "left": round(o + tf * 60 - t0, 1),
+            rec["mk"][str(tf)] = {"o": o, "open": opens.get((tf, o)), "cl_open": cl_opens.get((tf, o)), "left": round(o + tf * 60 - t0, 1),
                                   "fair": None if f is None else round(f if up else 100 - f, 2), "snaps": {}}
             a, b = _ladder(tok)
             rec["mk"][str(tf)]["snaps"]["0"] = {"a": a, "b": b}
@@ -565,11 +568,83 @@ def early_capture(t0, feed, bps):
                 rec.setdefault("pxs", {})[f"{off:g}"] = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
         with flock:
             rec["cross"] = [[round(t_ - t0, 3), f, l, s] for t_, f, l, s in cross if -5 <= t_ - t0 <= 10]
+        rec["cl"] = [[round(ts - t0, 3), round(rt - t0, 3), v] for ts, rt, v in list(cl_hist) if -10 <= rt - t0 <= 12]
         rec["jump"] = round(state["last_jump"] - t0, 3) if abs(state["last_jump"] - t0) <= 10 else None
         db_exec("INSERT INTO lj_early (t0, feed, data) VALUES (?,?,?)", (t0, feed, json.dumps(rec, separators=(",", ":"))))
         early_state["n"] += 1
     except Exception as e:
         log.warning(f"early: {e}")
+
+
+def _cl_points(m):
+    """pull (timestamp_ms, value) points out of a feed message, whatever its exact shape"""
+    out = []
+    def walk(x):
+        if isinstance(x, dict):
+            v, ts = x.get("value"), x.get("timestamp") or x.get("ts")
+            if v is not None and ts is not None:
+                try:
+                    try:
+                        tsf = float(ts)
+                    except (TypeError, ValueError):
+                        tsf = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+                    out.append((tsf / 1000 if tsf > 1e11 else tsf, float(v)))
+                    return
+                except (TypeError, ValueError):
+                    pass
+            for k in ("payload", "data", "snapshot"):
+                if k in x:
+                    walk(x[k])
+        elif isinstance(x, list):
+            for y in x:
+                walk(y)
+    walk(m)
+    return out
+
+
+def chainlink_worker():
+    seen = 0
+    while True:
+        try:
+            cr = clob().creds
+            ws = websocket.create_connection(CL_WS, timeout=10)
+            ws.settimeout(30)
+            ws.send(json.dumps({"op": "auth", "rid": "a1", "auth": {"apiKey": cr.api_key, "secret": cr.api_secret,
+                                                                    "passphrase": cr.api_passphrase}}))
+            ws.send(json.dumps({"op": "subscribe", "rid": "s1",
+                                "subscriptions": [{"channel": "price.crypto", "filter": {"symbol": "btcusd"}}]}))
+            log.info("chainlink feed connected")
+            last_ping = time.time()
+            while True:
+                if time.time() - last_ping > 15:
+                    ws.ping()
+                    last_ping = time.time()
+                raw = ws.recv()
+                now = time.time()
+                try:
+                    m = json.loads(raw)
+                except Exception:
+                    continue
+                if seen < 3:                                 # first few frames to the log, to check the format
+                    log.info(f"chainlink frame: {str(m)[:300]}")
+                    seen += 1
+                if isinstance(m, dict) and m.get("op") in ("error",):
+                    early_state["cl_err"] = str(m)[:150]
+                pts = _cl_points(m)
+                for ts, v in pts:
+                    if cl_hist and ts <= cl_hist[-1][0]:
+                        continue
+                    cl_hist.append((ts, now, v))
+                    early_state["ticks"]["cl"] += 1
+                    feed_tick("cl", now, v)
+                    for tf in TFS:
+                        o = window(tf, ts)[0]
+                        if (tf, o) not in cl_opens and ts - o < 5:
+                            cl_opens[(tf, o)] = v
+        except Exception as e:
+            early_state["cl_err"] = str(e)[:150]
+            log.warning(f"chainlink: {e}")
+        time.sleep(10)
 
 
 def early_feed_worker(name):
@@ -948,7 +1023,8 @@ def status_text():
          f"limits: ${LIVE_DAILY_LOSS:g}/day · {LIVE_MAX_TRADES_HOUR}/hour · buy ≤ min(ask+{SMART_MAX:g}¢, fair−{KEEP_EDGE:g}¢) · "
          f"sell ≥bid−{LIVE_SELL_SLIP:g}¢ · decide after {EDGE_DELAY:g}s",
          f"up {(time.time() - state['started']) / 3600:.1f}h · BTC {price['px'] or 0:,.0f} · markets {nm} · jumps {state['jumps']} · "
-         f"signals {state['signals']} · σ {sigma() * 1e5:.1f}e-5/s" + (f" · last error: {state['err'][:80]}" if state["err"] else ""),
+         f"signals {state['signals']} · σ {sigma() * 1e5:.1f}e-5/s · early log {early_state['n']} (feeds {early_state['ticks']})"
+         + (f" · chainlink: {early_state['cl_err'][:60]}" if early_state["cl_err"] else "") + (f" · last error: {state['err'][:80]}" if state["err"] else ""),
          summary(t_day, "today")]
     return "\n".join(L)
 
@@ -1051,6 +1127,7 @@ def main():
     if EARLY_LOG:
         for nm in EARLY_FEEDS:
             threading.Thread(target=early_feed_worker, args=(nm,), daemon=True).start()
+        threading.Thread(target=chainlink_worker, daemon=True).start()
     bal = ""
     if LIVE_ENABLED:
         try:
