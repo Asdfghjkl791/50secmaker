@@ -245,34 +245,65 @@ def fast_post(c, order, ot):
         return c.post_order(order, ot)
 
 
-def market_order(token, side, amount, limit_c):
-    """Market order with a price limit. BUY: amount = dollars, limit = most we pay. SELL: amount = shares,
-    limit = least we accept. FAK fills what it can at or better than the limit and cancels the rest.
-    Returns (ok, resp, note)."""
+BATCH_ORDERS = os.environ.get("BATCH_ORDERS", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def build_order(token, side, amount, limit_c):
     from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
     ot = OrderType.FAK if ORDER_TYPE == "FAK" else OrderType.FOK
     lim = max(0.01, min(0.99, round(limit_c / 100.0, 2)))
     mo = MarketOrderArgs(token_id=token, amount=round(amount, 2), side=Side.BUY if side == "BUY" else Side.SELL,
                          price=lim, order_type=ot)
-    c = clob()
-    t0 = time.time()
-    order = c.create_market_order(mo)
-    t1 = time.time()
-    try:
-        resp = fast_post(c, order, ot) or {}
-    except Exception as e:
-        resp = {"success": False, "errorMsg": str(e)[:200]}
-    t2 = time.time()
-    timing.update(build=t1 - t0, post=t2 - t1, sent=t1)
+    return clob().create_market_order(mo), ot
+
+
+def check_resp(resp):
+    """(ok, resp, note) from one order answer"""
     if not isinstance(resp, dict):
         resp = {"success": False, "errorMsg": str(resp)[:200]}
-    log.info(f"[LIVE] {side} build {t1 - t0:.2f}s post {t2 - t1:.2f}s resp: {str(resp)[:300]}")
     if not resp.get("success", False) or resp.get("errorMsg"):
         return False, resp, str(resp.get("errorMsg") or resp)[:200]
     mk, tk = _amounts(resp)
     if str(resp.get("status", "")).lower() != "matched" and tk <= 0:
         return False, resp, f"status={resp.get('status')}"
     return True, resp, ""
+
+
+def batch_post(c, items):
+    """Send several signed orders in ONE request, so they all reach Polymarket together
+    (sent one by one, the second waits ~0.4s behind the first). Returns one answer per order.
+    Raises if the whole request fails."""
+    import py_clob_client_v2.client as cm
+    POST_ORDERS = getattr(cm, "POST_ORDERS", "/orders")
+    owner = c.creds.api_key or ""
+    payload = [cm.order_to_json_v2(o, owner, ot, False, False) if cm._is_v2_order(o)
+               else cm.order_to_json_v1(o, owner, ot, False, False) for o, ot in items]
+    ser = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    headers = c._l2_headers("POST", POST_ORDERS, body=payload, serialized_body=ser)
+    res = c._post(f"{c.host}{POST_ORDERS}", headers=headers, data=ser)
+    if isinstance(res, dict) and isinstance(res.get("data"), list):
+        res = res["data"]
+    if not isinstance(res, list) or len(res) != len(items):
+        raise RuntimeError(f"batch answer not understood: {str(res)[:150]}")
+    return res
+
+
+def market_order(token, side, amount, limit_c, tim=None):
+    """Market order with a price limit. BUY: amount = dollars, limit = most we pay. SELL: amount = shares,
+    limit = least we accept. FAK fills what it can at or better than the limit and cancels the rest.
+    Returns (ok, resp, note)."""
+    t0 = time.time()
+    order, ot = build_order(token, side, amount, limit_c)
+    t1 = time.time()
+    try:
+        resp = fast_post(clob(), order, ot) or {}
+    except Exception as e:
+        resp = {"success": False, "errorMsg": str(e)[:200]}
+    t2 = time.time()
+    if tim is not None:
+        tim.update(build=t1 - t0, post=t2 - t1, sent=t1)
+    log.info(f"[LIVE] {side} build {t1 - t0:.2f}s post {t2 - t1:.2f}s resp: {str(resp)[:300]}")
+    return check_resp(resp)
 
 
 # ── markets ─────────────────────────────────────────────────────────────────
@@ -489,17 +520,18 @@ def best(tok, kind):
 
 
 # ── the trade ───────────────────────────────────────────────────────────────
-def risk_check():
+def risk_check(pending=0):
     if paused():
         return "paused (/go to resume)"
     t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     rows = db_query("SELECT pnl, buy_cost, status, t0 FROM lj_trades WHERE mode='LIVE' AND t0>=?", (t_day,))
     realized = sum(r["pnl"] or 0 for r in rows if r["pnl"] is not None)
     open_cost = sum(r["buy_cost"] or 0 for r in rows if r["pnl"] is None and r["status"] in ("BOUGHT", "HOLDING"))
+    open_cost += LIVE_STAKE * pending
     if realized - open_cost - LIVE_STAKE < -LIVE_DAILY_LOSS - 1e-9:
         return f"daily loss limit ${LIVE_DAILY_LOSS:g} reached (today {money(realized)})"
     last_hour = sum(1 for r in rows if r["t0"] >= time.time() - 3600)
-    if last_hour >= LIVE_MAX_TRADES_HOUR:
+    if last_hour + pending >= LIVE_MAX_TRADES_HOUR:
         return f"{last_hour} live trades in the last hour (max {LIVE_MAX_TRADES_HOUR})"
     return None
 
@@ -514,6 +546,7 @@ def on_jump(t0, bps, px0):
         if f is not None:
             fairs[(tf, o)] = (toks, f if up else 100 - f)
     time.sleep(max(0.0, t0 + EDGE_DELAY - time.time()))
+    sigs = []
     for (tf, o), (toks, fair) in fairs.items():
         tok = toks[0] if up else toks[1]
         ask, bid = best(tok, "asks"), best(tok, "bids")
@@ -523,32 +556,112 @@ def on_jump(t0, bps, px0):
         if not (edge >= MIN_EDGE and ask < MAX_ASK and (ask >= CHEAP_CENTS or edge >= CHEAP_EDGE)):
             continue
         state["signals"] += 1
-        threading.Thread(target=trade, args=(t0, tf, o, tok, "UP" if up else "DOWN", bps, fair, ask, bid, edge),
-                         daemon=True).start()
+        sigs.append((t0, tf, o, tok, "UP" if up else "DOWN", bps, fair, ask, bid, edge))
+    if not sigs:
+        return
+    if LIVE_ENABLED and BATCH_ORDERS and len(sigs) > 1:
+        live_group(sigs)
+        return
+    for s in sigs:
+        threading.Thread(target=trade, args=s, daemon=True).start()
+
+
+def _head(tf, side, bps, fair, ask, edge):
+    return f"{tf}m {side} {edge:+.0f}¢"
+
+
+def short_why(note, cap):
+    n = (note or "").lower()
+    if "no orders found to match" in n or "not filled" in n or "status=" in n:
+        return f"price ran past {cap:.0f}¢"
+    if "not enough balance" in n or "allowance" in n:
+        return "not enough USDC"
+    return (note or "?")[:60]
+
+
+def admit(t0, tf, o, tok, side, bps, fair, ask, bid, edge, mode, pending=0):
+    """log the signal; for LIVE, check the limits and lock the market. Returns (rid, head, allowed)."""
+    head = _head(tf, side, bps, fair, ask, edge)
+    rid = db_exec("INSERT INTO lj_trades (t0,tf,open_ts,side,bps,fair,ask,bid0,edge,mode,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (t0, tf, o, side, bps, fair, ask, bid, edge, mode, "SIGNAL"))
+    if mode != "LIVE":
+        return rid, head, True
+    with trade_lock:
+        if (tf, o) in busy:
+            db_exec("UPDATE lj_trades SET mode='SKIPPED', status='SKIPPED', note=? WHERE id=?", ("position already open", rid))
+            return rid, head, False
+        why = risk_check(pending)
+        if why:
+            db_exec("UPDATE lj_trades SET mode='BLOCKED', status='BLOCKED', note=? WHERE id=?", (why, rid))
+            tg(f"⛔ {head} · skipped: {why}")
+            return rid, head, False
+        busy.add((tf, o))
+    return rid, head, True
+
+
+def buy_cap(ask, fair):
+    return max(ask + LIVE_MAX_OVERPAY, min(ask + SMART_MAX, fair - KEEP_EDGE))
+
+
+def live_group(sigs):
+    """Two or more signals on the same jump: send all the buys in one request so none waits behind another."""
+    acc = []
+    for s in sigs:
+        rid, head, ok = admit(*s, mode="LIVE", pending=len(acc))
+        if ok:
+            acc.append((s, rid, head))
+    if not acc:
+        return
+    if len(acc) == 1:
+        s, rid, head = acc[0]
+        t0, tf, o, tok, side, bps, fair, ask, bid, edge = s
+        _run_live(rid, head, tf, o, tok, side, ask, t0, fair)
+        return
+    tb = time.time()
+    items, built = [], []
+    for s, rid, head in acc:
+        t0, tf, o, tok, side, bps, fair, ask, bid, edge = s
+        cap = buy_cap(ask, fair)
+        try:
+            items.append(build_order(tok, "BUY", LIVE_STAKE, cap))
+            built.append((s, rid, head, cap))
+        except Exception as e:
+            db_exec("UPDATE lj_trades SET mode='MISSED', status='MISSED', note=? WHERE id=?", (f"build: {str(e)[:150]}", rid))
+            tg(f"⏭ {head} · order error: {str(e)[:60]}")
+            busy.discard((tf, o))
+    if not built:
+        return
+    t1 = time.time()
+    try:
+        resps, unsure = (batch_post(clob(), items) if len(items) > 1 else [fast_post(clob(), *items[0])]), False
+    except Exception as e:
+        resps, unsure = [{"success": False, "errorMsg": str(e)[:200]}] * len(items), True
+    t2 = time.time()
+    log.info(f"[LIVE] batch of {len(items)} build {t1 - tb:.2f}s post {t2 - t1:.2f}s resp: {str(resps)[:400]}")
+    tim = {"build": t1 - tb, "post": t2 - t1, "sent": t1, "n": len(items)}
+    for (s, rid, head, cap), r in zip(built, resps):
+        t0, tf, o, tok, side, bps, fair, ask, bid, edge = s
+        buy = (*check_resp(r), dict(tim), cap, unsure)
+        threading.Thread(target=_run_live, args=(rid, head, tf, o, tok, side, ask, t0, fair, buy), daemon=True).start()
+
+
+def _run_live(rid, head, tf, o, tok, side, ask, t0, fair, buy=None):
+    try:
+        live_round_trip(rid, head, tf, o, tok, side, ask, t0, fair, buy)
+    finally:
+        busy.discard((tf, o))
 
 
 def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
-    key = (tf, o)
-    head = (f"⚡ <b>BTC {tf}m {side}</b> · jump {bps:+.1f}bp · fair {fair:.0f}¢ vs ask {ask:g}¢ "
-            f"(<b>edge {edge:+.0f}¢</b>)")
     mode = "LIVE" if LIVE_ENABLED else "PAPER"
-    rid = db_exec("INSERT INTO lj_trades (t0,tf,open_ts,side,bps,fair,ask,bid0,edge,mode,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                  (t0, tf, o, side, bps, fair, ask, bid, edge, mode, "SIGNAL"))
+    rid, head, allowed = admit(t0, tf, o, tok, side, bps, fair, ask, bid, edge, mode)
+    if not allowed:
+        return
     if mode == "LIVE":
-        with trade_lock:
-            if key in busy:
-                db_exec("UPDATE lj_trades SET mode='SKIPPED', status='SKIPPED', note=? WHERE id=?", ("position already open", rid))
-                return
-            why = risk_check()
-            if why:
-                db_exec("UPDATE lj_trades SET mode='BLOCKED', status='BLOCKED', note=? WHERE id=?", (why, rid))
-                tg(f"{head}\n⛔ skipped: {why}")
-                return
-            busy.add(key)
         try:
             live_round_trip(rid, head, tf, o, tok, side, ask, t0, fair)
         finally:
-            busy.discard(key)
+            busy.discard((tf, o))
     else:
         time.sleep(max(0.0, t0 + EDGE_DELAY + HOLD_SECS - time.time()))
         b = best(tok, "bids")
@@ -556,23 +669,50 @@ def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
         sh = st / (ask / 100)
         pp = None if b is None else sh * b / 100 - st - fee(sh, ask / 100) - fee(sh, b / 100)
         db_exec("UPDATE lj_trades SET status='PAPER', paper_bid=?, paper_pnl=?, pnl=? WHERE id=?", (b, pp, pp, rid))
-        tg(f"{head}\n📝 paper ${st:g}: buy {ask:g}¢ → sell {b if b is not None else '—'}¢ after {HOLD_SECS:g}s = "
-           f"<b>{money(pp) if pp is not None else 'n/a'}</b>  (live is OFF)")
+        bs = "—" if b is None else f"{b:g}"
+        tg(f"📝 {head} · {ask:g}→{bs}¢ · <b>{money(pp) if pp is not None else 'n/a'}</b>")
 
 
-def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0, fair=0.0):
+def held_shares(tf, o, side):
+    return sum((r["buy_shares"] or 0) for r in db_query(
+        "SELECT buy_shares FROM lj_trades WHERE status='HOLDING' AND tf=? AND open_ts=? AND side=?", (tf, o, side)))
+
+
+def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0, fair=0.0, buy=None):
     bal0 = state.get("bal")                      # cached balance (fetching it here would slow the buy down)
+    unsure = False
     # BUY
-    try:
-        cap = max(ask + LIVE_MAX_OVERPAY, min(ask + SMART_MAX, fair - KEEP_EDGE))
-        ok, resp, note = market_order(tok, "BUY", LIVE_STAKE, cap)
-    except Exception as e:
-        ok, resp, note = False, {}, f"error: {str(e)[:150]}"
-    lag = (f"order reached Polymarket {timing.get('sent', 0) + timing.get('post', 0) - t_jump:.2f}s after the jump "
-           f"(build {timing.get('build', 0) * 1000:.0f}ms · send {timing.get('post', 0) * 1000:.0f}ms)")
+    if buy is None:
+        tim = {}
+        cap = buy_cap(ask, fair)
+        try:
+            ok, resp, note = market_order(tok, "BUY", LIVE_STAKE, cap, tim)
+        except Exception as e:
+            ok, resp, note = False, {}, f"error: {str(e)[:150]}"
+    else:
+        ok, resp, note, tim, cap, unsure = buy
+    lag = (f"{tim.get('sent', 0) + tim.get('post', 0) - t_jump:.2f}s"
+           + (f" ×{tim['n']}" if tim.get("n", 1) > 1 else ""))
+    lag_full = (f"reached Polymarket {lag} after the jump (build {tim.get('build', 0) * 1000:.0f}ms · "
+                f"send {tim.get('post', 0) * 1000:.0f}ms)")
+    if not ok and unsure:
+        # the whole group request errored: make sure nothing filled anyway before calling it a miss
+        time.sleep(max(0.0, t_jump + HOLD_SECS - time.time()))
+        extra = 0.0
+        for _ in range(3):
+            try:
+                extra = token_balance(tok) - held_shares(tf, o, side)
+            except Exception:
+                extra = 0.0
+            if extra >= 1:
+                break
+            time.sleep(1)
+        if extra >= 1:
+            ok, note = True, "group request errored but shares arrived — cost estimated at the limit price"
+            resp = {"makingAmount": str(round(extra * cap / 100, 4)), "takingAmount": str(round(extra, 4))}
     if not ok:
-        db_exec("UPDATE lj_trades SET mode='MISSED', status='MISSED', note=?, bal_before=? WHERE id=?", (f"{note} | {lag}", bal0, rid))
-        tg(f"{head}\n⏭ not filled at ≤{cap:.0f}¢ — {note[:150]}\n<i>{lag}</i>")
+        db_exec("UPDATE lj_trades SET mode='MISSED', status='MISSED', note=?, bal_before=? WHERE id=?", (f"{note} | {lag_full}", bal0, rid))
+        tg(f"⏭ {head} · missed, {short_why(note, cap)} · {lag}")
         return
     cost, shares = _amounts(resp)
     if cost <= 0 or shares <= 0:
@@ -580,7 +720,7 @@ def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0, fair=0.0):
     bpx = cost / shares * 100
     t_buy = time.time()
     db_exec("UPDATE lj_trades SET status='BOUGHT', buy_cost=?, buy_shares=?, buy_px=?, buy_ts=?, bal_before=?, note=? WHERE id=?",
-            (cost, shares, bpx, t_buy, bal0, lag, rid))
+            (cost, shares, bpx, t_buy, bal0, (note + " | " if note else "") + lag_full, rid))
     # wait, then SELL (fill-or-kill with a floor; a few retries)
     time.sleep(max(0.0, (t_jump or t_buy) + HOLD_SECS - time.time()))
     paper_bid = best(tok, "bids")
@@ -621,15 +761,12 @@ def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0, fair=0.0):
         db_exec("UPDATE lj_trades SET status='SOLD', sell_proceeds=?, sell_shares=?, sell_px=?, sell_ts=?, paper_bid=?, "
                 "paper_pnl=?, pnl=?, bal_after=?, result=?, note=? WHERE id=?",
                 (proceeds, s_sh, spx, time.time(), paper_bid, pp, pnl, bal1, "WIN" if pnl > 0 else "LOSS", note, rid))
-        cash = f" · wallet {money(bal1 - bal0)}" if bal0 is not None and bal1 is not None else ""
-        tg(f"{head}\n💵 <b>LIVE</b> bought {shares:.2f} sh @ {bpx:.1f}¢ (${cost:.2f}) → sold @ {spx:.1f}¢ "
-           f"after {time.time() - t_buy:.1f}s = <b>{money(pnl)}</b>{cash}\n"
-           f"<i>paper would have made {money(pp) if pp is not None else 'n/a'} · {lag}</i>")
+        tg(f"{'✅' if pnl > 0 else '❌'} {head} · {bpx:.0f}→{spx:.0f}¢ · <b>{money(pnl)}</b>"
+           f" (paper {money(pp) if pp is not None else 'n/a'}) · {lag}")
     else:
         db_exec("UPDATE lj_trades SET status='HOLDING', paper_bid=?, paper_pnl=?, bal_after=?, note=? WHERE id=?",
                 (paper_bid, pp, bal1, note, rid))
-        tg(f"{head}\n💵 <b>LIVE</b> bought {shares:.2f} sh @ {bpx:.1f}¢ but couldn't sell after {HOLD_SECS:g}s — "
-           f"holding to the end.\n<i>{note[:150]}</i>")
+        tg(f"⏳ {head} · bought {bpx:.0f}¢, couldn't sell · holding to the end")
 
 
 def balance_worker():
@@ -654,7 +791,7 @@ def settler():
                 won = out == r["side"]
                 pnl = (r["buy_shares"] if won else 0) - r["buy_cost"]
                 db_exec("UPDATE lj_trades SET status='SETTLED', pnl=?, result=? WHERE id=?", (pnl, "WIN" if won else "LOSS", r["id"]))
-                tg(f"{'✅' if won else '❌'} held BTC {r['tf']}m {r['side']} settled {out}: <b>{money(pnl)}</b>")
+                tg(f"{'✅' if won else '❌'} held {r['tf']}m {r['side']} settled {out} · <b>{money(pnl)}</b>")
         except Exception as e:
             log.warning(f"settler: {e}")
         time.sleep(30)
