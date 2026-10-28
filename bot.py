@@ -229,6 +229,22 @@ def warm(token):
         log.warning(f"[LIVE] warm {token[:10]}…: {e}")
 
 
+def fast_post(c, order, ot):
+    """Send a signed order and return Polymarket's answer straight away. (The library's post_order then keeps
+    polling until the trade settles on-chain, which can take seconds and would push our 5-second sell later.)"""
+    try:
+        import py_clob_client_v2.client as cm
+        owner = c.creds.api_key or ""
+        payload = (cm.order_to_json_v2(order, owner, ot, False, False) if cm._is_v2_order(order)
+                   else cm.order_to_json_v1(order, owner, ot, False, False))
+        ser = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        headers = c._l2_headers("POST", cm.POST_ORDER, body=payload, serialized_body=ser)
+        return c._post(f"{c.host}{cm.POST_ORDER}", headers=headers, data=ser)
+    except (AttributeError, ImportError, TypeError) as e:     # library changed: fall back to the normal call
+        log.warning(f"[LIVE] fast_post fallback: {e}")
+        return c.post_order(order, ot)
+
+
 def market_order(token, side, amount, limit_c):
     """Market order with a price limit. BUY: amount = dollars, limit = most we pay. SELL: amount = shares,
     limit = least we accept. FAK fills what it can at or better than the limit and cancels the rest.
@@ -243,7 +259,7 @@ def market_order(token, side, amount, limit_c):
     order = c.create_market_order(mo)
     t1 = time.time()
     try:
-        resp = c.post_order(order, ot) or {}
+        resp = fast_post(c, order, ot) or {}
     except Exception as e:
         resp = {"success": False, "errorMsg": str(e)[:200]}
     t2 = time.time()
@@ -566,7 +582,7 @@ def live_round_trip(rid, head, tf, o, tok, side, ask, t_jump=0.0, fair=0.0):
     db_exec("UPDATE lj_trades SET status='BOUGHT', buy_cost=?, buy_shares=?, buy_px=?, buy_ts=?, bal_before=?, note=? WHERE id=?",
             (cost, shares, bpx, t_buy, bal0, lag, rid))
     # wait, then SELL (fill-or-kill with a floor; a few retries)
-    time.sleep(max(0.0, t_buy + HOLD_SECS - time.time()))
+    time.sleep(max(0.0, (t_jump or t_buy) + HOLD_SECS - time.time()))
     paper_bid = best(tok, "bids")
     sold, proceeds, s_sh, note = False, 0.0, 0.0, ""
     for attempt in range(6):
