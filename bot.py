@@ -107,6 +107,7 @@ def init_db():
             sell_px REAL, sell_ts REAL, paper_bid REAL, paper_pnl REAL, pnl REAL, bal_before REAL, bal_after REAL,
             result TEXT, note TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS lj_kv (k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS lj_early (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, feed TEXT, data TEXT)")
         c.commit()
         c.close()
 
@@ -245,6 +246,7 @@ def fast_post(c, order, ot):
         return c.post_order(order, ot)
 
 
+LIVE_TFS = {int(x) for x in os.environ.get("LIVE_TFS", "5,15").replace(" ", "").split(",") if x}   # which markets trade for real
 BATCH_ORDERS = os.environ.get("BATCH_ORDERS", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -484,10 +486,108 @@ def bn_worker():
                 b, a = float(d.get("b", 0)), float(d.get("a", 0))
                 if b > 0 and a > 0:
                     state["bn"] += 1
-                    on_tick(time.time(), (b + a) / 2)
+                    now_ = time.time()
+                    on_tick(now_, (b + a) / 2)
+                    if EARLY_LOG:
+                        feed_tick("vis", now_, (b + a) / 2)
         except Exception as e:
             log.warning(f"binance: {e}")
         time.sleep(3)
+
+
+# ── early-signal logger (paper only, never trades) ──────────────────────────
+# Watches two faster Binance feeds next to the one we trade on, and logs the Polymarket book right after any
+# smaller/earlier BTC move. Lets us test "act earlier" without risking money. /earlyexport downloads it.
+EARLY_LOG = os.environ.get("EARLY_LOG", "true").strip().lower() in ("1", "true", "yes", "on")
+EARLY_FEEDS = {"spot": "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker",
+               "fut": "wss://fstream.binance.com/stream?streams=btcusdt@bookTicker"}
+EARLY_BPS, EARLY_WIN, EARLY_COOL = 3.0, 2.0, 10.0
+EARLY_SNAPS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+feeds = {k: deque(maxlen=3000) for k in ("vis", "spot", "fut")}     # (t, mid) per feed
+cross = deque(maxlen=200)                                          # (t, feed, level, sign) first crossings
+flock = threading.Lock()
+early_state = {"last": {1: 0.0, -1: 0.0}, "n": 0, "ticks": {"spot": 0, "fut": 0}}
+
+
+def feed_tick(name, now, px):
+    with flock:
+        q = feeds[name]
+        q.append((now, px))
+        while q and q[0][0] < now - EARLY_WIN:        # keep only the last 2s (cheap, so it never slows trading)
+            q.popleft()
+        old = q[0][1]
+        bps = (px / old - 1) * 1e4
+        for lvl in (2.0, 3.0, 5.0):
+            if abs(bps) >= lvl:
+                sg = 1 if bps > 0 else -1
+                if not any(f == name and l == lvl and s == sg and now - t_ < 5 for t_, f, l, s in cross):
+                    cross.append((now, name, lvl, sg))
+        if not EARLY_LOG or abs(bps) < EARLY_BPS:
+            return
+        sg = 1 if bps > 0 else -1
+        if now - early_state["last"][sg] < EARLY_COOL:
+            return
+        early_state["last"][sg] = now
+    threading.Thread(target=early_capture, args=(now, name, bps), daemon=True).start()
+
+
+def _ladder(tok, n=6):
+    with lock:
+        b = books.get(tok) or {}
+        a = sorted((b.get("asks") or {}).items())[:n]
+        bi = sorted((b.get("bids") or {}).items(), reverse=True)[:n]
+    return [[p, round(s, 1)] for p, s in a], [[p, round(s, 1)] for p, s in bi]
+
+
+def early_capture(t0, feed, bps):
+    try:
+        up = bps > 0
+        with lock:
+            live = [(k, v) for k, v in markets.items() if k[1] <= t0 < k[1] + k[0] * 60]
+        with flock:
+            last = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
+        px = last.get("vis") or price["px"]
+        rec = {"t0": t0, "feed": feed, "bps": round(bps, 2), "px": last, "sig": sigma(), "mk": {}}
+        for (tf, o), toks in live:
+            f = fair_up(tf, o, t0, px)
+            tok = toks[0] if up else toks[1]
+            rec["mk"][str(tf)] = {"o": o, "open": opens.get((tf, o)), "left": round(o + tf * 60 - t0, 1),
+                                  "fair": None if f is None else round(f if up else 100 - f, 2), "snaps": {}}
+            a, b = _ladder(tok)
+            rec["mk"][str(tf)]["snaps"]["0"] = {"a": a, "b": b}
+        toks_by_tf = {str(tf): (toks[0] if up else toks[1]) for (tf, o), toks in live}
+        for off in EARLY_SNAPS:
+            time.sleep(max(0.0, t0 + off - time.time()))
+            for tf, tok in toks_by_tf.items():
+                a, b = _ladder(tok)
+                rec["mk"][tf]["snaps"][f"{off:g}"] = {"a": a, "b": b}
+            with flock:
+                rec.setdefault("pxs", {})[f"{off:g}"] = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
+        with flock:
+            rec["cross"] = [[round(t_ - t0, 3), f, l, s] for t_, f, l, s in cross if -5 <= t_ - t0 <= 10]
+        rec["jump"] = round(state["last_jump"] - t0, 3) if abs(state["last_jump"] - t0) <= 10 else None
+        db_exec("INSERT INTO lj_early (t0, feed, data) VALUES (?,?,?)", (t0, feed, json.dumps(rec, separators=(",", ":"))))
+        early_state["n"] += 1
+    except Exception as e:
+        log.warning(f"early: {e}")
+
+
+def early_feed_worker(name):
+    url = EARLY_FEEDS[name]
+    while True:
+        try:
+            ws = websocket.create_connection(url, timeout=10)
+            ws.settimeout(30)
+            log.info(f"early feed {name} connected")
+            while True:
+                d = json.loads(ws.recv()).get("data", {})
+                b, a = float(d.get("b", 0)), float(d.get("a", 0))
+                if b > 0 and a > 0:
+                    early_state["ticks"][name] += 1
+                    feed_tick(name, time.time(), (b + a) / 2)
+        except Exception as e:
+            log.warning(f"early feed {name}: {e}")
+        time.sleep(5)
 
 
 # ── model ───────────────────────────────────────────────────────────────────
@@ -560,8 +660,11 @@ def on_jump(t0, bps, px0):
     if not sigs:
         return
     sigs.sort(key=lambda s: -s[9])                 # biggest edge goes out first
-    if LIVE_ENABLED and BATCH_ORDERS and len(sigs) > 1:
-        live_group(sigs)
+    if LIVE_ENABLED and BATCH_ORDERS and len([s for s in sigs if s[1] in LIVE_TFS]) > 1:
+        for s in sigs:
+            if s[1] not in LIVE_TFS:
+                threading.Thread(target=trade, args=s, daemon=True).start()
+        live_group([s for s in sigs if s[1] in LIVE_TFS])
         return
     for s in sigs:
         threading.Thread(target=trade, args=s, daemon=True).start()
@@ -654,7 +757,7 @@ def _run_live(rid, head, tf, o, tok, side, ask, t0, fair, buy=None):
 
 
 def trade(t0, tf, o, tok, side, bps, fair, ask, bid, edge):
-    mode = "LIVE" if LIVE_ENABLED else "PAPER"
+    mode = "LIVE" if LIVE_ENABLED and tf in LIVE_TFS else "PAPER"
     rid, head, allowed = admit(t0, tf, o, tok, side, bps, fair, ask, bid, edge, mode)
     if not allowed:
         return
@@ -913,6 +1016,16 @@ def telegram_worker():
                 elif t == "/go":
                     kv_set("paused", "0")
                     tg("▶️ resumed.")
+                elif t == "/earlyexport":
+                    rows = db_query("SELECT t0, feed, data FROM lj_early ORDER BY t0")
+                    if rows:
+                        buf = io.StringIO()
+                        w = csv.writer(buf)
+                        w.writerow(["t0", "feed", "data"])
+                        w.writerows([list(x) for x in rows])
+                        tg_document("early.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} early moves")
+                    else:
+                        tg(f"no early moves logged yet (feed ticks: {early_state['ticks']})")
                 elif t == "/export":
                     rows = db_query("SELECT * FROM lj_trades ORDER BY t0")
                     if rows:
@@ -925,7 +1038,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -935,6 +1048,9 @@ def main():
     init_db()
     for fn in (resolver_worker, pm_worker, bn_worker, settler, telegram_worker, balance_worker, keep_warm):
         threading.Thread(target=fn, daemon=True).start()
+    if EARLY_LOG:
+        for nm in EARLY_FEEDS:
+            threading.Thread(target=early_feed_worker, args=(nm,), daemon=True).start()
     bal = ""
     if LIVE_ENABLED:
         try:
