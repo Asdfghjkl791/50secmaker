@@ -108,6 +108,8 @@ def init_db():
             result TEXT, note TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS lj_kv (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS lj_early (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, feed TEXT, data TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS lj_close (id INTEGER PRIMARY KEY AUTOINCREMENT, close_ts REAL, tf INTEGER, "
+                  "open_ts INTEGER, outcome TEXT, data TEXT)")
         for col in ("fair_iv REAL", "sig REAL", "sig_iv REAL", "cl_open REAL", "bn_open REAL"):
             try:
                 c.execute(f"ALTER TABLE lj_trades ADD COLUMN {col}")
@@ -654,6 +656,74 @@ def chainlink_worker():
         time.sleep(10)
 
 
+# ── close logger (paper only): the last 10 seconds of every 5m/15m window ──────────────────────────
+# The market settles on Chainlink, which runs a little behind Binance. So in the final second the settlement
+# price may already be (almost) known. This logs both books + all feeds around each close to test that.
+CLOSE_SNAPS = (-10, -5, -3, -2, -1.5, -1, -0.75, -0.5, -0.25, -0.1, 0.25, 1, 3)
+
+
+def close_capture(tf, o):
+    C = o + tf * 60
+    try:
+        with lock:
+            toks = markets.get((tf, o))
+        if not toks:
+            return
+        rec = {"tf": tf, "o": o, "close": C, "open": opens.get((tf, o)), "cl_open": cl_opens.get((tf, o)),
+               "sig": sigma(), "sig_iv": sigma_iv(), "snaps": {}}
+        for off in CLOSE_SNAPS:
+            time.sleep(max(0.0, C + off - time.time()))
+            ua, ub = _ladder(toks[0])
+            da, db = _ladder(toks[1])
+            with flock:
+                px = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
+            lc = cl_hist[-1] if cl_hist else None
+            rec["snaps"][f"{off:g}"] = {"t": round(time.time() - C, 3), "ua": ua, "ub": ub, "da": da, "db": db, "px": px,
+                                       "cl": None if not lc else [round(lc[0] - C, 3), round(lc[1] - C, 3), lc[2]]}
+        time.sleep(2)
+        pts = [(ts, v) for ts, rt, v in list(cl_hist) if ts <= C + 0.001]
+        rec["cl_close"] = pts[-1][1] if pts else None              # last Chainlink value at or before the close
+        rec["cl_close_ts"] = round(pts[-1][0] - C, 3) if pts else None
+        rec["cl_tail"] = [[round(ts - C, 3), round(rt - C, 3), v] for ts, rt, v in list(cl_hist) if -15 <= ts - C <= 5]
+        db_exec("INSERT INTO lj_close (close_ts, tf, open_ts, data) VALUES (?,?,?,?)",
+                (C, tf, o, json.dumps(rec, separators=(",", ":"))))
+        early_state["closes"] = early_state.get("closes", 0) + 1
+    except Exception as e:
+        log.warning(f"close log: {e}")
+
+
+def close_worker():
+    done = set()
+    while True:
+        try:
+            now = time.time()
+            for tf in TFS:
+                o, C = window(tf, now)
+                if C - now <= 11 and (tf, o) not in done:
+                    done.add((tf, o))
+                    threading.Thread(target=close_capture, args=(tf, o), daemon=True).start()
+            if len(done) > 500:
+                done = {k for k in done if k[1] > now - 3600}
+        except Exception as e:
+            log.warning(f"close worker: {e}")
+        time.sleep(0.5)
+
+
+def close_outcomes():
+    """fill in who won, a few minutes after each close"""
+    while True:
+        try:
+            for r in db_query("SELECT id, tf, open_ts FROM lj_close WHERE outcome IS NULL AND close_ts < ? LIMIT 20",
+                              (time.time() - 150,)):
+                out = outcome(r["tf"], r["open_ts"])
+                if out:
+                    db_exec("UPDATE lj_close SET outcome=? WHERE id=?", (out, r["id"]))
+                time.sleep(1)
+        except Exception as e:
+            log.warning(f"close outcomes: {e}")
+        time.sleep(60)
+
+
 def early_feed_worker(name):
     url = EARLY_FEEDS[name]
     while True:
@@ -1100,7 +1170,7 @@ def status_text():
          f"sell ≥bid−{LIVE_SELL_SLIP:g}¢ · decide after {EDGE_DELAY:g}s",
          f"up {(time.time() - state['started']) / 3600:.1f}h · BTC {price['px'] or 0:,.0f} · markets {nm} · jumps {state['jumps']} · "
          f"signals {state['signals']} · σ {sigma() * 1e5:.1f}e-5/s · options σ "
-         f"{(sigma_iv() or 0) * 1e5:.1f}e-5/s · early log {early_state['n']} (feeds {early_state['ticks']})"
+         f"{(sigma_iv() or 0) * 1e5:.1f}e-5/s · closes logged {early_state.get('closes', 0)} · early log {early_state['n']} (feeds {early_state['ticks']})"
          + (f" · chainlink: {early_state['cl_err'][:60]}" if early_state["cl_err"] else "") + (f" · last error: {state['err'][:80]}" if state["err"] else ""),
          summary(t_day, "today")]
     return "\n".join(L)
@@ -1179,6 +1249,16 @@ def telegram_worker():
                         tg_document("early.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} early moves")
                     else:
                         tg(f"no early moves logged yet (feed ticks: {early_state['ticks']})")
+                elif t == "/closeexport":
+                    rows = db_query("SELECT close_ts, tf, open_ts, outcome, data FROM lj_close ORDER BY close_ts")
+                    if rows:
+                        buf = io.StringIO()
+                        w = csv.writer(buf)
+                        w.writerow(["close_ts", "tf", "open_ts", "outcome", "data"])
+                        w.writerows([list(x) for x in rows])
+                        tg_document("closes.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} window closes")
+                    else:
+                        tg("no closes logged yet")
                 elif t == "/export":
                     rows = db_query("SELECT * FROM lj_trades ORDER BY t0")
                     if rows:
@@ -1191,7 +1271,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -1206,6 +1286,8 @@ def main():
             threading.Thread(target=early_feed_worker, args=(nm,), daemon=True).start()
         threading.Thread(target=chainlink_worker, daemon=True).start()
         threading.Thread(target=deribit_worker, daemon=True).start()
+        threading.Thread(target=close_worker, daemon=True).start()
+        threading.Thread(target=close_outcomes, daemon=True).start()
     bal = ""
     if LIVE_ENABLED:
         try:
