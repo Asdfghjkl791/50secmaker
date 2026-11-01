@@ -29,6 +29,9 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import websocket
+import types
+E2_ON = False
+early2 = None                                  # second early logger, built in main()
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -1201,6 +1204,14 @@ def telegram_worker():
                 if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                     continue
                 t = (msg.get("text") or "").strip().split()[0].lower() if msg.get("text") else ""
+                if E2_ON:                                   # second early logger (paper only)
+                    try:
+                        parts = (msg.get("text") or "").strip().split()
+                        if early2.handle(t, parts[1].lower() if len(parts) > 1 else "", tg):
+                            continue
+                    except Exception as e:
+                        tg(f"⚠️ early2: {str(e)[:200]}")
+                        continue
                 if t == "/status":
                     tg(status_text())
                 elif t == "/trades":
@@ -1271,10 +1282,437 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
+
+
+# ── early2: SECOND early-move logger (paper research only, NEVER trades) ─────────────────────────
+# 
+# The original early logger in bot.py (BTC only, 3bp trigger, /earlyexport) is NOT touched, so all running
+# fair tests stay exactly the same. This file runs next to it and logs:
+# - BTC and ETH 5m/15m up/down markets
+# - triggers at 2bp AND at 3bp (a move of >= level within 2s on any Binance feed: vis / spot / fut),
+# each level with its own 10s cooldown per direction, so the 3bp rows match the original rule.
+# - to keep the file small it only saves a trigger when, for 5m or 15m, the side the move points to is
+# at least 5c cheap vs Deribit fair (or our fair if Deribit vol is missing). The D rules need 10c, so no
+# possible D trade is lost.
+# Fully self-contained: its own Binance feeds, Polymarket books, market list, window open prices, Deribit vol
+# and market results. It shares only the database file and the Telegram bot with bot.py.
+# 
+# Telegram: /ethexport          -> ETH only, rows since the last /ethexport (eth.csv.gz + eth_mkts.csv.gz)
+# /early2export        -> BTC+ETH, rows since the last /early2export (early2.csv.gz + early2_mkts.csv.gz)
+# add 'all' (e.g. /ethexport all) -> everything
+# /early2status        -> counts / feed health
+def _make_early2():
+    """builds the early2 logger in its own namespace, so none of its names clash with the bot's"""
+    import time, json, math, threading, logging, requests, csv, io, gzip
+    from collections import deque
+    import websocket
+
+    log = logging.getLogger("early2")
+    ASSETS = {"BTC": "btcusdt", "ETH": "ethusdt"}
+    TFS = (5, 15)
+    LEVELS = (2.0, 3.0)
+    WIN, COOL, MIN_GAP = 2.0, 10.0, 5.0
+    EXPORT_LAG = 30.0     # rows still being captured (10s of snapshots) are left for the next export
+    SNAPS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+    _streams = "/".join(f"{s}@bookTicker" for s in ASSETS.values())
+    FEEDS = {"vis": f"wss://data-stream.binance.vision/stream?streams={_streams}",
+             "spot": f"wss://stream.binance.com:9443/stream?streams={_streams}",
+             "fut": f"wss://fstream.binance.com/stream?streams={_streams}"}
+    SYM = {v.upper(): k for k, v in ASSETS.items()}
+    GAMMA = "https://gamma-api.polymarket.com"
+    MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    KLINES = "https://data-api.binance.vision/api/v3/klines"
+    DERIBIT = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
+
+    lock = threading.RLock()
+    books, markets, opens = {}, {}, {}        # tok -> {bids, asks}; (asset, tf, o) -> (up, dn); (asset, tf, o) -> open px
+    q2 = {(a, f): deque(maxlen=3000) for a in ASSETS for f in FEEDS}   # last 2s of mids per asset/feed
+    px1s = {a: deque(maxlen=1200) for a in ASSETS}                      # ~1/s vis mids, for our vol
+    last_px = {(a, f): None for a in ASSETS for f in FEEDS}
+    last_trig = {}                                                       # (asset, level, sign) -> t
+    tlock = threading.Lock()
+    ivs = {a: {"iv": None, "ts": 0.0} for a in ASSETS}
+    st = {"ticks": {f: 0 for f in FEEDS}, "pm": 0, "trig": 0, "saved": 0, "err": ""}
+    H = {}                                                               # db_exec, db_query, token, chat
+
+
+    def norm_cdf(z):
+        return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+    def window(tf, now):
+        L = tf * 60
+        o = int(now // L) * L
+        return o, o + L
+
+
+    def slug(a, tf, o):
+        return f"{a.lower()}-updown-{tf}m-{o}"
+
+
+    def gamma_market(a, tf, o):
+        arr = requests.get(f"{GAMMA}/events", params={"slug": slug(a, tf, o)}, timeout=10).json()
+        mk = (arr[0] if isinstance(arr, list) and arr else {}).get("markets", [])
+        return mk[0] if mk else None
+
+
+    # ── vol ─────────────────────────────────────────────────────────────────────
+    def sigma(a):
+        pts = [p for p in list(px1s[a]) if p[0] >= time.time() - 900]
+        r = [(math.log(y / x)) ** 2 / (t1 - t0) for (t0, x), (t1, y) in zip(pts, pts[1:]) if t1 > t0 and x > 0 and y > 0]
+        if len(r) < 30:
+            return 6e-5
+        return max(2e-5, math.sqrt(sum(r) / len(r)))
+
+
+    def sigma_iv(a):
+        v = ivs[a]
+        if not v["iv"] or time.time() - v["ts"] > 600:
+            return None
+        return v["iv"] / math.sqrt(365 * 86400)
+
+
+    def fair_up(a, tf, o, now, px, s):
+        op = opens.get((a, tf, o))
+        left = o + tf * 60 - now
+        if not s or not op or not px or left <= 0:
+            return None
+        return 100.0 * norm_cdf(math.log(px / op) / (s * math.sqrt(left)))
+
+
+    def deribit_iv(cur):
+        from datetime import datetime, timezone
+        r = requests.get(DERIBIT, params={"currency": cur, "kind": "option"}, timeout=15).json()
+        now, by = time.time(), {}
+        for x in r.get("result", []):
+            p = (x.get("instrument_name") or "").split("-")
+            if len(p) != 4 or not x.get("mark_iv"):
+                continue
+            try:
+                e = datetime.strptime(p[1], "%d%b%y").replace(hour=8, tzinfo=timezone.utc).timestamp()
+                K, F = float(p[2]), float(x.get("underlying_price") or 0)
+            except Exception:
+                continue
+            if e - now < 7200 or F <= 0:
+                continue
+            by.setdefault(e, []).append((abs(K / F - 1), float(x["mark_iv"]) / 100.0))
+        if not by:
+            return None
+        allp = sorted(by[min(by)])
+        pts = [x for x in allp if x[0] <= 0.03][:4] or allp[:2]
+        return sum(v for _, v in pts) / len(pts)
+
+
+    def deribit_worker():
+        while True:
+            for a in ASSETS:
+                try:
+                    iv = deribit_iv(a)
+                    if iv:
+                        ivs[a].update(iv=iv, ts=time.time())
+                except Exception as e:
+                    st["err"] = f"deribit {a}: {str(e)[:80]}"
+            time.sleep(60)
+
+
+    # ── markets / books ─────────────────────────────────────────────────────────
+    def kline_open(a, o):
+        try:
+            j = requests.get(KLINES, params=dict(symbol=ASSETS[a].upper(), interval="1m", startTime=o * 1000,
+                                                 endTime=o * 1000 + 59000, limit=1), timeout=8).json()
+            if isinstance(j, list) and j:
+                return float(j[0][1])
+        except Exception:
+            pass
+        return None
+
+
+    def market_worker():
+        while True:
+            try:
+                now = time.time()
+                for a in ASSETS:
+                    for tf in TFS:
+                        cur = window(tf, now)[0]
+                        if (a, tf, cur) not in opens and now >= cur + 60:
+                            op = kline_open(a, cur)
+                            if op:
+                                opens[(a, tf, cur)] = op
+                        for o in (cur, window(tf, now + 90)[0]):
+                            if (a, tf, o) in markets:
+                                continue
+                            try:
+                                m = gamma_market(a, tf, o)
+                                t = json.loads(m.get("clobTokenIds", "[]")) if m else []
+                            except Exception:
+                                t = []
+                            if len(t) == 2:
+                                with lock:
+                                    markets[(a, tf, o)] = (str(t[0]), str(t[1]))
+                                H["db_exec"]("INSERT OR IGNORE INTO e2_mkts (asset, tf, open_ts) VALUES (?,?,?)", (a, tf, o))
+                        k = (a, tf, cur)
+                        if k in opens:
+                            H["db_exec"]("UPDATE e2_mkts SET open=? WHERE asset=? AND tf=? AND open_ts=? AND open IS NULL",
+                                         (opens[k], a, tf, cur))
+                with lock:
+                    for k in [k for k in markets if k[2] + k[1] * 60 < now - 600]:
+                        for t in markets.pop(k):
+                            books.pop(t, None)
+                for k in [k for k in opens if k[2] + k[1] * 60 < now - 3600]:
+                    opens.pop(k, None)
+            except Exception as e:
+                st["err"] = f"markets: {str(e)[:80]}"
+            time.sleep(3)
+
+
+    def pm_handle(raw):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        for m in (data if isinstance(data, list) else [data]):
+            if not isinstance(m, dict):
+                continue
+            st["pm"] += 1
+            et = m.get("event_type")
+            with lock:
+                if et == "book":
+                    tok = str(m.get("asset_id"))
+                    books[tok] = {"bids": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])},
+                                  "asks": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}}
+                elif et == "price_change":
+                    for ch in (m.get("price_changes") or m.get("changes") or []):
+                        tok = str(ch.get("asset_id") or m.get("asset_id"))
+                        b = books.setdefault(tok, {"bids": {}, "asks": {}})
+                        lvl = b["bids"] if str(ch.get("side", "")).upper() == "BUY" else b["asks"]
+                        px, sz = round(float(ch["price"]) * 100, 3), float(ch.get("size", 0))
+                        if sz <= 0:
+                            lvl.pop(px, None)
+                        else:
+                            lvl[px] = sz
+
+
+    def pm_worker():
+        while True:
+            try:
+                with lock:
+                    toks = tuple(sorted(t for v in markets.values() for t in v))
+                if not toks:
+                    time.sleep(2)
+                    continue
+                stop = threading.Event()
+
+                def on_open(ws):
+                    ws.send(json.dumps({"assets_ids": list(toks), "type": "market"}))
+
+                    def pinger():
+                        while not stop.is_set():
+                            time.sleep(10)
+                            try:
+                                ws.send("PING")
+                            except Exception:
+                                return
+                    threading.Thread(target=pinger, daemon=True).start()
+
+                def on_message(ws, msg):
+                    if msg in ("PONG", "pong"):
+                        return
+                    pm_handle(msg)
+                    with lock:
+                        cur = tuple(sorted(t for v in markets.values() for t in v))
+                    if cur != toks:
+                        ws.close()
+
+                ws = websocket.WebSocketApp(MARKET_WS, on_open=on_open, on_message=on_message)
+                ws.run_forever(ping_interval=20, ping_timeout=10)
+                stop.set()
+            except Exception as e:
+                st["err"] = f"pm ws: {str(e)[:80]}"
+            time.sleep(1)
+
+
+    def ladder(tok, n=6):
+        with lock:
+            b = books.get(tok) or {}
+            a = sorted((b.get("asks") or {}).items())[:n]
+            bi = sorted((b.get("bids") or {}).items(), reverse=True)[:n]
+        return [[p, round(s, 1)] for p, s in a], [[p, round(s, 1)] for p, s in bi]
+
+
+    # ── triggers ────────────────────────────────────────────────────────────────
+    def tick(a, feed, now, px):
+        q = q2[(a, feed)]
+        q.append((now, px))
+        last_px[(a, feed)] = px
+        while q and q[0][0] < now - WIN:
+            q.popleft()
+        if feed == "vis":
+            p1 = px1s[a]
+            if not p1 or now - p1[-1][0] >= 1.0:
+                p1.append((now, px))
+            for tf in TFS:
+                o = window(tf, now)[0]
+                if (a, tf, o) not in opens and now - o <= 5:
+                    opens[(a, tf, o)] = px
+        bps = (px / q[0][1] - 1) * 1e4
+        sg = 1 if bps > 0 else -1
+        for lvl in LEVELS:
+            if abs(bps) < lvl:
+                continue
+            k = (a, lvl, sg)
+            with tlock:
+                if now - last_trig.get(k, 0) < COOL:
+                    continue
+                last_trig[k] = now
+            st["trig"] += 1
+            threading.Thread(target=capture, args=(now, a, feed, lvl, bps), daemon=True).start()
+
+
+    def capture(t0, a, feed, lvl, bps):
+        try:
+            up = bps > 0
+            with lock:
+                live = [(k, v) for k, v in markets.items() if k[0] == a and k[2] <= t0 < k[2] + k[1] * 60]
+            px = last_px[(a, "vis")] or last_px[(a, feed)]
+            s, siv = sigma(a), sigma_iv(a)
+            rec = {"t0": t0, "asset": a, "feed": feed, "level": lvl, "bps": round(bps, 2),
+                   "px": {f: last_px[(a, f)] for f in FEEDS}, "sig": s, "sig_iv": siv, "mk": {}}
+            keep = False
+            side_tok = {}
+            for (_, tf, o), toks in live:
+                fo, fi = fair_up(a, tf, o, t0, px, s), fair_up(a, tf, o, t0, px, siv)
+                fo = None if fo is None else round(fo if up else 100 - fo, 2)
+                fi = None if fi is None else round(fi if up else 100 - fi, 2)
+                tok = toks[0] if up else toks[1]
+                asks, bids = ladder(tok)
+                rec["mk"][str(tf)] = {"o": o, "open": opens.get((a, tf, o)), "left": round(o + tf * 60 - t0, 1),
+                                      "fair": fo, "fair_iv": fi, "snaps": {"0": {"a": asks, "b": bids}}}
+                ref = fi if fi is not None else fo
+                if asks and ref is not None and ref - asks[0][0] >= MIN_GAP:
+                    keep = True
+                side_tok[str(tf)] = tok
+            if not keep:
+                return
+            for off in SNAPS:
+                time.sleep(max(0.0, t0 + off - time.time()))
+                for tf, tok in side_tok.items():
+                    asks, bids = ladder(tok)
+                    rec["mk"][tf]["snaps"][f"{off:g}"] = {"a": asks, "b": bids}
+                rec.setdefault("pxs", {})[f"{off:g}"] = {f: last_px[(a, f)] for f in FEEDS}
+            H["db_exec"]("INSERT INTO e2_early (t0, asset, feed, level, data) VALUES (?,?,?,?,?)",
+                         (t0, a, feed, lvl, json.dumps(rec, separators=(",", ":"))))
+            st["saved"] += 1
+        except Exception as e:
+            st["err"] = f"capture: {str(e)[:80]}"
+
+
+    def feed_worker(name):
+        while True:
+            try:
+                ws = websocket.create_connection(FEEDS[name], timeout=10)
+                ws.settimeout(30)
+                while True:
+                    d = json.loads(ws.recv()).get("data", {})
+                    a = SYM.get(str(d.get("s", "")).upper())
+                    b, k = float(d.get("b", 0)), float(d.get("a", 0))
+                    if a and b > 0 and k > 0:
+                        st["ticks"][name] += 1
+                        tick(a, name, time.time(), (b + k) / 2)
+            except Exception as e:
+                st["err"] = f"feed {name}: {str(e)[:80]}"
+            time.sleep(5)
+
+
+    # ── results ─────────────────────────────────────────────────────────────────
+    def outcome_worker():
+        while True:
+            try:
+                rows = H["db_query"]("SELECT asset, tf, open_ts FROM e2_mkts WHERE outcome IS NULL AND open_ts + tf*60 < ? LIMIT 40",
+                                     (time.time() - 150,))
+                for r in rows:
+                    try:
+                        m = gamma_market(r["asset"], r["tf"], r["open_ts"])
+                        op = m.get("outcomePrices") if m else None
+                        op = json.loads(op) if isinstance(op, str) else op
+                        out = "UP" if op and float(op[0]) >= 0.99 else "DOWN" if op and float(op[1]) >= 0.99 else None
+                        if out:
+                            H["db_exec"]("UPDATE e2_mkts SET outcome=? WHERE asset=? AND tf=? AND open_ts=?",
+                                         (out, r["asset"], r["tf"], r["open_ts"]))
+                    except Exception:
+                        pass
+                    time.sleep(1)
+            except Exception as e:
+                st["err"] = f"outcomes: {str(e)[:80]}"
+            time.sleep(60)
+
+
+    # ── telegram (called from bot.py's command loop) ────────────────────────────
+    def _send(name, rows, header, caption):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(header)
+        w.writerows([list(x) for x in rows])
+        r = requests.post(f"https://api.telegram.org/bot{H['token']}/sendDocument",
+                          data={"chat_id": H["chat"], "caption": caption[:1000]},
+                          files={"document": (name, gzip.compress(buf.getvalue().encode()), "application/gzip")}, timeout=180)
+        return r.status_code == 200
+
+
+    def handle(cmd, arg, tg):
+        """returns True if the command was ours"""
+        if cmd == "/early2status":
+            n = H["db_query"]("SELECT asset, level, COUNT(*) n FROM e2_early GROUP BY asset, level")
+            tg("🧪 early2 (BTC+ETH, 2bp+3bp, paper only)\n" + ", ".join(f"{r['asset']} {r['level']:g}bp: {r['n']}" for r in n)
+               + f"\nsince start: triggers {st['trig']}, saved {st['saved']} · feed ticks {st['ticks']} · pm msgs {st['pm']}"
+               + f" · deribit vol {', '.join('%s %.2f' % (a, v['iv'] or 0) for a, v in ivs.items())}"
+               + (f"\nlast error: {st['err']}" if st["err"] else ""))
+            return True
+        if cmd == "/ethexport":
+            return _export(arg, tg, "ETH", "eth")
+        if cmd == "/early2export":
+            return _export(arg, tg, None, "early2")
+        return False
+
+
+    def _export(arg, tg, asset, name):
+        """asset=None -> BTC+ETH. Each command remembers its own 'last export' time."""
+        key = f"last_export_{name}"
+        since = 0.0
+        if arg != "all":
+            r = H["db_query"]("SELECT v FROM e2_kv WHERE k=?", (key,))
+            since = float(r[0]["v"]) if r else 0.0
+        upto = time.time() - EXPORT_LAG
+        aw, av = ("AND asset=?", (asset,)) if asset else ("", ())
+        rows = H["db_query"](f"SELECT t0, asset, feed, level, data FROM e2_early WHERE t0 > ? AND t0 <= ? {aw} ORDER BY t0", (since, upto) + av)
+        if not rows:
+            tg(f"no new {name} rows yet")
+            return True
+        what = asset or "BTC+ETH"
+        ok = _send(f"{name}.csv.gz", rows, ["t0", "asset", "feed", "level", "data"], f"{len(rows)} {what} early moves (2bp+3bp)")
+        mk = H["db_query"](f"SELECT asset, tf, open_ts, open, outcome FROM e2_mkts WHERE outcome IS NOT NULL {aw} ORDER BY open_ts", av)
+        ok2 = _send(f"{name}_mkts.csv.gz", mk, ["asset", "tf", "open_ts", "open", "outcome"], f"{len(mk)} {what} market results")
+        if ok and ok2:
+            H["db_exec"]("INSERT OR REPLACE INTO e2_kv (k, v) VALUES (?, ?)", (key, str(upto)))
+        else:
+            tg(f"⚠️ {name} upload failed — nothing marked as sent, try again (or add 'all')")
+        return True
+
+
+    def start(db_exec, db_query, token, chat):
+        H.update(db_exec=db_exec, db_query=db_query, token=token, chat=chat)
+        db_exec("CREATE TABLE IF NOT EXISTS e2_early (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, asset TEXT, feed TEXT, level REAL, data TEXT)")
+        db_exec("CREATE TABLE IF NOT EXISTS e2_mkts (asset TEXT, tf INTEGER, open_ts INTEGER, open REAL, outcome TEXT, PRIMARY KEY (asset, tf, open_ts))")
+        db_exec("CREATE TABLE IF NOT EXISTS e2_kv (k TEXT PRIMARY KEY, v TEXT)")
+        for fn in (market_worker, pm_worker, deribit_worker, outcome_worker):
+            threading.Thread(target=fn, daemon=True).start()
+        for nm in FEEDS:
+            threading.Thread(target=feed_worker, args=(nm,), daemon=True).start()
+        log.info("early2 logger started (BTC+ETH, 2bp+3bp)")
+    return types.SimpleNamespace(**dict(locals()))   # start, handle, st, ... (everything defined above)
 
 
 def main():
@@ -1288,6 +1726,15 @@ def main():
         threading.Thread(target=deribit_worker, daemon=True).start()
         threading.Thread(target=close_worker, daemon=True).start()
         threading.Thread(target=close_outcomes, daemon=True).start()
+    global E2_ON
+    if os.environ.get("EARLY2_LOG", "true").strip().lower() in ("1", "true", "yes", "on"):
+        try:                                           # second early logger: BTC+ETH, 2bp+3bp (paper only)
+            global early2
+            early2 = _make_early2()
+            early2.start(db_exec, db_query, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+            E2_ON = True
+        except Exception as e:
+            log.warning(f"early2 not started: {e}")
     bal = ""
     if LIVE_ENABLED:
         try:
