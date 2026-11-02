@@ -38,6 +38,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DB_PATH = os.environ.get("DB_PATH", "live_jumper.db")
 env_f = lambda k, d: float(os.environ.get(k, d))
 LIVE_ENABLED = os.environ.get("LIVE_ENABLED", "false").strip().lower() == "true"
+JUMPER_ON = os.environ.get("JUMPER", "off").strip().lower() in ("1", "true", "yes", "on")   # old jump sniper: off unless JUMPER=on
 LIVE_STAKE = env_f("LIVE_STAKE", "5")
 LIVE_MAX_OVERPAY = env_f("LIVE_MAX_OVERPAY_CENTS", "2")
 LIVE_SELL_SLIP = env_f("LIVE_SELL_SLIP_CENTS", "2")
@@ -483,7 +484,8 @@ def on_tick(now, px):
             return
         state["last_jump"] = now
         state["jumps"] += 1
-    threading.Thread(target=on_jump, args=(now, bps, px), daemon=True).start()
+    if JUMPER_ON:                       # old 5-second jump sniper (off by default since Nov 2; D rules are separate)
+        threading.Thread(target=on_jump, args=(now, bps, px), daemon=True).start()
 
 
 def bn_worker():
@@ -2075,7 +2077,7 @@ def main():
             bal = f" · USDC ${usdc_balance():,.2f} · orders {ORDER_TYPE}"
         except Exception as e:
             bal = f" · ⚠️ couldn't connect to Polymarket: {str(e)[:150]}"
-    tg(f"⚡ live BTC jump sniper started — {'🟢 LIVE' if LIVE_ENABLED else '📝 PAPER (LIVE_ENABLED=false)'} · "
+    tg(f"⚡ 50secmaker started — old jump sniper {'OFF' if not JUMPER_ON else ('🟢 LIVE' if LIVE_ENABLED else '📝 PAPER')} · "
        f"${LIVE_STAKE:g}/trade{bal}. Send /status."
        + (f"\n🎯 D rules: {'🟢 LIVE' if D_LIVE else '📝 paper'} · 5m {D_RULE[5]} · 15m {D_RULE[15]} · ${D_STAKE:g} · /dstatus" if D_ON else ""))
     while True:
