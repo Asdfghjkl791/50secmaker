@@ -227,7 +227,7 @@ timing = {}                                                          # last orde
 def warm(token):
     """Build (and sign) a throwaway order for a token WITHOUT sending it, so market info, fee info and the
     signing code are all loaded before a real trade needs them."""
-    if not LIVE_ENABLED or token in warmed:
+    if not (LIVE_ENABLED or D_LIVE) or token in warmed:
         return
     try:
         from py_clob_client_v2 import MarketOrderArgs, OrderType, Side
@@ -570,6 +570,11 @@ def early_capture(t0, feed, bps):
                                   "fair": None if f is None else round(f if up else 100 - f, 2), "snaps": {}}
             a, b = _ladder(tok)
             rec["mk"][str(tf)]["snaps"]["0"] = {"a": a, "b": b}
+            if D_ON and a:                               # D rules (paper or live) decide from this same snapshot
+                m_ = rec["mk"][str(tf)]
+                threading.Thread(target=d_signal, args=(t0, feed, tf, o, tok, up, a[0][0], a[0][1], m_["fair"],
+                                                        m_["fair_iv"], rec["sig"], rec["sig_iv"], last.get("vis")),
+                                 daemon=True).start()
         toks_by_tf = {str(tf): (toks[0] if up else toks[1]) for (tf, o), toks in live}
         for off in EARLY_SNAPS:
             time.sleep(max(0.0, t0 + off - time.time()))
@@ -1104,7 +1109,7 @@ def keep_warm():
     when a jump comes (the library drops idle connections after 5s)."""
     while True:
         try:
-            if LIVE_ENABLED:
+            if LIVE_ENABLED or D_LIVE:
                 clob().get_server_time()
         except Exception as e:
             log.debug(f"keep_warm: {e}")
@@ -1115,7 +1120,7 @@ def balance_worker():
     """keep a recent USDC balance on hand without slowing down orders"""
     while True:
         try:
-            if LIVE_ENABLED and not busy:
+            if (LIVE_ENABLED or D_LIVE) and not busy:
                 state["bal"] = usdc_balance()
         except Exception as e:
             log.warning(f"balance: {e}")
@@ -1126,7 +1131,7 @@ def settler():
     while True:
         try:
             now = time.time()
-            for r in db_query("SELECT * FROM lj_trades WHERE status='HOLDING' AND open_ts + tf*60 < ?", (now - 90,)):
+            for r in db_query("SELECT * FROM lj_trades WHERE status='HOLDING' AND mode NOT IN ('D','DPAPER') AND open_ts + tf*60 < ?", (now - 90,)):
                 out = outcome(r["tf"], r["open_ts"])
                 if not out:
                     continue
@@ -1137,6 +1142,218 @@ def settler():
         except Exception as e:
             log.warning(f"settler: {e}")
         time.sleep(30)
+
+
+# ── D rules: buy after a BTC move when Polymarket lags, HOLD TO THE END (added Nov 2 2026) ──────────────
+# Exactly the paper rules from the early logger (same trigger: BTC moves >= 3bp within 2s on vis/spot/fut,
+# 10s cooldown per direction; same snapshot; first qualifying move per market per rule):
+#   base   : buy the side the move points to if Deribit-vol fair (fair_iv) - ask >= D_EDGE (10c) and ask 15-95c
+#   5m  AV : base + ask didn't rise > 2c within 0.5s (A) + Deribit vol <= 1.5x BTC's recent vol (V)
+#   5m  AVS: AV + at least 60 shares at the best ask at the move
+#   5m  AVK: AV + BTC kept moving our way by >= 0.5bp in the 0.5s after the move (added Nov 2, fair test from 11:50am)
+#   15m C  : base + our own fair (1-second BTC vol) also says >= 5c cheap
+#   15m K  : base + BTC kept moving our way in the 0.5s after the move
+#   15m X  : base + A + V          15m R : base + ask didn't rise > 1c within 0.25s        15m D15: base only
+#   15m CKS: C + K + at least 60 shares at the best ask (added Nov 2, fair test from 10:05am)
+# Order: fill-and-kill BUY of D_STAKE dollars, limit = ask at decision + D_OVERPAY_CENTS (never above 97c).
+# OFF by default: D_LIVE=false -> paper (same decisions, buys priced from the book, settled at the end).
+# Safety: daily loss limit counts open positions as lost; max trades per hour; one trade per market per rule;
+#         /dstop pauses instantly, /dgo resumes.
+# ENV: D_LIVE=false  D_RULE_5=AVS (AV/AVS/AVK/off)  D_RULE_15=C (C/K/X/R/D15/CKS/off)  D_STAKE=5  D_OVERPAY_CENTS=3
+#      D_DAILY_LOSS=25  D_MAX_TRADES_HOUR=10  D_EDGE=10
+D_ON = os.environ.get("D_RULES", "true").strip().lower() in ("1", "true", "yes", "on")
+D_LIVE = os.environ.get("D_LIVE", "false").strip().lower() == "true"
+D_RULE = {5: os.environ.get("D_RULE_5", "AVS").strip().upper(), 15: os.environ.get("D_RULE_15", "C").strip().upper()}
+D_STAKE = env_f("D_STAKE", "5")
+D_OVERPAY = env_f("D_OVERPAY_CENTS", "3")
+D_DAILY_LOSS = env_f("D_DAILY_LOSS", "25")
+D_MAX_HOUR = int(env_f("D_MAX_TRADES_HOUR", "10"))
+D_EDGE = env_f("D_EDGE", "10")
+D_RULES_OK = {5: ("AV", "AVS", "AVK"), 15: ("C", "K", "X", "R", "D15", "CKS")}
+d_lock = threading.Lock()
+d_done = set()                      # (tf, open_ts) already traded (or tried) by the D rule
+
+
+def d_paused():
+    return kv_get("d_paused", "0") == "1"
+
+
+def d_name(tf):
+    r = D_RULE.get(tf, "OFF")
+    return ("D5-" + r) if tf == 5 else ("D-15" if r == "D15" else "D-15" + r)
+
+
+def _ask_at(tok):
+    a, _ = _ladder(tok)
+    a = [l for l in a if l[0] < 100]
+    return a
+
+
+def _walk(lad, stake):
+    spent = sh = 0.0
+    for px, sz in lad:
+        c = px / 100 * sz
+        if spent + c >= stake:
+            sh += (stake - spent) / (px / 100)
+            spent = stake
+            break
+        spent += c
+        sh += sz
+    return spent, sh
+
+
+def d_risk(stake):
+    if d_paused():
+        return "paused (/dgo to resume)"
+    t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    rows = db_query("SELECT pnl, buy_cost, status, t0 FROM lj_trades WHERE mode='D' AND t0>=?", (t_day,))
+    realized = sum(r["pnl"] or 0 for r in rows if r["pnl"] is not None)
+    open_cost = sum(r["buy_cost"] or 0 for r in rows if r["pnl"] is None and r["status"] == "HOLDING")
+    if realized - open_cost - stake < -D_DAILY_LOSS - 1e-9:
+        return f"daily loss limit ${D_DAILY_LOSS:g} (today {money(realized)}, open ${open_cost:.0f})"
+    if sum(1 for r in rows if r["t0"] >= time.time() - 3600 and r["status"] in ("HOLDING", "SETTLED")) >= D_MAX_HOUR:
+        return f"max {D_MAX_HOUR} trades per hour"
+    return None
+
+
+def d_signal(t0, feed, tf, o, tok, up, ask0, size0, fair, fair_iv, sig, sig_iv, px0):
+    """one market, one move: check the rule exactly like the paper tracker, then buy (live) or log (paper)"""
+    try:
+        rule = D_RULE.get(tf, "OFF")
+        if rule not in D_RULES_OK.get(tf, ()):
+            return
+        if (tf, o) in d_done or fair_iv is None:
+            return
+        if not (fair_iv - ask0 >= D_EDGE and 15 <= ask0 <= 95):
+            return
+        if rule in ("C", "CKS") and (fair is None or fair - ask0 < 5):
+            return
+        if rule in ("AVS", "CKS") and size0 < 60:
+            return
+        if rule in ("AV", "AVS", "AVK", "X") and (not sig or not sig_iv or sig_iv / sig > 1.5):
+            return
+        if rule == "R":
+            time.sleep(max(0.0, t0 + 0.25 - time.time()))
+            a = _ask_at(tok)
+            if not a or a[0][0] - ask0 > 1:
+                return
+        if rule in ("AV", "AVS", "AVK", "X", "K", "CKS"):
+            time.sleep(max(0.0, t0 + 0.5 - time.time()))
+            if rule in ("K", "CKS"):
+                with flock:
+                    p05 = feeds["vis"][-1][1] if feeds["vis"] else None
+                if not px0 or not p05 or (p05 - px0) * (1 if up else -1) <= 0:
+                    return
+            else:
+                a = _ask_at(tok)
+                if not a or a[0][0] - ask0 > 2:
+                    return
+                if rule == "AVK":                        # BTC kept moving our way by >= 0.5bp in the 0.5s after the move
+                    with flock:
+                        p05 = feeds["vis"][-1][1] if feeds["vis"] else None
+                    if not px0 or not p05 or (p05 - px0) * (1 if up else -1) / px0 * 1e4 < 0.5:
+                        return
+        side = "UP" if up else "DOWN"
+        name = d_name(tf)
+        with d_lock:
+            if (tf, o) in d_done:
+                return
+            d_done.add((tf, o))
+            why = d_risk(D_STAKE) if D_LIVE else None
+        a = _ask_at(tok)
+        cur = a[0][0] if a else ask0
+        cap = min(97.0, cur + D_OVERPAY)
+        head = f"{name} {side} · ask {ask0:g}¢ fair {fair_iv:.0f}¢ (+{fair_iv - ask0:.0f})"
+        mode = "D" if D_LIVE else "DPAPER"
+        rid = db_exec("INSERT INTO lj_trades (t0,tf,open_ts,side,bps,fair,ask,edge,mode,status,fair_iv,sig,sig_iv,note) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (t0, tf, o, side, None, fair, ask0, fair_iv - ask0, mode, "SIGNAL", fair_iv, sig, sig_iv,
+                       f"{name} · feed {feed}"))
+        if not D_LIVE:                                        # paper: price it from the book right now
+            spent, sh = _walk(a, D_STAKE)
+            if spent <= 0:
+                db_exec("UPDATE lj_trades SET status='MISSED', note=note||' · no ask' WHERE id=?", (rid,))
+                return
+            db_exec("UPDATE lj_trades SET status='HOLDING', buy_cost=?, buy_shares=?, buy_px=?, buy_ts=? WHERE id=?",
+                    (spent, sh, spent / sh * 100, time.time(), rid))
+            tg(f"📝 {head} · paper buy {spent / sh * 100:.0f}¢ · {time.time() - t0:.2f}s")
+            return
+        if why:
+            db_exec("UPDATE lj_trades SET status='BLOCKED', note=note||' · '||? WHERE id=?", (why, rid))
+            tg(f"⛔ {head} · skipped: {why}")
+            return
+        tim = {}
+        try:
+            ok, resp, note = market_order(tok, "BUY", D_STAKE, cap, tim)
+        except Exception as e:
+            ok, resp, note = False, {}, f"error: {str(e)[:150]}"
+        lag = tim.get("sent", t0) + tim.get("post", 0) - t0
+        if not ok:
+            db_exec("UPDATE lj_trades SET status='MISSED', note=note||' · '||? WHERE id=?", (f"{note} · {lag:.2f}s", rid))
+            tg(f"⏭ {head} · not filled ({short_why(note, cap)}) · {lag:.2f}s")
+            return
+        cost, shares = _amounts(resp)
+        if cost <= 0 or shares <= 0:
+            cost, shares = D_STAKE, D_STAKE / (cap / 100)
+        bpx = cost / shares * 100
+        db_exec("UPDATE lj_trades SET status='HOLDING', buy_cost=?, buy_shares=?, buy_px=?, buy_ts=?, note=note||' · '||? WHERE id=?",
+                (cost, shares, bpx, time.time(), f"reached Polymarket {lag:.2f}s after the move", rid))
+        tg(f"🎯 {head} · bought ${cost:.2f} at {bpx:.0f}¢ · {lag:.2f}s · holding to the end")
+    except Exception as e:
+        log.warning(f"D signal: {e}")
+
+
+def d_settler():
+    for r in db_query("SELECT tf, open_ts FROM lj_trades WHERE mode IN ('D','DPAPER') AND t0 > ?", (time.time() - 3600,)):
+        d_done.add((r["tf"], r["open_ts"]))                  # after a restart, don't trade the same market twice
+    while True:
+        try:
+            for k in [k for k in list(d_done) if k[1] + k[0] * 60 < time.time() - 600]:
+                d_done.discard(k)
+            for r in db_query("SELECT * FROM lj_trades WHERE mode IN ('D','DPAPER') AND status='HOLDING' AND open_ts + tf*60 < ?",
+                              (time.time() - 90,)):
+                out = outcome(r["tf"], r["open_ts"])
+                if not out:
+                    continue
+                won = out == r["side"]
+                p = (r["buy_px"] or 50) / 100
+                fee_ = math.ceil(r["buy_shares"] * FEE_RATE * p * (1 - p) * 100 - 1e-9) / 100
+                pnl = (r["buy_shares"] if won else 0) - r["buy_cost"] - fee_
+                db_exec("UPDATE lj_trades SET status='SETTLED', pnl=?, result=? WHERE id=?", (pnl, "WIN" if won else "LOSS", r["id"]))
+                tag = "" if r["mode"] == "D" else "📝 paper · "
+                nm = (r["note"] or "").split(" · ")[0]
+                tg(f"{'✅' if won else '❌'} {tag}{nm} {r['side']} at {r['buy_px']:.0f}¢ · result {out} · <b>{money(pnl)}</b>")
+        except Exception as e:
+            log.warning(f"D settler: {e}")
+        time.sleep(30)
+
+
+def d_summary(since, label):
+    rows = db_query("SELECT * FROM lj_trades WHERE mode IN ('D','DPAPER') AND t0>=? ORDER BY t0", (since,))
+    L = [f"<b>D rules · {label}</b>"]
+    for mode, tag in (("D", "💵 live"), ("DPAPER", "📝 paper")):
+        for tf in (5, 15):
+            rs = [r for r in rows if r["mode"] == mode and r["tf"] == tf]
+            if not rs:
+                continue
+            done = [r for r in rs if r["status"] == "SETTLED"]
+            w = sum(1 for r in done if r["result"] == "WIN")
+            L.append(f"{tag} {tf}m: {len(done)} settled · {w} wins · <b>{money(sum(r['pnl'] or 0 for r in done))}</b> · "
+                     f"holding {sum(1 for r in rs if r['status'] == 'HOLDING')} · not filled {sum(1 for r in rs if r['status'] == 'MISSED')} · "
+                     f"blocked {sum(1 for r in rs if r['status'] == 'BLOCKED')}")
+    if len(L) == 1:
+        L.append("no D trades yet")
+    return "\n".join(L)
+
+
+def d_status():
+    t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    st = "🟢 LIVE" if D_LIVE else "📝 PAPER (D_LIVE=false)"
+    return (f"🎯 <b>D rules</b> · {st}{' · ⏸ PAUSED' if d_paused() else ''}\n"
+            f"5m: {d_name(5) if D_RULE[5] in D_RULES_OK[5] else 'off'} · 15m: {d_name(15) if D_RULE[15] in D_RULES_OK[15] else 'off'} · "
+            f"${D_STAKE:g}/trade · buy limit ask+{D_OVERPAY:g}¢ · edge ≥{D_EDGE:g}¢ · hold to the end\n"
+            f"limits: ${D_DAILY_LOSS:g}/day (open trades count as lost) · {D_MAX_HOUR}/hour · one trade per market\n"
+            + d_summary(t_day, "today"))
 
 
 # ── reports ─────────────────────────────────────────────────────────────────
@@ -1212,6 +1429,20 @@ def telegram_worker():
                     except Exception as e:
                         tg(f"⚠️ early2: {str(e)[:200]}")
                         continue
+                if t == "/dstatus":
+                    tg(d_status())
+                    continue
+                if t == "/dstop":
+                    kv_set("d_paused", "1")
+                    tg("⏸ D rules paused — no new D trades. Open ones still settle. /dgo to resume.")
+                    continue
+                if t == "/dgo":
+                    kv_set("d_paused", "0")
+                    tg("▶️ D rules resumed.")
+                    continue
+                if t == "/dall":
+                    tg(d_summary(0, "all time"))
+                    continue
                 if t == "/status":
                     tg(status_text())
                 elif t == "/trades":
@@ -1282,7 +1513,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -1726,6 +1957,8 @@ def main():
         threading.Thread(target=deribit_worker, daemon=True).start()
         threading.Thread(target=close_worker, daemon=True).start()
         threading.Thread(target=close_outcomes, daemon=True).start()
+    if D_ON:
+        threading.Thread(target=d_settler, daemon=True).start()
     global E2_ON
     if os.environ.get("EARLY2_LOG", "true").strip().lower() in ("1", "true", "yes", "on"):
         try:                                           # second early logger: BTC+ETH, 2bp+3bp (paper only)
@@ -1736,13 +1969,14 @@ def main():
         except Exception as e:
             log.warning(f"early2 not started: {e}")
     bal = ""
-    if LIVE_ENABLED:
+    if LIVE_ENABLED or (D_ON and D_LIVE):
         try:
             bal = f" · USDC ${usdc_balance():,.2f} · orders {ORDER_TYPE}"
         except Exception as e:
             bal = f" · ⚠️ couldn't connect to Polymarket: {str(e)[:150]}"
     tg(f"⚡ live BTC jump sniper started — {'🟢 LIVE' if LIVE_ENABLED else '📝 PAPER (LIVE_ENABLED=false)'} · "
-       f"${LIVE_STAKE:g}/trade{bal}. Send /status.")
+       f"${LIVE_STAKE:g}/trade{bal}. Send /status."
+       + (f"\n🎯 D rules: {'🟢 LIVE' if D_LIVE else '📝 paper'} · 5m {D_RULE[5]} · 15m {D_RULE[15]} · ${D_STAKE:g} · /dstatus" if D_ON else ""))
     while True:
         time.sleep(60)
 
