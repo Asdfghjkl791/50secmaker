@@ -111,6 +111,7 @@ def init_db():
             result TEXT, note TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS lj_kv (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS lj_early (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, feed TEXT, data TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS lj_deribit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, data TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS lj_close (id INTEGER PRIMARY KEY AUTOINCREMENT, close_ts REAL, tf INTEGER, "
                   "open_ts INTEGER, outcome TEXT, data TEXT)")
         for col in ("fair_iv REAL", "sig REAL", "sig_iv REAL", "cl_open REAL", "bn_open REAL"):
@@ -792,6 +793,88 @@ def deribit_worker():
         time.sleep(60)
 
 
+# ── Deribit extra logger (paper research only, added Nov 2 2026) ─────────────────────────────────
+# Every 60s saves one row to lj_deribit with: ATM vol for the nearest expiries (incl. same-day), skew (OTM put vol minus OTM
+# call vol at about +/-1% and +/-2% from the price), perpetual futures price / funding / open interest, and option + perpetual
+# trades in the last minute (buy/sell volume, block trades, biggest trade). /deribitexport downloads it. Never trades.
+DERIBIT_LOG = os.environ.get("DERIBIT_LOG", "true").strip().lower() in ("1", "true", "yes", "on")
+DB_API = "https://www.deribit.com/api/v2/public"
+dlog_state = {"n": 0, "err": ""}
+
+
+def _dget(path, **params):
+    r = requests.get(f"{DB_API}/{path}", params=params, timeout=15).json()
+    return r.get("result")
+
+
+def deribit_snapshot():
+    now = time.time()
+    rec = {"ts": now}
+    opts = _dget("get_book_summary_by_currency", currency="BTC", kind="option") or []
+    by = {}
+    for x in opts:
+        p = (x.get("instrument_name") or "").split("-")
+        if len(p) != 4 or not x.get("mark_iv"):
+            continue
+        try:
+            e = datetime.strptime(p[1], "%d%b%y").replace(hour=8, tzinfo=timezone.utc).timestamp()
+            K, F = float(p[2]), float(x.get("underlying_price") or 0)
+        except Exception:
+            continue
+        if e <= now or F <= 0:
+            continue
+        by.setdefault(e, []).append((K, F, p[3], float(x["mark_iv"]), float(x.get("open_interest") or 0), float(x.get("volume") or 0)))
+    exps = []
+    for e in sorted(by)[:4]:                                  # the 4 nearest expiries (first is usually same-day)
+        pts = by[e]; F = pts[0][1]
+        def iv_at(m, kind):
+            c = [(abs(K / F - m), iv) for K, F_, k, iv, oi, v in pts if k == kind]
+            return min(c)[1] if c else None
+        atm = [iv for K, F_, k, iv, oi, v in pts if abs(K / F - 1) <= 0.01] or [iv for _, iv in sorted((abs(K / F - 1), iv) for K, F_, k, iv, oi, v in pts)[:2]]
+        exps.append({"exp": e, "hours": round((e - now) / 3600, 2), "F": F, "atm_iv": round(sum(atm) / len(atm), 2),
+                     "skew1": None if iv_at(0.99, "P") is None or iv_at(1.01, "C") is None else round(iv_at(0.99, "P") - iv_at(1.01, "C"), 2),
+                     "skew2": None if iv_at(0.98, "P") is None or iv_at(1.02, "C") is None else round(iv_at(0.98, "P") - iv_at(1.02, "C"), 2),
+                     "put_oi": round(sum(oi for K, F_, k, iv, oi, v in pts if k == "P"), 1), "call_oi": round(sum(oi for K, F_, k, iv, oi, v in pts if k == "C"), 1),
+                     "put_vol24": round(sum(v for K, F_, k, iv, oi, v in pts if k == "P"), 1), "call_vol24": round(sum(v for K, F_, k, iv, oi, v in pts if k == "C"), 1)})
+    rec["expiries"] = exps
+    fut = _dget("get_book_summary_by_currency", currency="BTC", kind="future") or []
+    perp = next((x for x in fut if x.get("instrument_name") == "BTC-PERPETUAL"), None)
+    if perp:
+        rec["perp"] = {k: perp.get(k) for k in ("mark_price", "last", "funding_8h", "current_funding", "open_interest", "estimated_delivery_price", "volume_usd")}
+    end = int(now * 1000); start = end - 60000
+    for kind in ("option", "future"):
+        tr = (_dget("get_last_trades_by_currency_and_time", currency="BTC", kind=kind, start_timestamp=start, end_timestamp=end, count=1000) or {}).get("trades", [])
+        s = {"n": len(tr), "blocks": sum(1 for t in tr if t.get("block_trade_id"))}
+        if kind == "option":
+            for side in ("buy", "sell"):
+                for typ in ("C", "P"):
+                    s[f"{typ}_{side}"] = round(sum(t.get("amount", 0) for t in tr if t.get("direction") == side and t.get("instrument_name", "").endswith("-" + typ)), 2)
+            big = max(tr, key=lambda t: t.get("amount", 0), default=None)
+            s["biggest"] = None if not big else {k: big.get(k) for k in ("instrument_name", "direction", "amount", "iv", "block_trade_id")}
+        else:
+            tr = [t for t in tr if t.get("instrument_name") == "BTC-PERPETUAL"]
+            s["n"] = len(tr)
+            s["buy_usd"] = round(sum(t.get("amount", 0) for t in tr if t.get("direction") == "buy"))
+            s["sell_usd"] = round(sum(t.get("amount", 0) for t in tr if t.get("direction") == "sell"))
+            big = max(tr, key=lambda t: t.get("amount", 0), default=None)
+            s["biggest"] = None if not big else {k: big.get(k) for k in ("direction", "amount", "price")}
+        rec["trades_" + kind] = s
+    return rec
+
+
+def deribit_logger():
+    while True:
+        try:
+            rec = deribit_snapshot()
+            db_exec("INSERT INTO lj_deribit (ts, data) VALUES (?, ?)", (rec["ts"], json.dumps(rec, separators=(",", ":"))))
+            dlog_state["n"] += 1
+            dlog_state["err"] = ""
+        except Exception as e:
+            dlog_state["err"] = str(e)[:150]
+            log.warning(f"deribit logger: {e}")
+        time.sleep(60)
+
+
 def sigma_iv():
     if not ivs["iv"] or time.time() - ivs["ts"] > 600:
         return None
@@ -1151,6 +1234,7 @@ def settler():
 #   5m  AV : base + ask didn't rise > 2c within 0.5s (A) + Deribit vol <= 1.5x BTC's recent vol (V)
 #   5m  AVS: AV + at least 60 shares at the best ask at the move
 #   5m  AVK: AV + BTC kept moving our way by >= 0.5bp in the 0.5s after the move (added Nov 2, fair test from 11:50am)
+#   5m  LAK: fair from the LOWER of Deribit vol and our vol, + A + K (>= 0.5bp), no vol-ratio filter (added Nov 2, fair test from 1:40pm)
 #   15m C  : base + our own fair (1-second BTC vol) also says >= 5c cheap
 #   15m K  : base + BTC kept moving our way in the 0.5s after the move
 #   15m X  : base + A + V          15m R : base + ask didn't rise > 1c within 0.25s        15m D15: base only
@@ -1159,7 +1243,7 @@ def settler():
 # OFF by default: D_LIVE=false -> paper (same decisions, buys priced from the book, settled at the end).
 # Safety: daily loss limit counts open positions as lost; max trades per hour; one trade per market per rule;
 #         /dstop pauses instantly, /dgo resumes.
-# ENV: D_LIVE=false  D_RULE_5=AVS (AV/AVS/AVK/off)  D_RULE_15=C (C/K/X/R/D15/CKS/off)  D_STAKE=5  D_OVERPAY_CENTS=3
+# ENV: D_LIVE=false  D_RULE_5=AVS (AV/AVS/AVK/LAK/off)  D_RULE_15=C (C/K/X/R/D15/CKS/off)  D_STAKE=5  D_OVERPAY_CENTS=3
 #      D_DAILY_LOSS=25  D_MAX_TRADES_HOUR=10  D_EDGE=10
 D_ON = os.environ.get("D_RULES", "true").strip().lower() in ("1", "true", "yes", "on")
 D_LIVE = os.environ.get("D_LIVE", "false").strip().lower() == "true"
@@ -1169,7 +1253,7 @@ D_OVERPAY = env_f("D_OVERPAY_CENTS", "3")
 D_DAILY_LOSS = env_f("D_DAILY_LOSS", "25")
 D_MAX_HOUR = int(env_f("D_MAX_TRADES_HOUR", "10"))
 D_EDGE = env_f("D_EDGE", "10")
-D_RULES_OK = {5: ("AV", "AVS", "AVK"), 15: ("C", "K", "X", "R", "D15", "CKS")}
+D_RULES_OK = {5: ("AV", "AVS", "AVK", "LAK"), 15: ("C", "K", "X", "R", "D15", "CKS")}
 d_lock = threading.Lock()
 d_done = set()                      # (tf, open_ts) already traded (or tried) by the D rule
 
@@ -1224,7 +1308,12 @@ def d_signal(t0, feed, tf, o, tok, up, ask0, size0, fair, fair_iv, sig, sig_iv, 
             return
         if (tf, o) in d_done or fair_iv is None:
             return
-        if not (fair_iv - ask0 >= D_EDGE and 15 <= ask0 <= 95):
+        fv = fair_iv
+        if rule == "LAK":                                 # fair from the LOWER of Deribit vol and BTC's own recent vol
+            if fair is None or not sig or not sig_iv:
+                return
+            fv = fair if sig < sig_iv else fair_iv
+        if not (fv - ask0 >= D_EDGE and 15 <= ask0 <= 95):
             return
         if rule in ("C", "CKS") and (fair is None or fair - ask0 < 5):
             return
@@ -1237,7 +1326,7 @@ def d_signal(t0, feed, tf, o, tok, up, ask0, size0, fair, fair_iv, sig, sig_iv, 
             a = _ask_at(tok)
             if not a or a[0][0] - ask0 > 1:
                 return
-        if rule in ("AV", "AVS", "AVK", "X", "K", "CKS"):
+        if rule in ("AV", "AVS", "AVK", "LAK", "X", "K", "CKS"):
             time.sleep(max(0.0, t0 + 0.5 - time.time()))
             if rule in ("K", "CKS"):
                 with flock:
@@ -1248,7 +1337,7 @@ def d_signal(t0, feed, tf, o, tok, up, ask0, size0, fair, fair_iv, sig, sig_iv, 
                 a = _ask_at(tok)
                 if not a or a[0][0] - ask0 > 2:
                     return
-                if rule == "AVK":                        # BTC kept moving our way by >= 0.5bp in the 0.5s after the move
+                if rule in ("AVK", "LAK"):               # BTC kept moving our way by >= 0.5bp in the 0.5s after the move
                     with flock:
                         p05 = feeds["vis"][-1][1] if feeds["vis"] else None
                     if not px0 or not p05 or (p05 - px0) * (1 if up else -1) / px0 * 1e4 < 0.5:
@@ -1263,11 +1352,11 @@ def d_signal(t0, feed, tf, o, tok, up, ask0, size0, fair, fair_iv, sig, sig_iv, 
         a = _ask_at(tok)
         cur = a[0][0] if a else ask0
         cap = min(97.0, cur + D_OVERPAY)
-        head = f"{name} {side} · ask {ask0:g}¢ fair {fair_iv:.0f}¢ (+{fair_iv - ask0:.0f})"
+        head = f"{name} {side} · ask {ask0:g}¢ fair {fv:.0f}¢ (+{fv - ask0:.0f})"
         mode = "D" if D_LIVE else "DPAPER"
         rid = db_exec("INSERT INTO lj_trades (t0,tf,open_ts,side,bps,fair,ask,edge,mode,status,fair_iv,sig,sig_iv,note) "
                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (t0, tf, o, side, None, fair, ask0, fair_iv - ask0, mode, "SIGNAL", fair_iv, sig, sig_iv,
+                      (t0, tf, o, side, None, fair, ask0, fv - ask0, mode, "SIGNAL", fair_iv, sig, sig_iv,
                        f"{name} · feed {feed}"))
         if not D_LIVE:                                        # paper: price it from the book right now
             spent, sh = _walk(a, D_STAKE)
@@ -1491,6 +1580,16 @@ def telegram_worker():
                         tg_document("early.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} early moves")
                     else:
                         tg(f"no early moves logged yet (feed ticks: {early_state['ticks']})")
+                elif t == "/deribitexport":
+                    rows = db_query("SELECT ts, data FROM lj_deribit ORDER BY ts")
+                    if rows:
+                        buf = io.StringIO()
+                        w = csv.writer(buf)
+                        w.writerow(["ts", "data"])
+                        w.writerows([list(x) for x in rows])
+                        tg_document("deribit.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} Deribit snapshots (1/min)")
+                    else:
+                        tg(f"no Deribit snapshots yet {('· ' + dlog_state['err']) if dlog_state['err'] else ''}")
                 elif t == "/closeexport":
                     rows = db_query("SELECT close_ts, tf, open_ts, outcome, data FROM lj_close ORDER BY close_ts")
                     if rows:
@@ -1513,7 +1612,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/deribitexport — Deribit skew/same-day vol/perp/trades log (1/min)\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -1955,6 +2054,8 @@ def main():
             threading.Thread(target=early_feed_worker, args=(nm,), daemon=True).start()
         threading.Thread(target=chainlink_worker, daemon=True).start()
         threading.Thread(target=deribit_worker, daemon=True).start()
+    if DERIBIT_LOG:
+        threading.Thread(target=deribit_logger, daemon=True).start()
         threading.Thread(target=close_worker, daemon=True).start()
         threading.Thread(target=close_outcomes, daemon=True).start()
     if D_ON:
