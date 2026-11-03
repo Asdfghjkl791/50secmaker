@@ -1245,7 +1245,7 @@ def settler():
 # OFF by default: D_LIVE=false -> paper (same decisions, buys priced from the book, settled at the end).
 # Safety: daily loss limit counts open positions as lost; max trades per hour; one trade per market per rule;
 #         /dstop pauses instantly, /dgo resumes.
-# ENV: D_LIVE=false  D_RULE_5=AVS (AV/AVS/AVK/LAK/off)  D_RULE_15=C (C/K/X/R/D15/CKS/off)  D_STAKE=5  D_OVERPAY_CENTS=3
+# ENV: D_LIVE=false  D_RULE_5=AVS (A/AV/AVS/AVK/LAK/off)  D_RULE_15=C (C/K/X/R/D15/CKS/off)  D_STAKE=5  D_OVERPAY_CENTS=3
 #      D_DAILY_LOSS=25  D_MAX_TRADES_HOUR=10  D_EDGE=10
 D_ON = os.environ.get("D_RULES", "true").strip().lower() in ("1", "true", "yes", "on")
 D_LIVE = os.environ.get("D_LIVE", "false").strip().lower() == "true"
@@ -1255,7 +1255,7 @@ D_OVERPAY = env_f("D_OVERPAY_CENTS", "3")
 D_DAILY_LOSS = env_f("D_DAILY_LOSS", "25")
 D_MAX_HOUR = int(env_f("D_MAX_TRADES_HOUR", "10"))
 D_EDGE = env_f("D_EDGE", "10")
-D_RULES_OK = {5: ("AV", "AVS", "AVK", "LAK"), 15: ("C", "K", "X", "R", "D15", "CKS")}
+D_RULES_OK = {5: ("A", "AV", "AVS", "AVK", "LAK"), 15: ("C", "K", "X", "R", "D15", "CKS")}
 d_lock = threading.Lock()
 d_done = set()                      # (tf, open_ts) already traded (or tried) by the D rule
 
@@ -1328,7 +1328,7 @@ def d_signal(t0, feed, tf, o, tok, up, ask0, size0, fair, fair_iv, sig, sig_iv, 
             a = _ask_at(tok)
             if not a or a[0][0] - ask0 > 1:
                 return
-        if rule in ("AV", "AVS", "AVK", "LAK", "X", "K", "CKS"):
+        if rule in ("A", "AV", "AVS", "AVK", "LAK", "X", "K", "CKS"):     # A (5m, Nov 3) = only the ask-jump check, no vol filter
             time.sleep(max(0.0, t0 + 0.5 - time.time()))
             if rule in ("K", "CKS"):
                 with flock:
@@ -2086,3 +2086,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
