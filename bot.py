@@ -538,6 +538,11 @@ def feed_tick(name, now, px):
                 sg = 1 if bps > 0 else -1
                 if not any(f == name and l == lvl and s == sg and now - t_ < 5 for t_, f, l, s in cross):
                     cross.append((now, name, lvl, sg))
+        if name != "cl" and D_TRIG_LOW and abs(bps) >= D_TRIG_LOW:      # Nov 4: extra lower trigger for the D rules only
+            sg_ = 1 if bps > 0 else -1
+            if now - d_trig_last[sg_] >= EARLY_COOL:
+                d_trig_last[sg_] = now
+                threading.Thread(target=d_trigger_low, args=(now, name, bps), daemon=True).start()
         if not EARLY_LOG or abs(bps) < EARLY_BPS or name == "cl":
             return
         sg = 1 if bps > 0 else -1
@@ -545,6 +550,47 @@ def feed_tick(name, now, px):
             return
         early_state["last"][sg] = now
     threading.Thread(target=early_capture, args=(now, name, bps), daemon=True).start()
+
+
+# Nov 4: optional lower trigger for the D rules (no logging). D_TRIGGER_BP_5 / D_TRIGGER_BP_15 = 2 means that market's D rule also
+# acts on 2bp moves (the 3bp trigger keeps working as before; one trade per market, so whichever move comes first is used).
+def _trig_env(k):
+    try:
+        v = float(os.environ.get(k, "3"))
+        return v if 0 < v < 3 else None
+    except ValueError:
+        return None
+D_TRIG_BP = {5: _trig_env("D_TRIGGER_BP_5"), 15: _trig_env("D_TRIGGER_BP_15")}
+D_TRIG_LOW = min([v for v in D_TRIG_BP.values() if v] or [0]) or None
+d_trig_last = {1: 0.0, -1: 0.0}
+
+
+def d_trigger_low(t0, feed, bps):
+    try:
+        if not D_ON:
+            return
+        up = bps > 0
+        with lock:
+            live = [(k, v) for k, v in markets.items() if k[1] <= t0 < k[1] + k[0] * 60]
+        with flock:
+            last = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
+        px = last.get("vis") or price["px"]
+        s, siv = sigma(), sigma_iv()
+        for (tf, o), toks in live:
+            lvl = D_TRIG_BP.get(tf)
+            if not lvl or abs(bps) < lvl or abs(bps) >= EARLY_BPS:   # 3bp+ moves already go through early_capture
+                continue
+            tok = toks[0] if up else toks[1]
+            f, fi = fair_up(tf, o, t0, px), fair_up_iv(tf, o, t0, px)
+            a, _b = _ladder(tok)
+            if not a:
+                continue
+            threading.Thread(target=d_signal, args=(t0, feed, tf, o, tok, up, a[0][0], a[0][1],
+                                                    None if f is None else round(f if up else 100 - f, 2),
+                                                    None if fi is None else round(fi if up else 100 - fi, 2),
+                                                    s, siv, last.get("vis")), daemon=True).start()
+    except Exception as e:
+        log.warning(f"d_trigger_low: {e}")
 
 
 def _ladder(tok, n=6):
@@ -590,10 +636,118 @@ def early_capture(t0, feed, bps):
             rec["cross"] = [[round(t_ - t0, 3), f, l, s] for t_, f, l, s in cross if -5 <= t_ - t0 <= 10]
         rec["cl"] = [[round(ts - t0, 3), round(rt - t0, 3), v] for ts, rt, v in list(cl_hist) if -10 <= rt - t0 <= 12]
         rec["jump"] = round(state["last_jump"] - t0, 3) if abs(state["last_jump"] - t0) <= 10 else None
+        if FLOW_LOG:
+            rec["flow"] = flow_features(t0, 1 if up else -1, px)
         db_exec("INSERT INTO lj_early (t0, feed, data) VALUES (?,?,?)", (t0, feed, json.dumps(rec, separators=(",", ":"))))
         early_state["n"] += 1
     except Exception as e:
         log.warning(f"early: {e}")
+
+
+# ── order-flow recorder (paper only, Nov 4): Binance trades (who is buying/selling), liquidations, order book depth, Coinbase price ──
+# Attached to every early-logger move as rec["flow"], so the D rules can be tested with this extra information. FLOW_LOG=false turns it off.
+FLOW_LOG = os.environ.get("FLOW_LOG", "true").strip().lower() in ("1", "true", "yes", "on")
+FLOW_WS = {"fut": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@forceOrder/btcusdt@depth20@100ms",
+           "spot": "wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@depth20@100ms"}
+CB_WS = "wss://ws-feed.exchange.coinbase.com"
+flow_tr = {"fut": deque(maxlen=80000), "spot": deque(maxlen=40000)}     # (t, qty_btc, +1 buyer-initiated / -1 seller-initiated)
+flow_liq = deque(maxlen=2000)                                          # (t, notional_usd, +1 shorts squeezed (forced buy) / -1 longs liquidated (forced sell))
+flow_dep = {"fut": deque(maxlen=1500), "spot": deque(maxlen=1500)}     # (t, bid10, ask10, bid20, ask20)
+flow_cb = deque(maxlen=4000)                                           # (t, coinbase price)
+flow_state = {"err": "", "n": 0}
+
+
+def flow_worker(venue):
+    while True:
+        try:
+            ws = websocket.create_connection(FLOW_WS[venue], timeout=10)
+            ws.settimeout(30)
+            log.info(f"flow {venue} connected")
+            while True:
+                m = json.loads(ws.recv())
+                now = time.time()
+                st, d = m.get("stream", ""), m.get("data") or {}
+                if st.endswith("@aggTrade"):
+                    flow_tr[venue].append((now, float(d["q"]), -1 if d.get("m") else 1))
+                elif st.endswith("@forceOrder"):
+                    o = d.get("o") or {}
+                    flow_liq.append((now, float(o.get("q", 0)) * float(o.get("ap") or o.get("p") or 0), 1 if o.get("S") == "BUY" else -1))
+                elif "@depth" in st:
+                    b, a = d.get("b") or d.get("bids") or [], d.get("a") or d.get("asks") or []
+                    sb = lambda L, n: sum(float(q) for _, q in L[:n])
+                    flow_dep[venue].append((now, sb(b, 10), sb(a, 10), sb(b, 20), sb(a, 20)))
+                flow_state["n"] += 1
+        except Exception as e:
+            flow_state["err"] = f"{venue}: {str(e)[:100]}"
+            log.warning(f"flow {venue}: {e}")
+        time.sleep(5)
+
+
+def coinbase_worker():
+    while True:
+        try:
+            ws = websocket.create_connection(CB_WS, timeout=10)
+            ws.settimeout(30)
+            ws.send(json.dumps({"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]}))
+            log.info("coinbase connected")
+            while True:
+                m = json.loads(ws.recv())
+                if m.get("type") == "ticker" and m.get("price"):
+                    flow_cb.append((time.time(), float(m["price"])))
+        except Exception as e:
+            flow_state["err"] = f"coinbase: {str(e)[:100]}"
+            log.warning(f"coinbase: {e}")
+        time.sleep(5)
+
+
+def flow_features(t0, sg, vis0):
+    """order-flow numbers around a move at t0, signed so + = in the move's direction (sg = +1 up / -1 down)"""
+    out = {}
+    try:
+        def recent(q, since):                       # walk back from the newest item only as far as needed (keeps it cheap)
+            out_ = []
+            for x in reversed(q):
+                if x[0] < since:
+                    break
+                out_.append(x)
+            return out_
+        for v, q in flow_tr.items():
+            L = recent(q, t0 - 60)
+            for lab, a, b in (("m60", -60, 0), ("m30", -30, 0), ("m10", -10, 0), ("m5", -5, 0), ("m2", -2, 0), ("p025", 0, 0.25), ("p05", 0, 0.5), ("p1", 0, 1.0)):
+                vol = [(qq, s) for t, qq, s in L if t0 + a < t <= t0 + b]
+                out[f"{v}_net_{lab}"] = round(sum(qq * s for qq, s in vol) * sg, 3)
+                out[f"{v}_vol_{lab}"] = round(sum(qq for qq, s in vol), 3)
+                if lab in ("m10", "m60"):
+                    out[f"{v}_n_{lab}"] = len(vol)
+                    out[f"{v}_big_{lab}"] = round(sum(qq * s for qq, s in vol if qq >= 2.0) * sg, 3)
+        LQ = recent(flow_liq, t0 - 60)
+        for lab, a in (("m60", -60), ("m10", -10)):
+            z = [(n, s) for t, n, s in LQ if t0 + a < t <= t0]
+            out[f"liq_net_{lab}"] = round(sum(n * s for n, s in z) * sg)
+            out[f"liq_tot_{lab}"] = round(sum(n for n, s in z))
+        for v, q in flow_dep.items():
+            Dq = recent(q, t0 - 5)[::-1]
+            pre = [x for x in Dq if x[0] <= t0]
+            if pre:
+                t, b10, a10, b20, a20 = pre[-1]
+                out[f"{v}_imb10"] = round((b10 - a10) / max(b10 + a10, 1e-9) * sg, 4)
+                out[f"{v}_imb20"] = round((b20 - a20) / max(b20 + a20, 1e-9) * sg, 4)
+            post = [x for x in Dq if t0 < x[0] <= t0 + 0.5]
+            if post:
+                t, b10, a10, b20, a20 = post[-1]
+                out[f"{v}_imb10_p05"] = round((b10 - a10) / max(b10 + a10, 1e-9) * sg, 4)
+        CB = recent(flow_cb, t0 - 5)[::-1]
+        at = lambda tt: next((p for t, p in reversed(CB) if t <= tt), None)
+        c0, cm2, cp05 = at(t0), at(t0 - 2), at(t0 + 0.5)
+        if c0 and vis0:
+            out["cb_basis_bp"] = round((c0 / vis0 - 1) * 1e4 * sg, 2)
+        if c0 and cm2:
+            out["cb_move_m2"] = round((c0 / cm2 - 1) * 1e4 * sg, 2)
+        if c0 and cp05:
+            out["cb_move_p05"] = round((cp05 / c0 - 1) * 1e4 * sg, 2)
+    except Exception as e:
+        out["err"] = str(e)[:80]
+    return out
 
 
 def _cl_points(m):
@@ -1245,7 +1399,7 @@ def settler():
 # OFF by default: D_LIVE=false -> paper (same decisions, buys priced from the book, settled at the end).
 # Safety: daily loss limit counts open positions as lost; max trades per hour; one trade per market per rule;
 #         /dstop pauses instantly, /dgo resumes.
-# ENV: D_LIVE=false  D_RULE_5=AVS (A/AV/AVS/AVK/LAK/off)  D_RULE_15=C (C/K/X/R/D15/CKS/off)  D_STAKE=5  D_OVERPAY_CENTS=3
+# ENV: D_TRIGGER_BP_5=3 / D_TRIGGER_BP_15=3 (set 2 to also act on 2bp moves)  D_LIVE=false  D_RULE_5=AVS (A/AV/AVS/AVK/LAK/off)  D_RULE_15=C (C/K/X/R/D15/CKS/off)  D_STAKE=5  D_OVERPAY_CENTS=3
 #      D_DAILY_LOSS=25  D_MAX_TRADES_HOUR=10  D_EDGE=10
 D_ON = os.environ.get("D_RULES", "true").strip().lower() in ("1", "true", "yes", "on")
 D_LIVE = os.environ.get("D_LIVE", "false").strip().lower() == "true"
@@ -1443,6 +1597,7 @@ def d_status():
     return (f"🎯 <b>D rules</b> · {st}{' · ⏸ PAUSED' if d_paused() else ''}\n"
             f"5m: {d_name(5) if D_RULE[5] in D_RULES_OK[5] else 'off'} · 15m: {d_name(15) if D_RULE[15] in D_RULES_OK[15] else 'off'} · "
             f"${D_STAKE:g}/trade · buy limit ask+{D_OVERPAY:g}¢ · edge ≥{D_EDGE:g}¢ · hold to the end\n"
+            f"trigger: 5m {D_TRIG_BP[5] or 3:g}bp · 15m {D_TRIG_BP[15] or 3:g}bp\n"
             f"limits: ${D_DAILY_LOSS:g}/day (open trades count as lost) · {D_MAX_HOUR}/hour · one trade per market\n"
             + d_summary(t_day, "today"))
 
@@ -2056,6 +2211,10 @@ def main():
             threading.Thread(target=early_feed_worker, args=(nm,), daemon=True).start()
         threading.Thread(target=chainlink_worker, daemon=True).start()
         threading.Thread(target=deribit_worker, daemon=True).start()
+        if FLOW_LOG:
+            for v in FLOW_WS:
+                threading.Thread(target=flow_worker, args=(v,), daemon=True).start()
+            threading.Thread(target=coinbase_worker, daemon=True).start()
     if DERIBIT_LOG:
         threading.Thread(target=deribit_logger, daemon=True).start()
         threading.Thread(target=close_worker, daemon=True).start()
@@ -2086,4 +2245,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
