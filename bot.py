@@ -113,6 +113,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS lj_kv (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS lj_early (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, feed TEXT, data TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS lj_deribit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, data TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS lj_extra (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, data TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS lj_close (id INTEGER PRIMARY KEY AUTOINCREMENT, close_ts REAL, tf INTEGER, "
                   "open_ts INTEGER, outcome TEXT, data TEXT)")
         for col in ("fair_iv REAL", "sig REAL", "sig_iv REAL", "cl_open REAL", "bn_open REAL"):
@@ -414,6 +415,12 @@ def pm_handle(raw):
                 tok = str(m.get("asset_id"))
                 books[tok] = {"bids": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])},
                               "asks": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}}
+            elif et == "last_trade_price":                 # Nov 4: Polymarket's own trades (paper research)
+                try:
+                    pm_trades.append((time.time(), str(m.get("asset_id")), round(float(m.get("price", 0)) * 100, 2),
+                                      float(m.get("size", 0)), str(m.get("side", "")).upper()))
+                except (TypeError, ValueError):
+                    pass
             elif et == "price_change":
                 for ch in (m.get("price_changes") or m.get("changes") or []):
                     tok = str(ch.get("asset_id") or m.get("asset_id"))
@@ -625,11 +632,21 @@ def early_capture(t0, feed, bps):
                                                         m_["fair_iv"], rec["sig"], rec["sig_iv"], last.get("vis")),
                                  daemon=True).start()
         toks_by_tf = {str(tf): (toks[0] if up else toks[1]) for (tf, o), toks in live}
+        opp_by_tf = {str(tf): (toks[1] if up else toks[0]) for (tf, o), toks in live}       # Nov 4: the other side's book too
+        for tf, tok in opp_by_tf.items():
+            if tf in rec["mk"]:
+                a, b = _ladder(tok, 3)
+                rec["mk"][tf]["opp"] = {"0": {"a": a, "b": b}}
         for off in EARLY_SNAPS:
             time.sleep(max(0.0, t0 + off - time.time()))
             for tf, tok in toks_by_tf.items():
                 a, b = _ladder(tok)
                 rec["mk"][tf]["snaps"][f"{off:g}"] = {"a": a, "b": b}
+            if off in (0.5, 1.0, 2.0, 10.0):
+                for tf, tok in opp_by_tf.items():
+                    if tf in rec["mk"] and "opp" in rec["mk"][tf]:
+                        a, b = _ladder(tok, 3)
+                        rec["mk"][tf]["opp"][f"{off:g}"] = {"a": a, "b": b}
             with flock:
                 rec.setdefault("pxs", {})[f"{off:g}"] = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
         with flock:
@@ -638,6 +655,9 @@ def early_capture(t0, feed, bps):
         rec["jump"] = round(state["last_jump"] - t0, 3) if abs(state["last_jump"] - t0) <= 10 else None
         if FLOW_LOG:
             rec["flow"] = flow_features(t0, 1 if up else -1, px)
+        if EXTRA_LOG:
+            rec["xtra"] = extra_features(t0, 1 if up else -1, toks_by_tf, opp_by_tf)
+            rec["lead"] = lead_features(t0, 1 if up else -1, px)
         db_exec("INSERT INTO lj_early (t0, feed, data) VALUES (?,?,?)", (t0, feed, json.dumps(rec, separators=(",", ":"))))
         early_state["n"] += 1
     except Exception as e:
@@ -747,6 +767,277 @@ def flow_features(t0, sg, vis0):
             out["cb_move_m2"] = round((c0 / cm2 - 1) * 1e4 * sg, 2)
         if c0 and cp05:
             out["cb_move_p05"] = round((cp05 / c0 - 1) * 1e4 * sg, 2)
+    except Exception as e:
+        out["err"] = str(e)[:80]
+    return out
+
+
+# ── extra recorder (paper only, Nov 4). EXTRA_LOG=false turns it off. Table lj_extra (kind, data); /extraexport sends new rows. ──
+#  win  : every 5s, for each live BTC 5m/15m market: both sides' top-3 book, BTC prices (vis/spot/fut/Chainlink), ETH/SOL, vol, Polymarket trades since last snapshot
+#  pmt  : Polymarket trades (last_trade_price) in our BTC markets, flushed every 5s
+#  meta : Polymarket's market data for each window, ~30s and ~120s after the start (to find the official start price / "price to beat")
+#  bn   : once a minute, Binance futures funding, mark/index price, open interest, taker buy/sell ratio, long/short account ratio
+# Every early-logger move also gets rec["xtra"]: ETH/SOL moves around the move and Polymarket trades in the 10s before / 1s after.
+EXTRA_LOG = os.environ.get("EXTRA_LOG", "true").strip().lower() in ("1", "true", "yes", "on")
+pm_trades = deque(maxlen=20000)                      # (t, token, price_c, size, side)
+alt_px = {"ETH": deque(maxlen=3000), "SOL": deque(maxlen=3000)}   # (t, mid), at most ~5 per second
+ALT_WS = "wss://data-stream.binance.vision/stream?streams=ethusdt@bookTicker/solusdt@bookTicker"
+FAPI = "https://fapi.binance.com"
+extra_state = {"err": "", "win": 0, "meta": 0, "bn": 0, "pmt": 0}
+
+
+def alt_worker():
+    while True:
+        try:
+            ws = websocket.create_connection(ALT_WS, timeout=10)
+            ws.settimeout(30)
+            log.info("alt coins feed connected")
+            while True:
+                m = json.loads(ws.recv())
+                d = m.get("data") or {}
+                c = {"ETHUSDT": "ETH", "SOLUSDT": "SOL"}.get(d.get("s"))
+                if not c:
+                    continue
+                now = time.time()
+                q = alt_px[c]
+                if not q or now - q[-1][0] >= 0.2:
+                    q.append((now, (float(d["b"]) + float(d["a"])) / 2))
+        except Exception as e:
+            extra_state["err"] = f"alt: {str(e)[:100]}"
+            log.warning(f"alt: {e}")
+        time.sleep(5)
+
+
+def _alt_at(c, t):
+    for tt, p in reversed(alt_px[c]):
+        if tt <= t:
+            return p
+    return None
+
+
+def extra_features(t0, sg, toks_by_tf, opp_by_tf):
+    out = {}
+    try:
+        for c in alt_px:
+            p0 = _alt_at(c, t0)
+            for lab, dt in (("m2", -2), ("m10", -10), ("m60", -60), ("p05", 0.5), ("p1", 1.0)):
+                p1 = _alt_at(c, t0 + dt)
+                if p0 and p1:
+                    out[f"{c.lower()}_{lab}"] = round(((p1 / p0 - 1) if dt > 0 else (p0 / p1 - 1)) * 1e4 * sg, 2)
+        T = [x for x in list(pm_trades) if t0 - 10 <= x[0] <= t0 + 1]
+        for tf in toks_by_tf:
+            ours, opp = toks_by_tf[tf], opp_by_tf.get(tf)
+            for lab, a, b in (("m10", -10, 0), ("p1", 0, 1)):
+                our_v = sum(s for t, k, p, s, sd in T if k == ours and t0 + a <= t < t0 + b)
+                opp_v = sum(s for t, k, p, s, sd in T if k == opp and t0 + a <= t < t0 + b)
+                out[f"pm{tf}_ours_{lab}"] = round(our_v, 1)
+                out[f"pm{tf}_opp_{lab}"] = round(opp_v, 1)
+    except Exception as e:
+        out["err"] = str(e)[:80]
+    return out
+
+
+def extra_recorder():
+    """every 5s: window snapshots + Polymarket trades; meta fetches; Binance stats once a minute; prunes rows older than 7 days"""
+    last_bn = 0.0
+    last_prune = 0.0
+    meta_done = set()
+    flushed = 0.0
+    while True:
+        try:
+            now = time.time()
+            with lock:
+                live = [(k, v) for k, v in markets.items() if k[1] <= now < k[1] + k[0] * 60]
+            with flock:
+                px = {k: (q[-1][1] if q else None) for k, q in feeds.items()}
+            alts = {c.lower(): (q[-1][1] if q else None) for c, q in alt_px.items()}
+            alts.update({v: (q[-1][1] if q else None) for v, q in lead_px.items()})
+            alts["cb"] = flow_cb[-1][1] if flow_cb else None
+            new_tr = [x for x in list(pm_trades) if x[0] > flushed]
+            if new_tr:
+                flushed = max(x[0] for x in new_tr)
+            tok_map = {}
+            for (tf, o), toks in live:
+                tok_map[toks[0]] = (tf, o, "UP")
+                tok_map[toks[1]] = (tf, o, "DOWN")
+                ua, ub = _ladder(toks[0], 3)
+                da, dbb = _ladder(toks[1], 3)
+                vol = {}
+                for t, k, p, s, sd in new_tr:
+                    if k in toks:
+                        key = "up" if k == toks[0] else "dn"
+                        vol[key] = round(vol.get(key, 0) + s, 1)
+                dep = {}
+                with lock:                                  # total shares within 5c / 10c of the best price, each side of each book
+                    for nm, tk in (("u", toks[0]), ("d", toks[1])):
+                        bk = books.get(tk) or {}
+                        A, B = bk.get("asks") or {}, bk.get("bids") or {}
+                        if A:
+                            ma = min(A)
+                            dep[nm + "a5"], dep[nm + "a10"] = round(sum(z for q_, z in A.items() if q_ <= ma + 5), 1), round(sum(z for q_, z in A.items() if q_ <= ma + 10), 1)
+                        if B:
+                            mb = max(B)
+                            dep[nm + "b5"], dep[nm + "b10"] = round(sum(z for q_, z in B.items() if q_ >= mb - 5), 1), round(sum(z for q_, z in B.items() if q_ >= mb - 10), 1)
+                rec = {"tf": tf, "o": o, "into": round(now - o, 1), "ua": ua, "ub": ub, "da": da, "db": dbb, "dep": dep, "px": px, "alt": alts,
+                       "open": opens.get((tf, o)), "cl_open": cl_opens.get((tf, o)), "sig": sigma(), "sig_iv": sigma_iv(), "pmv": vol}
+                db_exec("INSERT INTO lj_extra (ts, kind, data) VALUES (?,?,?)", (now, "win", json.dumps(rec, separators=(",", ":"))))
+                extra_state["win"] += 1
+            mine = [[round(t, 2)] + list(tok_map[k]) + [p, s, sd] for t, k, p, s, sd in new_tr if k in tok_map]
+            if mine:
+                db_exec("INSERT INTO lj_extra (ts, kind, data) VALUES (?,?,?)", (now, "pmt", json.dumps(mine, separators=(",", ":"))))
+                extra_state["pmt"] += len(mine)
+            for (tf, o), toks in live:                     # Polymarket market data ~30s and ~120s after the start
+                for stage in (30, 120):
+                    if (tf, o, stage) not in meta_done and now - o >= stage:
+                        meta_done.add((tf, o, stage))
+                        threading.Thread(target=_fetch_meta, args=(tf, o, stage), daemon=True).start()
+            if now - last_bn >= 60:
+                last_bn = now
+                threading.Thread(target=_fetch_bn, daemon=True).start()
+            if now - last_prune >= 3600:
+                last_prune = now
+                db_exec("DELETE FROM lj_extra WHERE ts < ?", (now - 7 * 86400,))
+                meta_done = {x for x in meta_done if now - x[1] < 7200}
+        except Exception as e:
+            extra_state["err"] = f"recorder: {str(e)[:100]}"
+            log.warning(f"extra recorder: {e}")
+        time.sleep(max(0.5, 5 - (time.time() - now)))
+
+
+def _fetch_meta(tf, o, stage):
+    try:
+        arr = requests.get(f"{GAMMA}/events", params={"slug": f"btc-updown-{tf}m-{o}"}, timeout=10).json()
+        ev = arr[0] if isinstance(arr, list) and arr else {}
+        keep = lambda d: {k: v for k, v in (d or {}).items()
+                          if any(w in k.lower() for w in ("price", "metadata", "strike", "threshold", "reference", "target", "start", "end", "resolution", "description", "outcome"))}
+        mk = (ev.get("markets") or [{}])[0]
+        rec = {"tf": tf, "o": o, "stage": stage, "event": keep(ev), "market": keep(mk)}
+        for d in (rec["event"], rec["market"]):
+            if isinstance(d.get("description"), str):
+                d["description"] = d["description"][:600]
+        db_exec("INSERT INTO lj_extra (ts, kind, data) VALUES (?,?,?)", (time.time(), "meta", json.dumps(rec, separators=(",", ":"), default=str)))
+        extra_state["meta"] += 1
+    except Exception as e:
+        extra_state["err"] = f"meta: {str(e)[:100]}"
+
+
+def _fetch_bn():
+    out = {}
+    for name, path, params in (("premium", "/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}), ("oi", "/fapi/v1/openInterest", {"symbol": "BTCUSDT"}),
+                               ("taker", "/futures/data/takerlongshortRatio", {"symbol": "BTCUSDT", "period": "5m", "limit": 1}),
+                               ("lsr", "/futures/data/globalLongShortAccountRatio", {"symbol": "BTCUSDT", "period": "5m", "limit": 1}),
+                               ("top", "/futures/data/topLongShortPositionRatio", {"symbol": "BTCUSDT", "period": "5m", "limit": 1}),
+                               ("bybit", "https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": "BTCUSDT"}),
+                               ("okx_fund", "https://www.okx.com/api/v5/public/funding-rate", {"instId": "BTC-USDT-SWAP"}),
+                               ("okx_oi", "https://www.okx.com/api/v5/public/open-interest", {"instId": "BTC-USDT-SWAP"})):
+        try:
+            out[name] = requests.get(path if path.startswith("http") else FAPI + path, params=params, timeout=8).json()
+        except Exception as e:
+            out[name] = {"err": str(e)[:80]}
+    try:
+        db_exec("INSERT INTO lj_extra (ts, kind, data) VALUES (?,?,?)", (time.time(), "bn", json.dumps(out, separators=(",", ":"))))
+        extra_state["bn"] += 1
+    except Exception as e:
+        extra_state["err"] = f"bn: {str(e)[:100]}"
+
+
+# ── lead recorder (paper only, Nov 4): which exchange moves first. Best bid/ask from Bybit, OKX, Hyperliquid (perps), Kraken, Bitstamp (spot),
+# kept next to Binance (vis/spot/fut), Coinbase and Chainlink. Every early move gets rec["lead"]: for each venue the move in the 2s/10s
+# before and 0.5s/1s after (signed our way), when it first crossed 1/2/3bp our way (relative to its price 2s before), and its gap to Binance.
+lead_px = {v: deque(maxlen=6000) for v in ("bybit", "okx", "hl", "kraken", "bitstamp")}   # (t, mid), at most 20 per second
+lead_state = {v: 0 for v in lead_px}
+lead_state["err"] = ""
+
+
+def _lead_push(v, b, a):
+    if b and a and b > 0 and a > 0:
+        now = time.time()
+        q = lead_px[v]
+        if not q or now - q[-1][0] >= 0.05:
+            q.append((now, (b + a) / 2))
+            lead_state[v] += 1
+
+
+def lead_worker(v):
+    cfg = {"bybit": ("wss://stream.bybit.com/v5/public/linear", {"op": "subscribe", "args": ["orderbook.1.BTCUSDT"]}, {"op": "ping"}),
+           "okx": ("wss://ws.okx.com:8443/ws/v5/public", {"op": "subscribe", "args": [{"channel": "bbo-tbt", "instId": "BTC-USDT-SWAP"}]}, "ping"),
+           "hl": ("wss://api.hyperliquid.xyz/ws", {"method": "subscribe", "subscription": {"type": "bbo", "coin": "BTC"}}, {"method": "ping"}),
+           "kraken": ("wss://ws.kraken.com/v2", {"method": "subscribe", "params": {"channel": "ticker", "symbol": ["BTC/USD"], "event_trigger": "bbo"}}, {"method": "ping"}),
+           "bitstamp": ("wss://ws.bitstamp.net", {"event": "bts:subscribe", "data": {"channel": "order_book_btcusd"}}, None)}
+    url, sub, ping = cfg[v]
+    while True:
+        try:
+            ws = websocket.create_connection(url, timeout=10)
+            ws.settimeout(30)
+            ws.send(json.dumps(sub))
+            log.info(f"lead {v} connected")
+            last_ping, bb, ba = time.time(), None, None
+            while True:
+                if ping and time.time() - last_ping > 15:
+                    ws.send(ping if isinstance(ping, str) else json.dumps(ping))
+                    last_ping = time.time()
+                raw = ws.recv()
+                if raw in ("pong", "") or not raw.startswith("{"):
+                    continue
+                m = json.loads(raw)
+                if v == "bybit":
+                    d = m.get("data") or {}
+                    if d.get("b") and float(d["b"][0][1]) > 0:
+                        bb = float(d["b"][0][0])
+                    if d.get("a") and float(d["a"][0][1]) > 0:
+                        ba = float(d["a"][0][0])
+                    if d:
+                        _lead_push(v, bb, ba)
+                elif v == "okx":
+                    for d in m.get("data") or []:
+                        if d.get("bids") and d.get("asks"):
+                            _lead_push(v, float(d["bids"][0][0]), float(d["asks"][0][0]))
+                elif v == "hl":
+                    d = m.get("data") or {}
+                    bbo = d.get("bbo") if isinstance(d, dict) else None
+                    if bbo and len(bbo) == 2 and bbo[0] and bbo[1]:
+                        _lead_push(v, float(bbo[0]["px"]), float(bbo[1]["px"]))
+                elif v == "kraken":
+                    if m.get("channel") == "ticker":
+                        for d in m.get("data") or []:
+                            _lead_push(v, float(d.get("bid") or 0), float(d.get("ask") or 0))
+                elif v == "bitstamp":
+                    d = m.get("data") or {}
+                    if d.get("bids") and d.get("asks"):
+                        _lead_push(v, float(d["bids"][0][0]), float(d["asks"][0][0]))
+        except Exception as e:
+            lead_state["err"] = f"{v}: {str(e)[:100]}"
+            log.warning(f"lead {v}: {e}")
+        time.sleep(5)
+
+
+def lead_features(t0, sg, vis0):
+    """per venue: move before/after t0 (bp, + = our way), first time it crossed 1/2/3bp our way vs its price 2s before, gap to Binance"""
+    out = {}
+    try:
+        venues = dict(lead_px)
+        venues["cb"] = flow_cb
+        for v, q in venues.items():
+            L = [x for x in list(q) if t0 - 61 <= x[0] <= t0 + 2.5]
+            if not L:
+                continue
+            at = lambda tt: next((p for t, p in reversed(L) if t <= tt), None)
+            p0 = at(t0)
+            if not p0:
+                continue
+            r = {"age": round(t0 - next(t for t, p in reversed(L) if t <= t0), 3)}
+            for lab, dt in (("m60", -60), ("m10", -10), ("m2", -2), ("p05", 0.5), ("p1", 1.0), ("p2", 2.0)):
+                p1 = at(t0 + dt)
+                if p1:
+                    r[lab] = round(((p1 / p0 - 1) if dt > 0 else (p0 / p1 - 1)) * 1e4 * sg, 2)
+            base = at(t0 - 2)
+            if base:
+                for lvl in (1, 2, 3):
+                    hit = next((t for t, p in L if t >= t0 - 2 and (p / base - 1) * 1e4 * sg >= lvl), None)
+                    r[f"x{lvl}"] = None if hit is None else round(hit - t0, 3)
+            if vis0:
+                r["gap"] = round((p0 / vis0 - 1) * 1e4, 2)
+            out[v] = r
     except Exception as e:
         out["err"] = str(e)[:80]
     return out
@@ -1739,6 +2030,28 @@ def telegram_worker():
                         tg_document("early.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} early moves")
                     else:
                         tg(f"no early moves logged yet (feed ticks: {early_state['ticks']})")
+                elif t == "/extraexport":          # Nov 4 extra recorder: rows since the last /extraexport ('all' = everything)
+                    parts = (msg.get("text") or "").strip().split()
+                    since = 0 if (len(parts) > 1 and parts[1].lower() == "all") else int(kv_get("extra_exported", 0) or 0)
+                    rows = db_query("SELECT id, ts, kind, data FROM lj_extra WHERE id > ? ORDER BY id", (since,))
+                    if rows:
+                        buf = io.StringIO()
+                        w = csv.writer(buf)
+                        w.writerow(["id", "ts", "kind", "data"])
+                        w.writerows([list(x) for x in rows])
+                        kinds = {}
+                        for x in rows:
+                            kinds[x[2]] = kinds.get(x[2], 0) + 1
+                        tg_document("extra.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} extra rows " + " ".join(f"{k}:{n}" for k, n in sorted(kinds.items())))
+                        kv_set("extra_exported", rows[-1][0])
+                    else:
+                        tg(f"no new extra rows {('· ' + extra_state['err']) if extra_state['err'] else ''}")
+                elif t == "/extrastatus":
+                    ag = lambda q: f"{time.time() - q[-1][0]:.0f}s" if q else "none"
+                    tg("extra recorder: " + ("on" if EXTRA_LOG else "off") + f"\nrows saved: window {extra_state['win']} · PM trades {extra_state['pmt']} · market info {extra_state['meta']} · Binance stats {extra_state['bn']}"
+                       + f"\nPM trades seen: {len(pm_trades)} · ETH last {ag(alt_px['ETH'])} ago · SOL {ag(alt_px['SOL'])}"
+                       + "\nlead feeds (last tick ago): " + " · ".join(f"{v} {ag(q)}" for v, q in lead_px.items()) + f" · coinbase {ag(flow_cb)}"
+                       + (f"\nlast error: {extra_state['err'][:80]}" if extra_state["err"] else "") + (f"\nlead error: {lead_state['err'][:80]}" if lead_state["err"] else ""))
                 elif t == "/deribitexport":
                     rows = db_query("SELECT ts, data FROM lj_deribit ORDER BY ts")
                     if rows:
@@ -1771,7 +2084,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/deribitexport — Deribit skew/same-day vol/perp/trades log (1/min)\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/deribitexport — Deribit skew/same-day vol/perp/trades log (1/min)\n/extraexport — extra recorder: window books, PM trades, market info, Binance stats, new rows (add 'all' for everything)\n/extrastatus — extra + lead recorder health\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -2217,6 +2530,11 @@ def main():
             for v in FLOW_WS:
                 threading.Thread(target=flow_worker, args=(v,), daemon=True).start()
             threading.Thread(target=coinbase_worker, daemon=True).start()
+        if EXTRA_LOG:
+            threading.Thread(target=alt_worker, daemon=True).start()
+            threading.Thread(target=extra_recorder, daemon=True).start()
+            for v in lead_px:
+                threading.Thread(target=lead_worker, args=(v,), daemon=True).start()
     if DERIBIT_LOG:
         threading.Thread(target=deribit_logger, daemon=True).start()
         threading.Thread(target=close_worker, daemon=True).start()
