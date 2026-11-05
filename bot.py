@@ -624,6 +624,11 @@ def early_capture(t0, feed, bps):
             rec["mk"][str(tf)] = {"o": o, "open": opens.get((tf, o)), "cl_open": cl_opens.get((tf, o)),
                                   "fair_iv": None if fi is None else round(fi if up else 100 - fi, 2), "left": round(o + tf * 60 - t0, 1),
                                   "fair": None if f is None else round(f if up else 100 - f, 2), "snaps": {}}
+            if EXTRA_LOG:                                # Nov 5: real settlement rule (TWAP) strike + fair, paper only
+                k_, src_ = tw_strike(tf, o)
+                ft, fto = fair_tw(tf, o, t0, rec["sig_iv"]), fair_tw(tf, o, t0, rec["sig"])
+                rec["mk"][str(tf)]["tw"] = {"k": k_, "src": src_, "fair_tw": None if ft is None else round(ft if up else 100 - ft, 2),
+                                            "fair_two": None if fto is None else round(fto if up else 100 - fto, 2)}
             a, b = _ladder(tok)
             rec["mk"][str(tf)]["snaps"]["0"] = {"a": a, "b": b}
             if D_ON and a:                               # D rules (paper or live) decide from this same snapshot
@@ -878,10 +883,17 @@ def extra_recorder():
                         if B:
                             mb = max(B)
                             dep[nm + "b5"], dep[nm + "b10"] = round(sum(z for q_, z in B.items() if q_ >= mb - 5), 1), round(sum(z for q_, z in B.items() if q_ >= mb - 10), 1)
-                rec = {"tf": tf, "o": o, "into": round(now - o, 1), "ua": ua, "ub": ub, "da": da, "db": dbb, "dep": dep, "px": px, "alt": alts,
+                k_, src_ = tw_strike(tf, o)
+                ft = fair_tw(tf, o, now, sigma_iv())
+                tw = {"last": twap_hist[-1][2] if twap_hist else None, "k": k_, "src": src_, "fair_up": None if ft is None else round(ft, 2)}
+                rec = {"tf": tf, "o": o, "into": round(now - o, 1), "tw": tw, "ua": ua, "ub": ub, "da": da, "db": dbb, "dep": dep, "px": px, "alt": alts,
                        "open": opens.get((tf, o)), "cl_open": cl_opens.get((tf, o)), "sig": sigma(), "sig_iv": sigma_iv(), "pmv": vol}
                 db_exec("INSERT INTO lj_extra (ts, kind, data) VALUES (?,?,?)", (now, "win", json.dumps(rec, separators=(",", ":"))))
                 extra_state["win"] += 1
+            twn = [[round(ts, 3), v] for ts, rt, v in list(twap_hist) if ts > twap_state["flushed"]]
+            if twn:
+                twap_state["flushed"] = twn[-1][0]
+                db_exec("INSERT INTO lj_extra (ts, kind, data) VALUES (?,?,?)", (now, "twap", json.dumps(twn, separators=(",", ":"))))
             mine = [[round(t, 2)] + list(tok_map[k]) + [p, s, sd] for t, k, p, s, sd in new_tr if k in tok_map]
             if mine:
                 db_exec("INSERT INTO lj_extra (ts, kind, data) VALUES (?,?,?)", (now, "pmt", json.dumps(mine, separators=(",", ":"))))
@@ -1041,6 +1053,92 @@ def lead_features(t0, sg, vis0):
     except Exception as e:
         out["err"] = str(e)[:80]
     return out
+
+
+# ── TWAP recorder (paper only, Nov 5). The 5m/15m markets settle on Chainlink's 60-second TWAP: UP if TWAP60 at the end second >= TWAP60 at
+# the start second (since Aug 2026). TWAP60(T) ~ average Chainlink price over about [T-62s, T-3s]. So the real "price to beat" is the average of
+# the minute BEFORE the window, and the final price is the average of the last minute. Polymarket streams it (price.crypto.twap, 60s).
+# Recorded: every TWAP point (lj_extra kind='twap'), the exact start value per window, and on every early move rec["mk"][tf]["tw"] =
+# strike + a corrected fair price (fair_tw = Deribit vol, fair_two = our vol), side-flipped like the others. Nothing trades on it yet.
+twap_hist = deque(maxlen=8000)                    # (twap_ts, received_ts, value)
+tw_opens = {}                                     # (tf, open_ts) -> TWAP60 value at the start second (the real price to beat)
+twap_state = {"n": 0, "err": "", "flushed": 0.0}
+
+
+def twap_worker():
+    while True:
+        try:
+            cr = clob().creds
+            ws = websocket.create_connection(CL_WS, timeout=10)
+            ws.settimeout(30)
+            ws.send(json.dumps({"op": "auth", "rid": "a2", "auth": {"apiKey": cr.api_key, "secret": cr.api_secret, "passphrase": cr.api_passphrase}}))
+            ws.send(json.dumps({"op": "subscribe", "rid": "s2", "subscriptions": [{"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60}}]}))
+            log.info("twap feed connected")
+            last_ping = time.time()
+            while True:
+                if time.time() - last_ping > 15:
+                    ws.ping()
+                    last_ping = time.time()
+                raw = ws.recv()
+                now = time.time()
+                try:
+                    m = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(m, dict) and m.get("op") == "error":
+                    twap_state["err"] = str(m)[:150]
+                if not isinstance(m, dict) or "twap" not in str(m.get("channel", "")):
+                    continue
+                for ts, v in sorted(_cl_points(m)):
+                    if twap_hist and ts <= twap_hist[-1][0]:
+                        continue
+                    twap_hist.append((ts, now, v))
+                    twap_state["n"] += 1
+                    for tf in TFS:
+                        o = window(tf, ts)[0]
+                        if (tf, o) not in tw_opens and abs(ts - o) < 0.5:
+                            tw_opens[(tf, o)] = v
+        except Exception as e:
+            twap_state["err"] = str(e)[:150]
+            log.warning(f"twap: {e}")
+        time.sleep(10)
+
+
+def tw_strike(tf, o):
+    """(price to beat, source): exact TWAP at the start second if we saw it, else our own average of Chainlink ticks over [o-62, o-3]"""
+    if (tf, o) in tw_opens:
+        return tw_opens[(tf, o)], "feed"
+    pts = [v for ts, rt, v in list(cl_hist) if o - 62 <= ts <= o - 3]
+    if len(pts) >= 20:
+        return sum(pts) / len(pts), "cl"
+    return None, None
+
+
+def fair_tw(tf, o, now, s):
+    """chance (0-100) that UP wins under the real rule: final = average Chainlink price over [end-62, end-3] >= TWAP strike"""
+    try:
+        k, _src = tw_strike(tf, o)
+        if not k or not s or not cl_hist:
+            return None
+        e = o + tf * 60
+        a, b = e - 62, e - 3
+        H = list(cl_hist)
+        ts_l, rt_l, x = H[-1]
+        bn = [p for t, p in list(px1s) if t <= rt_l]
+        if bn and px1s:                                # bring the last Chainlink price up to now using Binance's move since then
+            x = x * px1s[-1][1] / bn[-1]
+        if now >= b:
+            pts = [v for ts, rt, v in H if a <= ts <= b]
+            return None if not pts else (100.0 if sum(pts) / len(pts) >= k else 0.0)
+        known = [v for ts, rt, v in H if a <= ts <= now] if now > a else []
+        f = min(1.0, (now - a) / (b - a)) if (now > a and known) else 0.0
+        start = max(now, a)
+        d, L = start - now, b - start
+        mean = (sum(known) / len(known) if known else x) * f + x * (1 - f)
+        sd = (1 - f) * s * math.sqrt(max(1e-9, d + L / 3.0))
+        return 100.0 * norm_cdf(math.log(mean / k) / sd)
+    except Exception:
+        return None
 
 
 def _cl_points(m):
@@ -2050,6 +2148,7 @@ def telegram_worker():
                     ag = lambda q: f"{time.time() - q[-1][0]:.0f}s" if q else "none"
                     tg("extra recorder: " + ("on" if EXTRA_LOG else "off") + f"\nrows saved: window {extra_state['win']} · PM trades {extra_state['pmt']} · market info {extra_state['meta']} · Binance stats {extra_state['bn']}"
                        + f"\nPM trades seen: {len(pm_trades)} · ETH last {ag(alt_px['ETH'])} ago · SOL {ag(alt_px['SOL'])}"
+                       + f"\nTWAP feed: {twap_state['n']} points, last {ag(twap_hist)} ago, windows with exact start {len(tw_opens)}" + (f" · {twap_state['err'][:60]}" if twap_state["err"] else "")
                        + "\nlead feeds (last tick ago): " + " · ".join(f"{v} {ag(q)}" for v, q in lead_px.items()) + f" · coinbase {ag(flow_cb)}"
                        + (f"\nlast error: {extra_state['err'][:80]}" if extra_state["err"] else "") + (f"\nlead error: {lead_state['err'][:80]}" if lead_state["err"] else ""))
                 elif t == "/deribitexport":
@@ -2533,6 +2632,7 @@ def main():
         if EXTRA_LOG:
             threading.Thread(target=alt_worker, daemon=True).start()
             threading.Thread(target=extra_recorder, daemon=True).start()
+            threading.Thread(target=twap_worker, daemon=True).start()
             for v in lead_px:
                 threading.Thread(target=lead_worker, args=(v,), daemon=True).start()
     if DERIBIT_LOG:
