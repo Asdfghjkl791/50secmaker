@@ -647,7 +647,8 @@ def early_capture(t0, feed, bps):
 # ── order-flow recorder (paper only, Nov 4): Binance trades (who is buying/selling), liquidations, order book depth, Coinbase price ──
 # Attached to every early-logger move as rec["flow"], so the D rules can be tested with this extra information. FLOW_LOG=false turns it off.
 FLOW_LOG = os.environ.get("FLOW_LOG", "true").strip().lower() in ("1", "true", "yes", "on")
-FLOW_WS = {"fut": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@forceOrder/btcusdt@depth20@100ms",
+FLOW_WS = {"fut": "wss://fstream.binance.com/stream?streams=btcusdt@depth20@100ms",                    # futures order book (public stream)
+           "futm": "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@forceOrder", # futures trades + liquidations ("market" streams moved here)
            "spot": "wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@depth20@100ms"}
 CB_WS = "wss://ws-feed.exchange.coinbase.com"
 flow_tr = {"fut": deque(maxlen=80000), "spot": deque(maxlen=40000)}     # (t, qty_btc, +1 buyer-initiated / -1 seller-initiated)
@@ -663,19 +664,20 @@ def flow_worker(venue):
             ws = websocket.create_connection(FLOW_WS[venue], timeout=10)
             ws.settimeout(30)
             log.info(f"flow {venue} connected")
+            vk = "fut" if venue.startswith("fut") else venue
             while True:
                 m = json.loads(ws.recv())
                 now = time.time()
                 st, d = m.get("stream", ""), m.get("data") or {}
                 if st.endswith("@aggTrade"):
-                    flow_tr[venue].append((now, float(d["q"]), -1 if d.get("m") else 1))
+                    flow_tr[vk].append((now, float(d["q"]), -1 if d.get("m") else 1))
                 elif st.endswith("@forceOrder"):
                     o = d.get("o") or {}
                     flow_liq.append((now, float(o.get("q", 0)) * float(o.get("ap") or o.get("p") or 0), 1 if o.get("S") == "BUY" else -1))
                 elif "@depth" in st:
                     b, a = d.get("b") or d.get("bids") or [], d.get("a") or d.get("asks") or []
                     sb = lambda L, n: sum(float(q) for _, q in L[:n])
-                    flow_dep[venue].append((now, sb(b, 10), sb(a, 10), sb(b, 20), sb(a, 20)))
+                    flow_dep[vk].append((now, sb(b, 10), sb(a, 10), sb(b, 20), sb(a, 20)))
                 flow_state["n"] += 1
         except Exception as e:
             flow_state["err"] = f"{venue}: {str(e)[:100]}"
