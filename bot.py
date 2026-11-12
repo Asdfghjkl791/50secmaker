@@ -229,14 +229,17 @@ def paused():
 
 
 def quiet():
-    return kv_get("quiet", "0") == "1"
+    return kv_get("quiet", "1") == "1"          # default: no per-trade messages, a table every 30 min instead (/quiet off to get them)
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────────
-def tg(msg):
+def tg(msg, pre=False):
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": TG_CHAT, "text": msg[:4000],
-                      "disable_web_page_preview": "true"}, timeout=15)
+        data = {"chat_id": TG_CHAT, "text": msg[:4000], "disable_web_page_preview": "true"}
+        if pre:                                   # fixed-width font so table columns line up
+            import html
+            data.update(text="<pre>" + html.escape(msg[:3900]) + "</pre>", parse_mode="HTML")
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=data, timeout=15)
     except Exception as e:
         log.warning(f"tg: {e}")
 
@@ -903,6 +906,44 @@ def check_trigger(a, venue, now):
         threading.Thread(target=on_move, args=(a, 2, venue, round(bps, 2), now), daemon=True).start()
 
 
+ENTRY_DELAY = 0.30     # seconds after a 2bp jump at which the ETH / 1h / 4h rules read the ask (matches their research data)
+
+
+def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
+    try:
+        if delay:
+            time.sleep(max(0.0, t0 + delay - time.time()))
+        tok, opp = (m["up"], m["dn"]) if up else (m["dn"], m["up"])
+        la = asks_of(tok, 1)
+        if not la:
+            return
+        a0, a0_ts = la[0][0], time.time()
+        bk_age = round(a0_ts - book_ts.get(tok, 0), 3)
+        left = o + tf * 60 - t0
+        for r in rules:
+            if r.tf != tf or (r.code, a, tf, o) in done:
+                continue
+            f = fu.get(r.fair)
+            if f is None:
+                continue
+            fv = f if up else 100 - f
+            gap = fv - a0
+            if not in_range(r, a0) or gap < r.gap:
+                continue
+            if (r.left_max is not None and left > r.left_max) or (r.left_min is not None and left < r.left_min):
+                continue
+            if r.conf == "filter" and not (m10 is not None and m10 >= 2):
+                continue
+            if r.trol and not (m2 is not None and m2 <= 1.15):
+                continue
+            ctx = dict(a=a, tf=tf, o=o, tok=tok, opp=opp, up=up, side="UP" if up else "DOWN", t0=t0, feed=feed, bps=bps, a0=a0,
+                       fair=round(fv, 2), gap=round(gap, 2), left=round(left, 1), m10=m10, m2=m2, cond=m.get("cond"),
+                       a0_ts=a0_ts, bk_age=bk_age, late=bool(delay))
+            threading.Thread(target=decide, args=(r, ctx), daemon=True).start()
+    except Exception as e:
+        _err("eval_market", e)
+
+
 def in_range(r, ask):
     return ask >= r.lo and (ask <= r.hi if r.hi_incl else ask < r.hi)
 
@@ -921,34 +962,12 @@ def on_move(a, trig, feed, bps, t0):
             return
         m10, m2 = lead_mean(a, t0, -10, sg), lead_mean(a, t0, -2, sg)
         for (a_, tf, o), m in mk:
-            tok, opp = (m["up"], m["dn"]) if up else (m["dn"], m["up"])
-            la = asks_of(tok, 1)
-            if not la:
-                continue
-            a0, a0_ts = la[0][0], time.time()
-            bk_age = round(a0_ts - book_ts.get(tok, 0), 3)
-            fu = fairs(a, tf, o, t0)
-            left = o + tf * 60 - t0
-            for r in rules:
-                if r.tf != tf or (r.code, a, tf, o) in done:
-                    continue
-                f = fu.get(r.fair)
-                if f is None:
-                    continue
-                fv = f if up else 100 - f
-                gap = fv - a0
-                if not in_range(r, a0) or gap < r.gap:
-                    continue
-                if (r.left_max is not None and left > r.left_max) or (r.left_min is not None and left < r.left_min):
-                    continue
-                if r.conf == "filter" and not (m10 is not None and m10 >= 2):
-                    continue
-                if r.trol and not (m2 is not None and m2 <= 1.15):
-                    continue
-                ctx = dict(a=a, tf=tf, o=o, tok=tok, opp=opp, up=up, side="UP" if up else "DOWN", t0=t0, feed=feed, bps=bps, a0=a0,
-                           fair=round(fv, 2), gap=round(gap, 2), left=round(left, 1), m10=m10, m2=m2, cond=m.get("cond"),
-                           a0_ts=a0_ts, bk_age=bk_age)
-                threading.Thread(target=decide, args=(r, ctx), daemon=True).start()
+            fu = fairs(a, tf, o, t0)                                     # fair from prices at the jump
+            if trig == 2:                                                 # ETH + 1h/4h rules: the recorder they were found on read the ask
+                threading.Thread(target=eval_market, args=(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, ENTRY_DELAY),
+                                 daemon=True).start()                     # ~0.3s after the jump (after Polymarket repriced), so we do too
+            else:
+                eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, 0.0)
     except Exception as e:
         _err("on_move", e)
 
@@ -959,7 +978,7 @@ def decide(r, c):
         t0 = c["t0"]
         threading.Thread(target=bump, args=(r.code, "pre"), daemon=True).start()
         a25 = None
-        if r.R or r.lc:
+        if (r.R and not c.get("late")) or (r.lc and not c.get("late")):
             time.sleep(max(0.0, t0 + 0.25 - time.time()))
             la = asks_of(c["tok"], 1)
             a25, a25_ts = (la[0][0] if la else None), time.time()
@@ -1095,7 +1114,7 @@ def risk_check(r, c, stk):
     today = dbq("SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (t_day,))[0]["s"]
     if today <= -DAILY_LOSS:
         kv_set("paused", f"paused: daily loss limit ${DAILY_LOSS:g} reached (today {money(today)})")
-        tg(f"🛑 Live trading PAUSED: today's live result is {money(today)} (limit ${DAILY_LOSS:g}). It stays paused until /resume.")
+        tg(f"🛑 Live trading PAUSED: today's live result is {money(today)} (limit ${DAILY_LOSS:g}). It stays paused until midnight, or /resume.")
         return paused()
     openp = [x for x in rows if x["status"] == "HOLDING"]
     if len(openp) >= MAX_OPEN:
@@ -1344,7 +1363,7 @@ def trades_text(n=12):
     for x in rows:
         t = datetime.fromtimestamp(x["t0"], TZ).strftime("%m-%d %H:%M:%S")
         res = money(x["pnl"]) if x["pnl"] is not None else x["status"].lower()
-        out.append(f"{t} {x['code']} {x['side']} ask {x['ask0']:g}¢" + (f" paid {x['buy_px']:.0f}¢" if x["buy_px"] else "") +
+        out.append(f"{t} {x['code']} {x['side']} ask {(x['ask0'] or 0):g}¢" + (f" paid {x['buy_px']:.0f}¢" if x["buy_px"] else "") +
                    (f" {x['lag']:.2f}s" if x["lag"] else "") + f" · {res}" + (f" · {x['note'][:60]}" if x["note"] and x["status"] in ("BLOCKED", "MISSED") else ""))
     return "\n".join(out)
 
@@ -1374,7 +1393,8 @@ HELP = """COMBO bot commands
 /edge [today|yday|week] — fill rate, speed, price vs paper
 /copiers — wallets buying right after us
 /export — CSV of every trade + copier log
-/quiet on|off — stop/start the per-trade messages
+/summary — the table for the last 30 min now · /summary 20 — every 20 min
+/quiet off|on — per-trade messages on/off (off by default)
 (cash alerts come by themselves: at $50, $100, $200, $500, $1000… and if cash drops 25% in a day)"""
 
 
@@ -1438,6 +1458,15 @@ def handle(text):
         tg(edge_text(*_range(args[0].lower() if args else "today")))
     elif cmd == "/trades":
         tg(trades_text(int(args[0]) if args and args[0].isdigit() else 12))
+    elif cmd == "/summary":
+        if args and args[0].isdigit() and 5 <= int(args[0]) <= 240:
+            kv_set("summary_min", args[0])
+            tg(f"summary every {args[0]} min")
+        else:
+            n = int(float(kv_get("summary_min", "30")))
+            now = time.time()
+            t_b = now
+            tg(summary_text(now - n * 60, now, n), pre=True)
     elif cmd == "/quiet":
         on_ = not args or args[0].lower() == "on"
         kv_set("quiet", "1" if on_ else "0")
@@ -1462,9 +1491,85 @@ def telegram_worker():
                     handle(m["text"])
                 except Exception as e:
                     tg(f"command error: {str(e)[:200]}")
+        except requests.exceptions.ReadTimeout:
+            pass
         except Exception as e:
             _err("telegram", e)
             time.sleep(5)
+
+
+def _f(x):
+    return f"{x:+.2f}"
+
+
+def summary_text(t_a, t_b, minutes):
+    lc = live_codes()
+    a_s = datetime.fromtimestamp(t_a, TZ).strftime("%-I:%M")
+    b_s = datetime.fromtimestamp(t_b, TZ).strftime("%-I:%M%p").lower()
+    head = f"📊 {a_s}–{b_s} · LIVE {'ON' if live_on() else 'OFF'} · ${stake():g}/trade" + (f"\n⛔ {paused()}" if paused() else "")
+    st_rows = dbq("SELECT * FROM trades WHERE settled_ts >= ? AND settled_ts < ? AND mode IN ('LIVE','PAPER')", (t_a, t_b))
+    act = dbq("SELECT * FROM trades WHERE t0 >= ? AND t0 < ? AND mode='LIVE'", (t_a, t_b))
+    seen_tw = {(x["code"], x["asset"], x["tf"], x["o"]) for x in dbq(
+        "SELECT code, asset, tf, o FROM trades WHERE p_cost1 > 0 AND settled_ts < ? AND settled_ts > ?", (t_a, t_a - 2 * 86400))}
+    L = [head, "", f"{'Rule':<5}{'Trades':>7}{'Won':>4}{'P&L':>7}{'Paper':>7}"]
+    T = [0, 0, 0.0, 0.0]
+    pap = []
+    for r in RULES:
+        rr = [x for x in st_rows if x["code"] == r.code]
+        live = [x for x in rr if x["mode"] == "LIVE" and (x["cost"] or 0) > 0 and x["pnl"] is not None]
+        tw, k_ = [], set()
+        for x in sorted(rr, key=lambda x: x["t0"]):
+            k = (x["code"], x["asset"], x["tf"], x["o"])
+            if (x["p_cost1"] or 0) > 0 and x["p_pnl1"] is not None and k not in k_ and k not in seen_tw:
+                k_.add(k)
+                tw.append(x)
+        pp = sum(x["p_pnl1"] for x in tw)
+        if r.code in lc:
+            n, w, pl = len(live), sum(x["won"] for x in live), sum(x["pnl"] for x in live)
+            L.append(f"{r.code:<5}{n:>7}{(w if n else '-'):>4}{(_f(pl) if n else '-'):>7}{(_f(pp) if tw else '-'):>7}")
+            T[0] += n; T[1] += w; T[2] += pl; T[3] += pp
+        else:
+            pap.append(f"{r.code} {len(tw)}/{sum(x['won'] for x in tw)} {_f(pp)}" if tw else f"{r.code} 0")
+    L.append(f"{'Total':<5}{T[0]:>7}{T[1]:>4}{_f(T[2]):>7}{_f(T[3]):>7}")
+    d0 = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    td = dbq("SELECT COUNT(*) n, COALESCE(SUM(won),0) w, COALESCE(SUM(pnl),0) s FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (d0,))[0]
+    op = dbq("SELECT COUNT(*) n, COALESCE(SUM(cost),0) c FROM trades WHERE mode='LIVE' AND status='HOLDING'")[0]
+    miss = [x for x in act if x["status"] == "MISSED"]
+    blk = [x for x in act if x["status"] == "BLOCKED"]
+    why = {}
+    for x in blk:
+        k = (x["note"] or "").split(" ")[0:2]
+        k = "cash floor" if "floor" in (x["note"] or "") else ("other side held" if "other side" in (x["note"] or "") else
+                                                                ("max open" if "already open" in (x["note"] or "") else (x["note"] or "")[:20]))
+        why[k] = why.get(k, 0) + 1
+    L += ["", f"Today: {td['n']} trades · {(100 * td['w'] / td['n']) if td['n'] else 0:.0f}% won · {money(td['s'])}",
+          f"Cash {'$%.2f' % st['balance'] if st['balance'] is not None else '?'} · open {op['n']} (${op['c']:.2f})",
+          f"Not filled {len(miss)} · skipped {len(blk)}" + (" (" + ", ".join(f"{k} {v}" for k, v in why.items()) + ")" if why else ""),
+          "", "Paper rules (at $1):"]
+    for i in range(0, len(pap), 3):
+        L.append(" · ".join(pap[i:i + 3]))
+    return "\n".join(L)
+
+
+def summary_worker():
+    """a table every N minutes (default 30, /summary 20 to change), at :00 and :30"""
+    last = None
+    while True:
+        try:
+            n = int(float(kv_get("summary_min", "30")))
+            slot = int(time.time() // (n * 60))
+            if last is None:
+                last = slot
+            elif slot != last:
+                last = slot
+                t_b = slot * n * 60
+                t_a = t_b - n * 60
+                busy = dbq("SELECT 1 FROM trades WHERE (settled_ts >= ? AND settled_ts < ?) OR (t0 >= ? AND t0 < ? AND mode='LIVE') LIMIT 1", (t_a, t_b, t_a, t_b))
+                if live_on() or busy:
+                    tg(summary_text(t_a, t_b, n), pre=True)
+        except Exception as e:
+            _err("summary", e)
+        time.sleep(15)
 
 
 def daily_worker():
@@ -1476,6 +1581,9 @@ def daily_worker():
                 kv_set("summary_day", d)
             if kv_get("summary_day") != d and datetime.now(TZ).minute >= 1:
                 kv_set("summary_day", d)
+                if paused().startswith("paused: daily loss"):
+                    kv_set("paused", "")
+                    tg("🌅 new day: the daily loss pause is cleared, live trading continues.")
                 tg(pnl_text(*_range("yday")))
                 tg(edge_text(*_range("yday")))
                 if dbq("SELECT 1 FROM trades WHERE mode='LIVE' AND cost > 0 LIMIT 1"):
@@ -1493,7 +1601,7 @@ def main():
     if LIVE_START and kv_get("live_on") is None:
         kv_set("live_on", "1")
     workers = [market_worker, open_worker, pm_worker, chainlink_worker, twap_feed_worker, deribit_worker, settler, balance_worker,
-               copier_worker, telegram_worker, daily_worker, warm_worker]
+               copier_worker, telegram_worker, daily_worker, warm_worker, summary_worker]
     for fn in workers:
         threading.Thread(target=fn, daemon=True, name=fn.__name__).start()
     for v in ("vis", "spot", "fut"):
