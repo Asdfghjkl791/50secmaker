@@ -13,8 +13,7 @@
 #     TR5  BTC D5-TR 30-90 · TROL BTC D-15TROL · L15 BTC D-15L · H4 BTC H4-LS · ELS5 ETH D5-LS · EH4C ETH H4-LS-C
 #   "R check" = the ask 0.25s after the jump is at most 1c above the ask at the jump. One trade per rule per market.
 #
-# Safety: starts with live OFF · stake capped by MAX_STAKE · daily loss stop · balance floor · max open trades · never takes the
-# other side of a market it holds · skips when price or Polymarket data is stale · pauses after 3 order errors in a row.
+# Safety: starts with live OFF · stake capped by MAX_STAKE · daily loss stop · balance floor · max open trades · one trade per rule per market · skips when price or Polymarket data is stale · pauses after 3 order errors in a row.
 # Tracking: every trade has a paper twin (what the paper rule would have paid), timing (jump -> order -> answer), copier log
 # (wallets that buy the same side right after us), daily summary at midnight Toronto time.
 #
@@ -1150,8 +1149,7 @@ def risk_check(r, c, stk):
     openp = [x for x in rows if x["status"] == "HOLDING"]
     if len(openp) >= MAX_OPEN:
         return f"{len(openp)} trades already open (max {MAX_OPEN})"
-    if any(x["asset"] == c["a"] and x["tf"] == c["tf"] and x["o"] == c["o"] and x["side"] != c["side"] for x in openp):
-        return "we already hold the other side of this market"
+    # (Nov 12: the "other side held" block was removed - each rule now trades exactly as it was tested; one trade per rule per market)
     bal = st["balance"]
     if bal is not None and time.time() - st["balance_ts"] < 300 and bal < max(MIN_BALANCE, stk):
         return f"cash ${bal:.2f} below the floor ${MIN_BALANCE:g}"
