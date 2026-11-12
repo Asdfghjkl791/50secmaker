@@ -846,6 +846,22 @@ def cl_now(a, t):
     return v * b1 / b0 if b0 and b1 else v
 
 
+def cl_now_1s(a, t):
+    """the BTC 5m/15m research (50secmaker) brought Chainlink up to now with Binance's 1-SECOND samples, so a jump in the last
+    second was usually not in its fair yet. The BTC 5m/15m rules' edges were measured on that fair, so we compute it the same way."""
+    x = None
+    for item in reversed(cl[a]):
+        if item[1] <= t:
+            x = item
+            break
+    if not x:
+        return None
+    ts, rt, v = x
+    s = [p for p in list(px1s[a]) if p[0] <= t]
+    b0 = next((p for tt, p in reversed(s) if tt <= rt), None)
+    return v * s[-1][1] / b0 if (s and b0) else v
+
+
 def tw_strike(a, tf, o):
     d = opens.get((a, tf, o)) or {}
     if d.get("tw"):
@@ -863,7 +879,7 @@ def fairs(a, tf, o, t):
         return out
     op = opens.get((a, tf, o)) or {}
     vols = {"o": sigma(a), "d": sigma_iv(a, tf)}
-    pb, pc = last(a, "vis", t), cl_now(a, t)
+    pb, pc = last(a, "vis", t), (cl_now_1s(a, t) if (a == "BTC" and tf in (5, 15)) else cl_now(a, t))
     k, _ = tw_strike(a, tf, o)
     A, B = e - 62, e - 3
     known = [v for ts, rt, v in list(cl[a]) if A <= ts <= t] if t > A else []
