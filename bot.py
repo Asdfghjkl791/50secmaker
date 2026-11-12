@@ -101,6 +101,7 @@ iv50 = {"ts": 0, "iv": None}                          # 50secmaker method (BTC 5
 markets = {}                                 # (asset, tf, o) -> {"up", "dn", "cond", "slug"}
 opens = {}                                   # (asset, tf, o) -> {"bn", "cl", "tw"}
 books = {}                                   # token -> {"asks": {c: sz}, "bids": {c: sz}}
+book_ts = {}                                 # token -> time of its last book update (to spot stale books)
 st = {"started": time.time(), "pm_msg": 0.0, "moves2": 0, "moves3": 0, "signals": 0, "err": {}, "errors_in_row": 0,
       "balance": None, "balance_ts": 0}
 last2, last3 = {}, {}
@@ -165,6 +166,11 @@ def init_db():
         p_cost1 REAL, p_sh1 REAL, p_cost100 REAL, p_sh100 REAL, p_px REAL,
         outcome TEXT, won INTEGER, pnl REAL, p_pnl1 REAL, p_pnl100 REAL, settled_ts REAL, copy_checked INTEGER DEFAULT 0)""")
     dbx("CREATE INDEX IF NOT EXISTS trades_t0 ON trades (t0)")
+    for col in ("bk_age REAL", "a0_ts REAL", "a25_ts REAL"):
+        try:
+            dbx(f"ALTER TABLE trades ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
     dbx("""CREATE TABLE IF NOT EXISTS copiers (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, ts REAL, wallet TEXT, name TEXT,
         delay REAL, size REAL, price REAL)""")
     dbx("CREATE TABLE IF NOT EXISTS stats (day TEXT, code TEXT, k TEXT, n INTEGER, PRIMARY KEY (day, code, k))")
@@ -694,11 +700,13 @@ def pm_handle(data):
         et = m.get("event_type")
         with lock:
             if et == "book":
+                book_ts[str(m.get("asset_id"))] = st["pm_msg"]
                 books[str(m.get("asset_id"))] = {"bids": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])},
                                                  "asks": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}}
             elif et == "price_change":
                 for ch in (m.get("price_changes") or m.get("changes") or []):
                     tok = str(ch.get("asset_id") or m.get("asset_id"))
+                    book_ts[tok] = st["pm_msg"]
                     b = books.setdefault(tok, {"bids": {}, "asks": {}})
                     lvl = b["bids"] if str(ch.get("side", "")).upper() == "BUY" else b["asks"]
                     p, sz = round(float(ch["price"]) * 100, 3), float(ch.get("size", 0))
@@ -910,7 +918,8 @@ def on_move(a, trig, feed, bps, t0):
             la = asks_of(tok, 1)
             if not la:
                 continue
-            a0 = la[0][0]
+            a0, a0_ts = la[0][0], time.time()
+            bk_age = round(a0_ts - book_ts.get(tok, 0), 3)
             fu = fairs(a, tf, o, t0)
             left = o + tf * 60 - t0
             for r in rules:
@@ -930,7 +939,8 @@ def on_move(a, trig, feed, bps, t0):
                 if r.trol and not (m2 is not None and m2 <= 1.15):
                     continue
                 ctx = dict(a=a, tf=tf, o=o, tok=tok, opp=opp, up=up, side="UP" if up else "DOWN", t0=t0, feed=feed, bps=bps, a0=a0,
-                           fair=round(fv, 2), gap=round(gap, 2), left=round(left, 1), m10=m10, m2=m2, cond=m.get("cond"))
+                           fair=round(fv, 2), gap=round(gap, 2), left=round(left, 1), m10=m10, m2=m2, cond=m.get("cond"),
+                           a0_ts=a0_ts, bk_age=bk_age)
                 threading.Thread(target=decide, args=(r, ctx), daemon=True).start()
     except Exception as e:
         _err("on_move", e)
@@ -945,9 +955,13 @@ def decide(r, c):
         if r.R or r.lc:
             time.sleep(max(0.0, t0 + 0.25 - time.time()))
             la = asks_of(c["tok"], 1)
-            a25 = la[0][0] if la else None
+            a25, a25_ts = (la[0][0] if la else None), time.time()
             if a25 is None or a25 - c["a0"] > 1:
                 bump(r.code, "r_fail")
+                dbx("INSERT INTO trades (code, rule, asset, tf, o, side, mode, status, t0, feed, bps, ask0, a25, fair, gap, left_s, m10, m2, bk_age, a0_ts, a25_ts, note) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (r.code, r.name, c["a"], c["tf"], c["o"], c["side"], "RFAIL", "RFAIL", t0, c["feed"], c["bps"], c["a0"], a25, c["fair"], c["gap"],
+                     c["left"], c["m10"], c["m2"], c["bk_age"], c["a0_ts"], a25_ts, "R check failed (diagnostic row, never traded)"))
                 return
         if r.conf == "first":                       # first signal that passes decides the market; trade it only if confirmed
             with dlock:
@@ -987,10 +1001,10 @@ def decide(r, c):
                     ok, resp, note = False, {}, f"error: {str(e)[:150]}"
         lag = ((tim.get("resp") or time.time()) - t0) if tim else None
         rid = dbx("INSERT INTO trades (code, rule, asset, tf, o, side, mode, status, t0, feed, bps, ask0, a25, fair, gap, left_s, m10, m2, p05, cap, stake, token, cond, "
-                  "t_sent, t_resp, lag) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "t_sent, t_resp, lag, bk_age, a0_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (r.code, r.name, c["a"], c["tf"], c["o"], c["side"], "LIVE" if live else "PAPER", "SIGNAL", t0, c["feed"], c["bps"], c["a0"], a25,
                    c["fair"], c["gap"], c["left"], c["m10"], c["m2"], p05, cap, stk if live else 1.0, c["tok"], c["cond"],
-                   tim.get("sent"), tim.get("resp"), lag))
+                   tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"]))
         st["signals"] += 1
         threading.Thread(target=paper_twin, args=(r, c, rid, cap, live, key), daemon=True).start()
         if not live:
@@ -1263,7 +1277,7 @@ def edge_text(t_from, t_to, label):
         pre, rf = s.get("pre", 0), s.get("r_fail", 0)
         lines.append(f"{r.code}: filled {len(fil)}/{len(att)}" + (f" · median {lags[len(lags) // 2]:.2f}s jump→answer" if lags else "")
                      + (f" · paid {sum(slip) / len(slip):+.1f}¢ vs paper" if slip else "") + (f" · {100 * sum(part) / len(part):.0f}% of stake filled" if part else "")
-                     + (f" · R-check fails {rf}/{pre}" if pre else ""))
+                     + (f" · R-check fails {rf}/{pre}" if pre and (r.R or r.lc) else (f" · {pre} signals" if pre else "")))
     return "\n".join(lines)
 
 
