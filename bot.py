@@ -895,7 +895,9 @@ def check_trigger(a, venue, now):
     if now - _chk.get((a, venue), 0) < 0.05:
         return
     _chk[(a, venue)] = now
-    if abs(bps) >= 2 and now - last2.get((a, sg), 0) >= 10:               # ETH + 1h/4h rules: 2bp jump on any Binance feed
+    if venue == "fut":                                                      # ETH + 1h/4h rules were found on jumps seen by the spot feeds
+        return                                                              # (the recorder's futures feed ran ~1.5s late), so futures don't count here
+    if abs(bps) >= 2 and now - last2.get((a, sg), 0) >= 10:               # ETH + 1h/4h rules: 2bp jump on Binance spot / spot mirror
         last2[(a, sg)] = now
         st["moves2"] += 1
         threading.Thread(target=on_move, args=(a, 2, venue, round(bps, 2), now), daemon=True).start()
