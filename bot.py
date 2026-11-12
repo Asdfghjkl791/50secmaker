@@ -722,37 +722,63 @@ def pm_handle(data):
                         lvl[p] = sz
 
 
-def pm_worker():
-    while True:
+pm_gen = {"n": 0, "retired": set()}
+
+
+def pm_conn(toks, gen, slot):
+    """one Polymarket book connection for a fixed set of markets; reconnects at once if the server drops it (it does, every few minutes)"""
+    fails = 0
+    while gen not in pm_gen["retired"]:
         try:
-            with lock:
-                toks = tuple(sorted(t for v in markets.values() for t in (v["up"], v["dn"])))
-            if not toks:
-                time.sleep(2)
-                continue
             ws = websocket.create_connection(PM_WS, timeout=10)
             ws.settimeout(15)
             ws.send(json.dumps({"assets_ids": list(toks), "type": "market"}))
             lp = time.time()
-            cur = toks
-            while True:
+            fails = 0
+            while gen not in pm_gen["retired"]:
                 if time.time() - lp > 10:
                     ws.send("PING")
                     lp = time.time()
-                    with lock:
-                        cur = tuple(sorted(t for v in markets.values() for t in (v["up"], v["dn"])))
-                    if cur != toks:
-                        break
                 raw = ws.recv()
                 if raw and raw[0] in "{[":
                     pm_handle(json.loads(raw))
             ws.close()
-            with lock:
-                for t in [t for t in books if t not in set(cur)]:
-                    books.pop(t, None)
         except Exception as e:
-            _err("pm", e)
-            time.sleep(2)
+            if gen in pm_gen["retired"]:
+                return
+            fails += 1
+            st["pm_drops"] = st.get("pm_drops", 0) + 1
+            if fails >= 3:
+                _err("pm", e)
+            time.sleep(0.05 if fails < 3 else 2)
+
+
+def pm_worker():
+    """keeps TWO book connections open (if one drops, the other keeps the prices fresh). When the list of markets changes,
+    the new pair is opened first and the old pair is closed 3s later, so there is never a gap."""
+    cur = None
+    while True:
+        try:
+            with lock:
+                toks = tuple(sorted(t for v in markets.values() for t in (v["up"], v["dn"])))
+            if toks and toks != cur:
+                old = pm_gen["n"]
+                pm_gen["n"] += 1
+                for slot in (0, 1):
+                    threading.Thread(target=pm_conn, args=(toks, pm_gen["n"], slot), daemon=True).start()
+                if cur is not None:
+                    time.sleep(3)
+                    pm_gen["retired"].add(old)
+                cur = toks
+            if cur:
+                with lock:
+                    keep = set(cur)
+                    for t in [t for t in books if t not in keep]:
+                        books.pop(t, None)
+                        book_ts.pop(t, None)
+        except Exception as e:
+            _err("pm_worker", e)
+        time.sleep(1)
 
 
 def asks_of(tok, n=12):
@@ -890,7 +916,7 @@ def check_trigger(a, venue, now):
         return
     bps = (p1 / p0 - 1) * 1e4
     sg = 1 if bps > 0 else -1
-    if a == "BTC" and venue in ("spot", "fut") and abs(bps) >= 3:          # BTC 5m/15m rules: 3bp jump on Binance spot/futures
+    if a == "BTC" and abs(bps) >= 3:                                        # BTC 5m/15m rules: 3bp jump on any Binance feed (as in their research)
         if now - last3.get(sg, 0) >= 10:
             last3[sg] = now
             st["moves3"] += 1
@@ -914,6 +940,9 @@ def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
         if delay:
             time.sleep(max(0.0, t0 + delay - time.time()))
         tok, opp = (m["up"], m["dn"]) if up else (m["dn"], m["up"])
+        if time.time() - st["pm_msg"] > 3:            # no Polymarket data for 3s: prices can't be trusted, skip (paper too)
+            bump("ALL", "pm_stale")
+            return
         la = asks_of(tok, 1)
         if not la:
             return
@@ -1072,6 +1101,8 @@ def decide(r, c):
         if cost <= 0 or shares <= 0:
             cost, shares = stk, stk / (cap / 100)
         bpx = cost / shares * 100
+        if st["balance"] is not None:
+            st["balance"] -= cost                   # keep our cash figure current between the 60s balance checks
         bump(r.code, "filled")
         dbx("UPDATE trades SET status='HOLDING', cost=?, shares=?, buy_px=? WHERE id=?", (cost, shares, bpx, rid))
         if not quiet():
@@ -1339,7 +1370,8 @@ def status_text():
              f"live rules: {', '.join(sorted(lc)) or 'none'}",
              f"cash: {'$%.2f' % st['balance'] if st['balance'] is not None else 'unknown (no key)'} · open live trades {op['n']} (${op['c']:.2f}) · today live {money(td['s'])} ({td['n']} settled)",
              f"jumps seen: {st['moves3']} BTC 3bp · {st['moves2']} 2bp · signals {st['signals']} · markets {len(markets)} · PM data {now - st['pm_msg']:.0f}s old"
-             + (f" · clock vs Binance {st['fut_lag']:+.3f}s" if st.get("fut_lag") is not None else "")]
+             + (f" · clock vs Binance {st['fut_lag']:+.3f}s" if st.get("fut_lag") is not None else "")
+             + f" · book reconnects {st.get('pm_drops', 0)}"]
     for a in ASSETS:
         lines.append(f"{a}: binance {age(a, 'vis')}/{age(a, 'spot')}/{age(a, 'fut')} · others " + " ".join(f"{v} {age(a, v)}" for v in LEAD_V)
                      + f" · chainlink {age(a, 'cl')} · twap feed {'%.0fs' % (now - tw_feed[a][-1][0]) if tw_feed[a] else 'none'} · deribit iv {ivs[a].get('iv')}"
