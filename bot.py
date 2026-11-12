@@ -96,7 +96,8 @@ px = {a: {} for a in ASSETS}                 # px[asset][venue] = deque((t, mid)
 px1s = {a: deque(maxlen=4000) for a in ASSETS}
 cl = {a: deque(maxlen=20000) for a in ASSETS}          # (chainlink_ts, received_ts, value)
 tw_feed = {a: deque(maxlen=20000) for a in ASSETS}     # Polymarket 60s TWAP feed (ts, value)
-ivs = {a: {"ts": 0, "iv": None} for a in ASSETS}
+ivs = {a: {"ts": 0, "iv": None} for a in ASSETS}   # recorder method (ETH rules, BTC 1h/4h)
+iv50 = {"ts": 0, "iv": None}                          # 50secmaker method (BTC 5m/15m rules were found with this one)
 markets = {}                                 # (asset, tf, o) -> {"up", "dn", "cond", "slug"}
 opens = {}                                   # (asset, tf, o) -> {"bn", "cl", "tw"}
 books = {}                                   # token -> {"asks": {c: sz}, "bids": {c: sz}}
@@ -663,6 +664,14 @@ def deribit_worker():
                         continue
                     if e > t and F > 0:
                         by.setdefault(e, []).append((K, F, float(x["mark_iv"])))
+                if a == "BTC":                          # nearest expiry >= 2h away, up to 4 strikes within 3% of the price
+                    far = [e for e in by if e - t >= 7200]
+                    if far:
+                        e = min(far)
+                        F = by[e][0][1]
+                        allp = sorted((abs(K / F - 1), iv) for K, F_, iv in by[e])
+                        pts = [x for x in allp if x[0] <= 0.03][:4] or allp[:2]
+                        iv50.update(ts=t, iv=round(sum(v for _, v in pts) / len(pts), 2))
                 for e in sorted(by)[:3]:
                     if (e - t) / 3600 < 1 and len(by) > 1:
                         continue
@@ -765,8 +774,8 @@ def sigma(a):
     return max(2e-5, math.sqrt(sum(r) / len(r))) if len(r) >= 30 else None
 
 
-def sigma_iv(a):
-    d = ivs.get(a) or {}
+def sigma_iv(a, tf=None):
+    d = iv50 if (a == "BTC" and tf in (5, 15)) else (ivs.get(a) or {})
     if not d.get("iv") or time.time() - d["ts"] > 600:
         return None
     return d["iv"] / 100 / math.sqrt(365 * 86400)
@@ -814,7 +823,7 @@ def fairs(a, tf, o, t):
     if left <= 0:
         return out
     op = opens.get((a, tf, o)) or {}
-    vols = {"o": sigma(a), "d": sigma_iv(a)}
+    vols = {"o": sigma(a), "d": sigma_iv(a, tf)}
     pb, pc = last(a, "vis", t), cl_now(a, t)
     k, _ = tw_strike(a, tf, o)
     A, B = e - 62, e - 3
@@ -1117,11 +1126,32 @@ def settler():
         time.sleep(20)
 
 
+ALERT_UP = (50, 100, 200, 300, 500, 1000, 2000, 5000, 10000)      # cash levels worth a message (10x the next stake step)
+
+
+def balance_alerts(bal):
+    try:
+        hi = float(kv_get("alert_hi", "0"))
+        lvl = max([x for x in ALERT_UP if bal >= x] or [0])
+        if lvl > hi:
+            kv_set("alert_hi", lvl)
+            if hi > 0 or lvl > 0:
+                tg(f"💰 cash reached ${bal:.2f} (passed ${lvl:g}). Your 10x rule: stakes up to ${lvl / 10:g} are OK now (/stake, MAX_STAKE).")
+        start = float(kv_get("bal_start", "0") or 0)
+        warned = kv_get("alert_lo_day") == day_str()
+        if start >= 5 and bal < start * 0.75 and not warned:
+            kv_set("alert_lo_day", day_str())
+            tg(f"📉 cash ${bal:.2f}, down {100 * (1 - bal / start):.0f}% from today's start (${start:.2f}).")
+    except Exception as e:
+        _err("alerts", e)
+
+
 def balance_worker():
     while True:
         if POLY_PRIVATE_KEY:
             try:
                 st["balance"], st["balance_ts"] = usdc_balance(), time.time()
+                balance_alerts(st["balance"])
                 d = day_str()
                 if kv_get("bal_day") != d:
                     kv_set("bal_day", d)
@@ -1271,7 +1301,8 @@ def status_text():
              f"jumps seen: {st['moves3']} BTC 3bp · {st['moves2']} 2bp · signals {st['signals']} · markets {len(markets)} · PM data {now - st['pm_msg']:.0f}s old"]
     for a in ASSETS:
         lines.append(f"{a}: binance {age(a, 'vis')}/{age(a, 'spot')}/{age(a, 'fut')} · others " + " ".join(f"{v} {age(a, v)}" for v in LEAD_V)
-                     + f" · chainlink {age(a, 'cl')} · twap feed {'%.0fs' % (now - tw_feed[a][-1][0]) if tw_feed[a] else 'none'} · deribit iv {ivs[a].get('iv')}")
+                     + f" · chainlink {age(a, 'cl')} · twap feed {'%.0fs' % (now - tw_feed[a][-1][0]) if tw_feed[a] else 'none'} · deribit iv {ivs[a].get('iv')}"
+                     + (f" (5m/15m: {iv50.get('iv')})" if a == "BTC" else ""))
     if st["err"]:
         lines.append("last errors: " + " | ".join(f"{k}: {v}" for k, v in list(st["err"].items())[-5:]))
     return "\n".join(lines)
@@ -1320,7 +1351,8 @@ HELP = """COMBO bot commands
 /edge [today|yday|week] — fill rate, speed, price vs paper
 /copiers — wallets buying right after us
 /export — CSV of every trade + copier log
-/quiet on|off — stop/start the per-trade messages"""
+/quiet on|off — stop/start the per-trade messages
+(cash alerts come by themselves: at $50, $100, $200, $500, $1000… and if cash drops 25% in a day)"""
 
 
 def handle(text):
