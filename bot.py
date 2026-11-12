@@ -173,6 +173,7 @@ def init_db():
             pass
     dbx("""CREATE TABLE IF NOT EXISTS copiers (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, ts REAL, wallet TEXT, name TEXT,
         delay REAL, size REAL, price REAL)""")
+    dbx("CREATE TABLE IF NOT EXISTS moves (t0 REAL, asset TEXT, trig INTEGER, feed TEXT, bps REAL, fut_lag REAL)")
     dbx("CREATE TABLE IF NOT EXISTS stats (day TEXT, code TEXT, k TEXT, n INTEGER, PRIMARY KEY (day, code, k))")
     dbx("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
 
@@ -516,6 +517,8 @@ def binance_book_worker(venue):
             return
         now = time.time()
         p = (float(d["b"]) + float(d["a"])) / 2
+        if venue == "fut" and d.get("E"):
+            st["fut_lag"] = round(now - float(d["E"]) / 1000, 3)     # our clock minus Binance's (network delay + clock offset)
         _push(a, venue, p, now, every=0.02)
         if venue == "vis" and (not px1s[a] or now - px1s[a][-1][0] >= 1):
             px1s[a].append((now, p))
@@ -904,6 +907,8 @@ def in_range(r, ask):
 
 def on_move(a, trig, feed, bps, t0):
     try:
+        threading.Thread(target=dbx, args=("INSERT INTO moves (t0, asset, trig, feed, bps, fut_lag) VALUES (?,?,?,?,?,?)",
+                                          (t0, a, trig, feed, bps, st.get("fut_lag"))), daemon=True).start()
         sg = 1 if bps > 0 else -1
         up = sg > 0
         rules = [r for r in RULES if r.asset == a and r.trig == trig]
@@ -1312,7 +1317,8 @@ def status_text():
              f"stake ${stake():g} (max ${MAX_STAKE:g}) · daily loss stop ${DAILY_LOSS:g} · cash floor ${MIN_BALANCE:g} · max open {MAX_OPEN}",
              f"live rules: {', '.join(sorted(lc)) or 'none'}",
              f"cash: {'$%.2f' % st['balance'] if st['balance'] is not None else 'unknown (no key)'} · open live trades {op['n']} (${op['c']:.2f}) · today live {money(td['s'])} ({td['n']} settled)",
-             f"jumps seen: {st['moves3']} BTC 3bp · {st['moves2']} 2bp · signals {st['signals']} · markets {len(markets)} · PM data {now - st['pm_msg']:.0f}s old"]
+             f"jumps seen: {st['moves3']} BTC 3bp · {st['moves2']} 2bp · signals {st['signals']} · markets {len(markets)} · PM data {now - st['pm_msg']:.0f}s old"
+             + (f" · clock vs Binance {st['fut_lag']:+.3f}s" if st.get("fut_lag") is not None else "")]
     for a in ASSETS:
         lines.append(f"{a}: binance {age(a, 'vis')}/{age(a, 'spot')}/{age(a, 'fut')} · others " + " ".join(f"{v} {age(a, v)}" for v in LEAD_V)
                      + f" · chainlink {age(a, 'cl')} · twap feed {'%.0fs' % (now - tw_feed[a][-1][0]) if tw_feed[a] else 'none'} · deribit iv {ivs[a].get('iv')}"
@@ -1343,7 +1349,8 @@ def trades_text(n=12):
 
 def export():
     rows = dbq("SELECT * FROM trades ORDER BY id")
-    for name, rs in (("combo_trades.csv.gz", rows), ("combo_copiers.csv.gz", dbq("SELECT * FROM copiers ORDER BY id"))):
+    mv = dbq("SELECT * FROM moves WHERE t0 > ? ORDER BY t0", (time.time() - 3 * 86400,))
+    for name, rs in (("combo_trades.csv.gz", rows), ("combo_copiers.csv.gz", dbq("SELECT * FROM copiers ORDER BY id")), ("combo_moves.csv.gz", mv)):
         if not rs:
             continue
         buf = io.StringIO()
