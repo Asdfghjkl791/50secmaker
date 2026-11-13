@@ -66,7 +66,7 @@ LEAD_V = ("bybit", "okx", "hl", "kraken", "bitstamp", "cb")
 # ── the rules ────────────────────────────────────────────────────────────────────
 class Rule:
     def __init__(self, code, name, asset, tf, trig, fair, gap, lo, hi, hi_incl=True, R=False, left_max=None, left_min=None,
-                 conf=None, trol=False, lc=False, cap=10, live=False):
+                 conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False):
         self.__dict__.update(locals())
         del self.__dict__["self"]
 
@@ -85,6 +85,12 @@ RULES = [
     Rule("H4", "BTC H4-LS", "BTC", 240, 2, "tw_d", 10, 10, 30, hi_incl=False, R=True, cap=15),
     Rule("ELS5", "ETH D5-LS", "ETH", 5, 2, "tw_d", 10, 10, 30, hi_incl=False, R=True, left_max=150, cap=20),
     Rule("EH4C", "ETH H4-LS-C", "ETH", 240, 2, "tw_d", 10, 10, 30, hi_incl=False, R=True, conf="first", cap=10),
+    # Nov 13 (paper): found on the worker's REAL-TIME early2 data. ETH 5m, 2bp jump, Binance-candle fair (Deribit vol) - ask >= 5c,
+    # ask 30-95c, and Binance keeps going >= 1bp further our way within 0.5s. Ask read at the jump (no 0.3s delay), order at ~0.5s.
+    Rule("EBC5", "ETH D5-BC", "ETH", 5, 2, "bn_d", 5, 30, 95, bc=1.0, early=True, cap=10),
+    # Nov 13 (paper): BTC 15m long shot from real-time early2 data. 2bp BTC jump, Binance-candle fair (Deribit vol) - ask >= 10c,
+    # ask 10-30c, no R check, ask read at the jump. Held up even with the order book 2s after the jump.
+    Rule("BLS15", "BTC D-15LS2", "BTC", 15, 2, "bn_d", 10, 10, 30, hi_incl=False, early=True, cap=10),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
@@ -1099,8 +1105,13 @@ def on_move(a, trig, feed, bps, t0):
         for (a_, tf, o), m in mk:
             fu = fairs(a, tf, o, t0)                                     # fair from prices at the jump
             if trig == 2:                                                 # ETH + 1h/4h rules: the recorder they were found on read the ask
-                threading.Thread(target=eval_market, args=(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, ENTRY_DELAY),
-                                 daemon=True).start()                     # ~0.3s after the jump (after Polymarket repriced), so we do too
+                late_r = [r for r in rules if not r.early]
+                now_r = [r for r in rules if r.early]                   # rules found on real-time data read the ask at the jump
+                if late_r:
+                    threading.Thread(target=eval_market, args=(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, late_r, ENTRY_DELAY),
+                                     daemon=True).start()                 # ~0.3s after the jump (after Polymarket repriced), so we do too
+                if now_r:
+                    eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, now_r, 0.0)
             else:
                 eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, 0.0)
     except Exception as e:
@@ -1143,6 +1154,18 @@ def decide(r, c):
             if p05 is None or p05 <= 0.1:
                 bump(r.code, "lc_fail")
                 return
+        if r.bc is not None:                         # Binance must keep going our way by >= bc bp within 0.5s of the jump
+            time.sleep(max(0.0, t0 + 0.5 - time.time()))
+            sg_ = 1 if c["up"] else -1
+            p0, p1 = last(c["a"], "vis", t0), last(c["a"], "vis", t0 + 0.5)
+            cont = (p1 / p0 - 1) * 1e4 * sg_ if (p0 and p1) else None
+            if cont is None or cont < r.bc:
+                bump(r.code, "bc_fail")
+                return
+            la = asks_of(c["tok"], 1)
+            if not la:
+                return
+            a25 = la[0][0]                           # the price we actually face now; the limit is set from it
         with dlock:
             if key in done and r.conf != "first":
                 return
