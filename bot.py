@@ -173,6 +173,9 @@ def init_db():
     dbx("""CREATE TABLE IF NOT EXISTS copiers (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, ts REAL, wallet TEXT, name TEXT,
         delay REAL, size REAL, price REAL)""")
     dbx("CREATE TABLE IF NOT EXISTS moves (t0 REAL, asset TEXT, trig INTEGER, feed TEXT, bps REAL, fut_lag REAL)")
+    dbx("CREATE TABLE IF NOT EXISTS rec (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, asset TEXT, trig INTEGER, tf INTEGER, o INTEGER, up INTEGER, data BLOB)")
+    dbx("CREATE INDEX IF NOT EXISTS rec_t0 ON rec (t0)")
+    dbx("CREATE TABLE IF NOT EXISTS outcomes (asset TEXT, tf INTEGER, o INTEGER, outcome TEXT, PRIMARY KEY (asset, tf, o))")
     dbx("CREATE TABLE IF NOT EXISTS stats (day TEXT, code TEXT, k TEXT, n INTEGER, PRIMARY KEY (day, code, k))")
     dbx("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
 
@@ -992,10 +995,98 @@ def in_range(r, ask):
     return ask >= r.lo and (ask <= r.hi if r.hi_incl else ask < r.hi)
 
 
+REC_OFFS = (0.0, 0.25, 0.5, 1.0, 2.0)
+
+
+def rec_capture(a, trig, feed, bps, t0):
+    """light research recorder (Nov 13): for EVERY jump, every live market of that coin: all fair prices at the jump, other-exchange
+    moves, and both sides' order books at 0 / 0.25 / 0.5 / 1 / 2 s. Same real-time numbers the trading uses. Never trades."""
+    try:
+        import zlib
+        sg = 1 if bps > 0 else -1
+        with lock:
+            mk = [(k, dict(v)) for k, v in markets.items() if k[0] == a and k[2] <= t0 < k[2] + k[1] * 60]
+        if not mk:
+            return
+        base = {"bps": bps, "feed": feed, "m10": lead_mean(a, t0, -10, sg), "m2": lead_mean(a, t0, -2, sg),
+                "vis0": last(a, "vis", t0), "sig": sigma(a), "iv": (ivs.get(a) or {}).get("iv"), "iv50": iv50.get("iv") if a == "BTC" else None}
+        per = {}
+        for (a_, tf, o), m in mk:
+            fu = fairs(a, tf, o, t0)
+            if a == "BTC" and tf in (5, 15):                           # also keep the tick-price version of the TWAP fair
+                pc = cl_now(a, t0)
+                k, _ = tw_strike(a, tf, o)
+                fu["tw_tick_ref"] = round(pc / k * 1e4 - 1e4, 3) if (pc and k) else None
+            k, src = tw_strike(a, tf, o)
+            per[(tf, o)] = {"fair": fu, "left": round(o + tf * 60 - t0, 2), "k": k, "ksrc": src, "bn": (opens.get((a, tf, o)) or {}).get("bn"),
+                            "up_tok": m["up"], "dn_tok": m["dn"], "s": {}}
+        for off in REC_OFFS:
+            time.sleep(max(0.0, t0 + off - time.time()))
+            with lock:
+                for (tf, o), d in per.items():
+                    snap = {}
+                    for side, tok in (("u", d["up_tok"]), ("d", d["dn_tok"])):
+                        b = books.get(tok) or {}
+                        snap[side + "a"] = sorted((p, round(z, 1)) for p, z in (b.get("asks") or {}).items() if p < 100)[:5]
+                        snap[side + "b"] = sorted(((p, round(z, 1)) for p, z in (b.get("bids") or {}).items()), reverse=True)[:3]
+                    d["s"][f"{off:g}"] = snap
+        base.update(p05=lead_mean(a, t0, 0.5, sg), p1=lead_mean(a, t0, 1.0, sg), vis05=last(a, "vis", t0 + 0.5),
+                    vis1=last(a, "vis", t0 + 1.0), vis2=last(a, "vis", t0 + 2.0), pm_age=round(time.time() - st["pm_msg"], 2))
+        for (tf, o), d in per.items():
+            d.pop("up_tok"), d.pop("dn_tok")
+            blob = zlib.compress(json.dumps({**base, **d}, separators=(",", ":")).encode())
+            dbx("INSERT INTO rec (t0, asset, trig, tf, o, up, data) VALUES (?,?,?,?,?,?,?)", (t0, a, trig, tf, o, 1 if sg > 0 else 0, blob))
+    except Exception as e:
+        _err("rec", e)
+
+
+def rec_outcome_worker():
+    """market results for the recorder, and drop recorder rows older than 10 days"""
+    n = 0
+    while True:
+        try:
+            now = time.time()
+            for x in dbq("SELECT DISTINCT r.asset, r.tf, r.o FROM rec r LEFT JOIN outcomes c ON c.asset=r.asset AND c.tf=r.tf AND c.o=r.o "
+                         "WHERE c.outcome IS NULL AND r.o + r.tf*60 < ? AND r.o + r.tf*60 > ? LIMIT 40", (now - 60, now - 2 * 86400)):
+                oc = outcome(x["asset"], x["tf"], x["o"])
+                if oc:
+                    dbx("INSERT OR REPLACE INTO outcomes (asset, tf, o, outcome) VALUES (?,?,?,?)", (x["asset"], x["tf"], x["o"], oc))
+                time.sleep(0.3)
+            n += 1
+            if n % 60 == 0:
+                dbx("DELETE FROM rec WHERE t0 < ?", (now - 10 * 86400,))
+        except Exception as e:
+            _err("rec_outcomes", e)
+        time.sleep(60)
+
+
+def rec_export(all_=False):
+    import zlib
+    last_id = 0 if all_ else int(kv_get("rec_last_id", "0") or 0)
+    rows = dbq("SELECT * FROM rec WHERE id > ? ORDER BY id", (last_id,))
+    if not rows:
+        tg("no new recorder rows")
+        return
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "t0", "asset", "trig", "tf", "o", "up", "data"])
+    for r in rows:
+        w.writerow([r["id"], r["t0"], r["asset"], r["trig"], r["tf"], r["o"], r["up"], zlib.decompress(r["data"]).decode()])
+    tg_doc("combo_rec.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} recorder rows")
+    oc = dbq("SELECT * FROM outcomes")
+    b2 = io.StringIO()
+    w2 = csv.writer(b2)
+    w2.writerow(["asset", "tf", "o", "outcome"])
+    w2.writerows([[x["asset"], x["tf"], x["o"], x["outcome"]] for x in oc])
+    tg_doc("combo_outcomes.csv.gz", gzip.compress(b2.getvalue().encode()), f"{len(oc)} market results")
+    kv_set("rec_last_id", rows[-1]["id"])
+
+
 def on_move(a, trig, feed, bps, t0):
     try:
         threading.Thread(target=dbx, args=("INSERT INTO moves (t0, asset, trig, feed, bps, fut_lag) VALUES (?,?,?,?,?,?)",
                                           (t0, a, trig, feed, bps, st.get("fut_lag"))), daemon=True).start()
+        threading.Thread(target=rec_capture, args=(a, trig, feed, bps, t0), daemon=True).start()
         sg = 1 if bps > 0 else -1
         up = sg > 0
         rules = [r for r in RULES if r.asset == a and r.trig == trig]
@@ -1439,6 +1530,7 @@ HELP = """COMBO bot commands
 /edge [today|yday|week] — fill rate, speed, price vs paper
 /copiers — wallets buying right after us
 /export — CSV of every trade + copier log
+/recexport — research recorder, new rows since last time (/recexport all = everything)
 /summary — the table for the last 30 min now · /summary 20 — every 20 min
 /quiet off|on — per-trade messages on/off (off by default)
 (cash alerts come by themselves: at $50, $100, $200, $500, $1000… and if cash drops 25% in a day)"""
@@ -1519,6 +1611,8 @@ def handle(text):
         tg("quiet: no per-trade messages (pauses, errors and the midnight summary still come)" if on_ else "per-trade messages ON")
     elif cmd == "/copiers":
         tg(copiers_text())
+    elif cmd == "/recexport":
+        rec_export(bool(args and args[0].lower() == "all"))
     elif cmd == "/export":
         export()
 
@@ -1647,7 +1741,7 @@ def main():
     if LIVE_START and kv_get("live_on") is None:
         kv_set("live_on", "1")
     workers = [market_worker, open_worker, pm_worker, chainlink_worker, twap_feed_worker, deribit_worker, settler, balance_worker,
-               copier_worker, telegram_worker, daily_worker, warm_worker, summary_worker]
+               copier_worker, telegram_worker, daily_worker, warm_worker, summary_worker, rec_outcome_worker]
     for fn in workers:
         threading.Thread(target=fn, daemon=True, name=fn.__name__).start()
     for v in ("vis", "spot", "fut"):
