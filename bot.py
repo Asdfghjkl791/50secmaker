@@ -1088,6 +1088,36 @@ def rec_export(all_=False):
     kv_set("rec_last_id", rows[-1]["id"])
 
 
+def old_early2_export():
+    """one-off: send the early2 data the OLD 50secmaker code saved in its database (still on this volume) before the switch"""
+    path = os.environ.get("OLD_DB", os.path.join(os.path.dirname(DB_PATH) or ".", "paper_favorite_dip.db"))
+    if not os.path.exists(path):
+        tg(f"old database not found at {path}")
+        return
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+        c.row_factory = sqlite3.Row
+        days = [r[0] for r in c.execute("SELECT DISTINCT CAST(t0/86400 AS INTEGER) FROM e2_early ORDER BY 1").fetchall()]
+        tg(f"old early2: {len(days)} days found, sending one file per day…")
+        for d in days:
+            rows = c.execute("SELECT t0, asset, feed, level, data FROM e2_early WHERE t0 >= ? AND t0 < ? ORDER BY t0", (d * 86400, (d + 1) * 86400)).fetchall()
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(["t0", "asset", "feed", "level", "data"])
+            w.writerows([tuple(r) for r in rows])
+            day = datetime.fromtimestamp(d * 86400, timezone.utc).strftime("%Y-%m-%d")
+            tg_doc(f"early2_old_{day}.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(rows)} rows, {day} (UTC)")
+        mk = c.execute("SELECT asset, tf, open_ts, open, outcome FROM e2_mkts WHERE outcome IS NOT NULL ORDER BY open_ts").fetchall()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["asset", "tf", "open_ts", "open", "outcome"])
+        w.writerows([tuple(r) for r in mk])
+        tg_doc("early2_mkts_old.csv.gz", gzip.compress(buf.getvalue().encode()), f"{len(mk)} market results")
+        c.close()
+    except Exception as e:
+        tg(f"old early2 export failed: {str(e)[:200]}")
+
+
 def on_move(a, trig, feed, bps, t0):
     try:
         threading.Thread(target=dbx, args=("INSERT INTO moves (t0, asset, trig, feed, bps, fut_lag) VALUES (?,?,?,?,?,?)",
@@ -1634,6 +1664,8 @@ def handle(text):
         tg("quiet: no per-trade messages (pauses, errors and the midnight summary still come)" if on_ else "per-trade messages ON")
     elif cmd == "/copiers":
         tg(copiers_text())
+    elif cmd == "/oldearly2":
+        threading.Thread(target=old_early2_export, daemon=True).start()
     elif cmd == "/recexport":
         rec_export(bool(args and args[0].lower() == "all"))
     elif cmd == "/export":
