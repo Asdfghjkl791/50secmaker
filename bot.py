@@ -66,7 +66,7 @@ LEAD_V = ("bybit", "okx", "hl", "kraken", "bitstamp", "cb")
 # ── the rules ────────────────────────────────────────────────────────────────────
 class Rule:
     def __init__(self, code, name, asset, tf, trig, fair, gap, lo, hi, hi_incl=True, R=False, left_max=None, left_min=None,
-                 conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False):
+                 conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False, fair2=None, gap2=None):
         self.__dict__.update(locals())
         del self.__dict__["self"]
 
@@ -91,6 +91,9 @@ RULES = [
     # Nov 13 (paper): BTC 15m long shot from real-time early2 data. 2bp BTC jump, Binance-candle fair (Deribit vol) - ask >= 10c,
     # ask 10-30c, no R check, ask read at the jump. Held up even with the order book 2s after the jump.
     Rule("BLS15", "BTC D-15LS2", "BTC", 15, 2, "bn_d", 10, 10, 30, hi_incl=False, early=True, cap=10),
+    # Nov 14 (paper): LC5 + a second opinion. Same as live LC5, but the Binance-candle fair (Deribit vol) must ALSO be >= 5c above
+    # the ask. On LC5's own live trades Nov 13-14 the "both agree" half made +$15.93, the "TWAP only" half -$4.00. Needs a fair test.
+    Rule("LC5B", "ETH D5-LC both fairs", "ETH", 5, 2, "tw_d", 5, 30, 95, R=True, lc=True, cap=15, fair2="bn_d", gap2=5),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
@@ -983,6 +986,10 @@ def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
             gap = fv - a0
             if not in_range(r, a0) or gap < r.gap:
                 continue
+            if r.fair2:                                # second fair price must agree too (paper rule LC5B)
+                f2 = fu.get(r.fair2)
+                if f2 is None or (f2 if up else 100 - f2) - a0 < r.gap2:
+                    continue
             if (r.left_max is not None and left > r.left_max) or (r.left_min is not None and left < r.left_min):
                 continue
             if r.conf == "filter" and not (m10 is not None and m10 >= 2):
