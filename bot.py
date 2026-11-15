@@ -686,6 +686,8 @@ def chainlink_worker():
                 continue
             q = cl[a]
             if not q or ts > q[-1][0]:
+                if q:
+                    cl_gaps[a].append((now, now - q[-1][1]))
                 q.append((ts, now, v))
                 _push(a, "cl", v, now, every=0)
     # Nov 14: Chainlink ticks about once a second, so 5s of silence means the line is dead -> drop it and reconnect at once
@@ -888,13 +890,25 @@ def sigma_iv(a, tf=None):
     return d["iv"] / 100 / math.sqrt(365 * 86400)
 
 
+def _rev(q):
+    """newest-first view of a deque that other threads keep appending to (iterating it live can raise 'deque mutated')"""
+    for _ in range(3):
+        try:
+            return list(reversed(q))
+        except RuntimeError:
+            continue
+    return list(reversed(list(q)))
+
+
 def last(a, venue, t=None):
     q = px[a].get(venue)
     if not q:
         return None
     if t is None:
         return q[-1][1]
-    for tt, p in reversed(q):
+    if q[-1][0] <= t:
+        return q[-1][1]
+    for tt, p in _rev(q):
         if tt <= t:
             return p
     return None
@@ -903,7 +917,7 @@ def last(a, venue, t=None):
 def cl_now(a, t):
     """Chainlink price brought up to time t with Binance's move since that tick arrived"""
     x = None
-    for item in reversed(cl[a]):
+    for item in _rev(cl[a]):
         if item[1] <= t:
             x = item
             break
@@ -918,7 +932,7 @@ def cl_now_1s(a, t):
     """the BTC 5m/15m research (50secmaker) brought Chainlink up to now with Binance's 1-SECOND samples, so a jump in the last
     second was usually not in its fair yet. The BTC 5m/15m rules' edges were measured on that fair, so we compute it the same way."""
     x = None
-    for item in reversed(cl[a]):
+    for item in _rev(cl[a]):
         if item[1] <= t:
             x = item
             break
@@ -1015,7 +1029,7 @@ def check_trigger(a, venue, now):
         threading.Thread(target=on_move, args=(a, 2, venue, round(bps, 2), now), daemon=True).start()
 
 
-CL_STALE = 3.0        # seconds: TWAP-fair rules skip signals when the last Chainlink price is older than this
+CL_STALE = 10.0       # seconds: TWAP-fair rules skip signals when the last Chainlink price is older than this
 ENTRY_DELAY = 0.30     # seconds after a 2bp jump at which the ETH / 1h / 4h rules read the ask (matches their research data)
 
 
@@ -1185,6 +1199,7 @@ def old_early2_export():
         tg(f"old early2 export failed: {str(e)[:200]}")
 
 
+cl_gaps = {a: deque(maxlen=20000) for a in ASSETS}   # (when, seconds since the previous new Chainlink price)
 FT = deque(maxlen=20000)       # (t0, ft10): BTC 3bp jumps and how far BTC kept going their way 10s later (bp)
 
 
@@ -1606,10 +1621,11 @@ def edge_text(t_from, t_to, label):
         lags = sorted(x["lag"] for x in rr if x["lag"])
         slip = [x["buy_px"] - x["p_px"] for x in fil if x["buy_px"] and x["p_px"]]
         part = [x["cost"] / x["stake"] for x in fil if x["stake"]]
-        pre, rf = s.get("pre", 0), s.get("r_fail", 0)
+        pre, rf, cs = s.get("pre", 0), s.get("r_fail", 0), s.get("cl_stale", 0)
         lines.append(f"{r.code}: filled {len(fil)}/{len(att)}" + (f" · median {lags[len(lags) // 2]:.2f}s jump→answer" if lags else "")
                      + (f" · paid {sum(slip) / len(slip):+.1f}¢ vs paper" if slip else "") + (f" · {100 * sum(part) / len(part):.0f}% of stake filled" if part else "")
-                     + (f" · R-check fails {rf}/{pre}" if pre and (r.R or r.lc) else (f" · {pre} signals" if pre else "")))
+                     + (f" · R-check fails {rf}/{pre}" if pre and (r.R or r.lc) else (f" · {pre} signals" if pre else ""))
+                     + (f" · {cs} skipped (Chainlink old)" if cs else ""))
     return "\n".join(lines)
 
 
@@ -1652,6 +1668,13 @@ def status_text():
                      + f" · chainlink {age(a, 'cl')} · twap feed {'%.0fs' % (now - tw_feed[a][-1][0]) if tw_feed[a] else 'none'} · deribit iv {ivs[a].get('iv')}"
                      + (f" (5m/15m: {iv50.get('iv')})" if a == "BTC" else ""))
     lines.append(ft_line())
+    for a in ASSETS:
+        g = [x for t, x in list(cl_gaps[a]) if t > now - 3600]
+        if g:
+            lines.append(f"{a} chainlink last 1h: {len(g)} prices · longest gap {max(g):.1f}s · gaps over 3s: {sum(1 for x in g if x > 3)}")
+    sk = {x["code"]: x["n"] for x in dbq("SELECT code, SUM(n) n FROM stats WHERE day=? AND k='cl_stale' GROUP BY code", (day_str(),))}
+    if sk:
+        lines.append("skipped today (Chainlink >10s old): " + ", ".join(f"{k} {v}" for k, v in sorted(sk.items())))
     if st["err"]:
         lines.append("last errors: " + " | ".join(f"{k}: {v}" for k, v in list(st["err"].items())[-5:]))
     return "\n".join(lines)
