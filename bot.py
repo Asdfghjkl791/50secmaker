@@ -94,6 +94,9 @@ RULES = [
     # Nov 14 (paper): LC5 + a second opinion. Same as live LC5, but the Binance-candle fair (Deribit vol) must ALSO be >= 5c above
     # the ask. On LC5's own live trades Nov 13-14 the "both agree" half made +$15.93, the "TWAP only" half -$4.00. Needs a fair test.
     Rule("LC5B", "ETH D5-LC both fairs", "ETH", 5, 2, "tw_d", 5, 30, 95, R=True, lc=True, cap=15, fair2="bn_d", gap2=5),
+    # Nov 14 (paper): P5 that doesn't chase. Same signal as live P5, limit = ask +10c instead of +40c. Since the Chainlink fix, P5 fills
+    # where the price had already run >5c lost (-$4.20 on 130), but earlier the chased fills were winners -> settle it on new data.
+    Rule("P5T", "BTC Plain D5 lim+10", "BTC", 5, 3, "tw_d", 5, 30, 90, cap=10),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
@@ -174,7 +177,7 @@ def init_db():
         p_cost1 REAL, p_sh1 REAL, p_cost100 REAL, p_sh100 REAL, p_px REAL,
         outcome TEXT, won INTEGER, pnl REAL, p_pnl1 REAL, p_pnl100 REAL, settled_ts REAL, copy_checked INTEGER DEFAULT 0)""")
     dbx("CREATE INDEX IF NOT EXISTS trades_t0 ON trades (t0)")
-    for col in ("bk_age REAL", "a0_ts REAL", "a25_ts REAL"):
+    for col in ("bk_age REAL", "a0_ts REAL", "a25_ts REAL", "t_build REAL", "ft_c REAL", "ft_m REAL", "ft_n INTEGER"):
         try:
             dbx(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -187,6 +190,8 @@ def init_db():
     dbx("CREATE TABLE IF NOT EXISTS outcomes (asset TEXT, tf INTEGER, o INTEGER, outcome TEXT, PRIMARY KEY (asset, tf, o))")
     dbx("CREATE TABLE IF NOT EXISTS stats (day TEXT, code TEXT, k TEXT, n INTEGER, PRIMARY KEY (day, code, k))")
     dbx("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+    dbx("CREATE TABLE IF NOT EXISTS ftrack (t0 REAL, feed TEXT, bps REAL, ft10 REAL)")
+    dbx("CREATE INDEX IF NOT EXISTS ftrack_t0 ON ftrack (t0)")
 
 
 _kvc = {}
@@ -194,7 +199,7 @@ _kvc = {}
 
 def kv_get(k, d=None):
     hit = _kvc.get(k)
-    if hit and time.time() - hit[0] < 2:
+    if hit and time.time() - hit[0] < (30 if k in HOT_KV else 2):   # hot settings are refreshed in the background (kv_worker)
         return hit[1] if hit[1] is not None else d
     r = dbq("SELECT v FROM kv WHERE k=?", (k,))
     v = r[0]["v"] if r else None
@@ -204,7 +209,53 @@ def kv_get(k, d=None):
 
 def kv_set(k, v):
     dbx("INSERT OR REPLACE INTO kv (k, v) VALUES (?,?)", (k, str(v)))
-    _kvc.pop(k, None)
+    _kvc[k] = (time.time(), str(v))
+
+
+HOT_KV = ("live_on", "live_rules", "stake", "paused", "quiet")
+
+
+def kv_worker():
+    """Nov 14 speed-up: keep the settings an order needs in memory, so a trade never waits on the database"""
+    while True:
+        try:
+            rows = {r["k"]: r["v"] for r in dbq("SELECT k, v FROM kv WHERE k IN (%s)" % ",".join("?" * len(HOT_KV)), HOT_KV)}
+            now = time.time()
+            for k in HOT_KV:
+                _kvc[k] = (now, rows.get(k))
+        except Exception as e:
+            _err("kv_worker", e)
+        time.sleep(1)
+
+
+RISK = {"ts": 0.0, "today": 0.0, "open": 0}
+
+
+def risk_worker():
+    """Nov 14 speed-up: today's settled live result + open live trades, recounted every second off the trading path"""
+    while True:
+        try:
+            t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            td = dbq("SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (t_day,))[0]["s"]
+            op = dbq("SELECT COUNT(*) n FROM trades WHERE mode='LIVE' AND status='HOLDING' AND t0 >= ?", (t_day - 86400,))[0]["n"]
+            RISK.update(ts=time.time(), today=float(td or 0), open=int(op or 0))
+        except Exception as e:
+            _err("risk_worker", e)
+        time.sleep(1)
+
+
+def keepalive_worker():
+    """Nov 14 speed-up: touch Polymarket's order server every few seconds so the connection is already open when an order goes"""
+    while True:
+        try:
+            if live_on() and POLY_PRIVATE_KEY and _clob is not None:
+                fn = getattr(_clob, "get_ok", None) or getattr(_clob, "get_server_time", None)
+                if fn is None:
+                    return                          # this client version has no cheap call: nothing to keep warm
+                fn()
+        except Exception as e:
+            _err("keepalive", e)
+        time.sleep(4)
 
 
 def day_str(t=None):
@@ -1125,8 +1176,55 @@ def old_early2_export():
         tg(f"old early2 export failed: {str(e)[:200]}")
 
 
+FT = deque(maxlen=20000)       # (t0, ft10): BTC 3bp jumps and how far BTC kept going their way 10s later (bp)
+
+
+def ft_watch(t0, feed, bps):
+    """Nov 14: the follow-through meter. P5's edge is BTC jumps carrying on; Nov 12-14 they carried on far less than in research."""
+    try:
+        sg = 1 if bps > 0 else -1
+        p0 = last("BTC", "vis", t0)
+        time.sleep(max(0.0, t0 + 10 - time.time()))
+        p1 = last("BTC", "vis")
+        if p0 and p1:
+            ft = round((p1 / p0 - 1) * 1e4 * sg, 3)
+            FT.append((t0, ft))
+            dbx("INSERT INTO ftrack (t0, feed, bps, ft10) VALUES (?,?,?,?)", (t0, feed, bps, ft))
+    except Exception as e:
+        _err("ft_watch", e)
+
+
+def ft_stats(window, t=None):
+    """share of BTC 3bp jumps still going their way 10s later, avg bp, count, over the last `window` seconds (results known by t)"""
+    t = t or time.time()
+    xs = [f for (ts, f) in list(FT) if t - window <= ts <= t - 10]
+    if len(xs) < 5:
+        return None, None, len(xs)
+    return round(sum(1 for f in xs if f > 0) / len(xs), 3), round(sum(xs) / len(xs), 2), len(xs)
+
+
+def ft_line():
+    def one(lbl, w):
+        c, m, n = ft_stats(w)
+        return f"{lbl} {c * 100:.0f}% ({m:+.2f}bp, {n})" if c is not None else f"{lbl} -"
+    c3 = ft_stats(3 * 3600)[0]
+    mood = "" if c3 is None else (" 🟢 normal" if c3 >= 0.62 else " 🟡 weak" if c3 >= 0.58 else " 🔴 very weak")
+    return "BTC jump follow-through (still going 10s later; research days 60-74%): " + " · ".join(
+        [one("1h", 3600), one("3h", 3 * 3600), one("24h", 86400)]) + mood
+
+
+def ft_load():
+    try:
+        for r in dbq("SELECT t0, ft10 FROM ftrack WHERE t0 > ? ORDER BY t0", (time.time() - 86400,)):
+            FT.append((r["t0"], r["ft10"]))
+    except Exception as e:
+        _err("ft_load", e)
+
+
 def on_move(a, trig, feed, bps, t0):
     try:
+        if a == "BTC" and trig == 3:
+            threading.Thread(target=ft_watch, args=(t0, feed, bps), daemon=True).start()
         threading.Thread(target=dbx, args=("INSERT INTO moves (t0, asset, trig, feed, bps, fut_lag) VALUES (?,?,?,?,?,?)",
                                           (t0, a, trig, feed, bps, st.get("fut_lag"))), daemon=True).start()
         threading.Thread(target=rec_capture, args=(a, trig, feed, bps, t0), daemon=True).start()
@@ -1221,11 +1319,12 @@ def decide(r, c):
                 except Exception as e:
                     ok, resp, note = False, {}, f"error: {str(e)[:150]}"
         lag = ((tim.get("resp") or time.time()) - t0) if tim else None
+        fc, fm, fn = ft_stats(3 * 3600, t0) if c["a"] == "BTC" else (None, None, None)
         rid = dbx("INSERT INTO trades (code, rule, asset, tf, o, side, mode, status, t0, feed, bps, ask0, a25, fair, gap, left_s, m10, m2, p05, cap, stake, token, cond, "
-                  "t_sent, t_resp, lag, bk_age, a0_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "t_sent, t_resp, lag, bk_age, a0_ts, t_build, ft_c, ft_m, ft_n) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (r.code, r.name, c["a"], c["tf"], c["o"], c["side"], "LIVE" if live else "PAPER", "SIGNAL", t0, c["feed"], c["bps"], c["a0"], a25,
                    c["fair"], c["gap"], c["left"], c["m10"], c["m2"], p05, cap, stk if live else 1.0, c["tok"], c["cond"],
-                   tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"]))
+                   tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"], tim.get("build"), fc, fm, fn))
         st["signals"] += 1
         threading.Thread(target=paper_twin, args=(r, c, rid, cap, live, key), daemon=True).start()
         if not live:
@@ -1269,6 +1368,7 @@ def decide(r, c):
         bpx = cost / shares * 100
         if st["balance"] is not None:
             st["balance"] -= cost                   # keep our cash figure current between the 60s balance checks
+        RISK["open"] += 1                           # counts at once, before risk_worker's next recount
         bump(r.code, "filled")
         dbx("UPDATE trades SET status='HOLDING', cost=?, shares=?, buy_px=? WHERE id=?", (cost, shares, bpx, rid))
         if not quiet():
@@ -1305,17 +1405,18 @@ def risk_check(r, c, stk):
         return p
     if stk > MAX_STAKE + 1e-9:
         return f"stake ${stk:g} above MAX_STAKE ${MAX_STAKE:g}"
-    t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    rows = dbq("SELECT pnl, cost, status, asset, tf, o, side FROM trades WHERE mode='LIVE' AND t0 >= ?", (t_day - 86400,))
-    realized = sum(x["pnl"] or 0 for x in rows if x["pnl"] is not None and x["status"] == "SETTLED")
-    today = dbq("SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (t_day,))[0]["s"]
+    if time.time() - RISK["ts"] < 5:                 # fresh numbers from risk_worker (no database on the trading path)
+        today, n_open = RISK["today"], RISK["open"]
+    else:                                            # fallback if the worker stalled
+        t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        today = dbq("SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (t_day,))[0]["s"]
+        n_open = dbq("SELECT COUNT(*) n FROM trades WHERE mode='LIVE' AND status='HOLDING' AND t0 >= ?", (t_day - 86400,))[0]["n"]
     if today <= -DAILY_LOSS:
         kv_set("paused", f"paused: daily loss limit ${DAILY_LOSS:g} reached (today {money(today)})")
         tg(f"🛑 Live trading PAUSED: today's live result is {money(today)} (limit ${DAILY_LOSS:g}). It stays paused until midnight, or /resume.")
         return paused()
-    openp = [x for x in rows if x["status"] == "HOLDING"]
-    if len(openp) >= MAX_OPEN:
-        return f"{len(openp)} trades already open (max {MAX_OPEN})"
+    if n_open >= MAX_OPEN:
+        return f"{n_open} trades already open (max {MAX_OPEN})"
     # (Nov 12: the "other side held" block was removed - each rule now trades exactly as it was tested; one trade per rule per market)
     bal = st["balance"]
     if bal is not None and time.time() - st["balance_ts"] < 300 and bal < max(MIN_BALANCE, stk):
@@ -1541,6 +1642,7 @@ def status_text():
         lines.append(f"{a}: binance {age(a, 'vis')}/{age(a, 'spot')}/{age(a, 'fut')} · others " + " ".join(f"{v} {age(a, v)}" for v in LEAD_V)
                      + f" · chainlink {age(a, 'cl')} · twap feed {'%.0fs' % (now - tw_feed[a][-1][0]) if tw_feed[a] else 'none'} · deribit iv {ivs[a].get('iv')}"
                      + (f" (5m/15m: {iv50.get('iv')})" if a == "BTC" else ""))
+    lines.append(ft_line())
     if st["err"]:
         lines.append("last errors: " + " | ".join(f"{k}: {v}" for k, v in list(st["err"].items())[-5:]))
     return "\n".join(lines)
@@ -1568,7 +1670,9 @@ def trades_text(n=12):
 def export():
     rows = dbq("SELECT * FROM trades ORDER BY id")
     mv = dbq("SELECT * FROM moves WHERE t0 > ? ORDER BY t0", (time.time() - 3 * 86400,))
-    for name, rs in (("combo_trades.csv.gz", rows), ("combo_copiers.csv.gz", dbq("SELECT * FROM copiers ORDER BY id")), ("combo_moves.csv.gz", mv)):
+    ftr = dbq("SELECT * FROM ftrack ORDER BY t0")
+    for name, rs in (("combo_trades.csv.gz", rows), ("combo_copiers.csv.gz", dbq("SELECT * FROM copiers ORDER BY id")), ("combo_moves.csv.gz", mv),
+                     ("combo_follow.csv.gz", ftr)):
         if not rs:
             continue
         buf = io.StringIO()
@@ -1579,7 +1683,7 @@ def export():
 
 
 HELP = """COMBO bot commands
-/status — live on/off, cash, open trades, feeds
+/status — live on/off, cash, open trades, feeds, BTC jump follow-through meter
 /rules — every rule, live or paper
 /live on | /live off — all live rules on/off (/stop = off)
 /live CODE on|off — one rule (e.g. /live ELS5 on)
@@ -1589,7 +1693,7 @@ HELP = """COMBO bot commands
 /trades [n] — last live trades
 /edge [today|yday|week] — fill rate, speed, price vs paper
 /copiers — wallets buying right after us
-/export — CSV of every trade + copier log
+/export — CSV of every trade + copier log + jumps + follow-through log
 /recexport — research recorder, new rows since last time (/recexport all = everything)
 /summary — the table for the last 30 min now · /summary 20 — every 20 min
 /quiet off|on — per-trade messages on/off (off by default)
@@ -1788,6 +1892,13 @@ def daily_worker():
                     tg("🌅 new day: the daily loss pause is cleared, live trading continues.")
                 tg(pnl_text(*_range("yday")))
                 tg(edge_text(*_range("yday")))
+                y0, y1 = _range("yday")[:2]
+                xs = [f for (ts, f) in list(FT) if y0 <= ts < y1]
+                if xs:
+                    cy = sum(1 for f in xs if f > 0) / len(xs)
+                    tg(f"📏 yesterday's BTC jump follow-through: {cy * 100:.0f}% of {len(xs)} jumps still going 10s later "
+                       f"(avg {sum(xs) / len(xs):+.2f}bp) · research days were 60-74%, Nov 12-14 57-60% · "
+                       + ("🟢 normal" if cy >= 0.62 else "🟡 weak" if cy >= 0.58 else "🔴 very weak"))
                 if dbq("SELECT 1 FROM trades WHERE mode='LIVE' AND cost > 0 LIMIT 1"):
                     tg(copiers_text(1))
         except Exception as e:
@@ -1797,13 +1908,15 @@ def daily_worker():
 
 def main():
     init_db()
+    ft_load()
     for x in dbq("SELECT code, asset, tf, o FROM trades WHERE t0 > ? AND (mode='SKIP' OR cost > 0 OR p_cost1 > 0 OR status IN ('SIGNAL','HOLDING'))",
                  (time.time() - 5 * 3600,)):
         done.add((x["code"], x["asset"], x["tf"], x["o"]))      # after a restart, never trade the same market twice
     if LIVE_START and kv_get("live_on") is None:
         kv_set("live_on", "1")
     workers = [market_worker, open_worker, pm_worker, chainlink_worker, twap_feed_worker, deribit_worker, settler, balance_worker,
-               copier_worker, telegram_worker, daily_worker, warm_worker, summary_worker, rec_outcome_worker]
+               copier_worker, telegram_worker, daily_worker, warm_worker, summary_worker, rec_outcome_worker,
+               kv_worker, risk_worker, keepalive_worker]
     for fn in workers:
         threading.Thread(target=fn, daemon=True, name=fn.__name__).start()
     for v in ("vis", "spot", "fut"):
