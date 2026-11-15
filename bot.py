@@ -66,7 +66,7 @@ LEAD_V = ("bybit", "okx", "hl", "kraken", "bitstamp", "cb")
 # ── the rules ────────────────────────────────────────────────────────────────────
 class Rule:
     def __init__(self, code, name, asset, tf, trig, fair, gap, lo, hi, hi_incl=True, R=False, left_max=None, left_min=None,
-                 conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False, fair2=None, gap2=None):
+                 conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False, fair2=None, gap2=None, follow=None):
         self.__dict__.update(locals())
         del self.__dict__["self"]
 
@@ -97,6 +97,10 @@ RULES = [
     # Nov 14 (paper): P5 that doesn't chase. Same signal as live P5, limit = ask +10c instead of +40c. Since the Chainlink fix, P5 fills
     # where the price had already run >5c lost (-$4.20 on 130), but earlier the chased fills were winners -> settle it on new data.
     Rule("P5T", "BTC Plain D5 lim+10", "BTC", 5, 3, "tw_d", 5, 30, 90, cap=10),
+    # Nov 15 (paper): ETH 5m follow-BTC long shot. When BTC jumps 3bp, buy the cheap (10-30c) ETH 5m side in BTC's direction before
+    # ETH's book catches up. No fair filter. Worker alts data Nov 13-15 (book 1s after the jump, limit +10c): 91 trades, 33% won,
+    # +$49.72 at $1, positive Fri / Sat / Sun - but mostly Saturday's BTC selloff. Needs weekdays.
+    Rule("FB5", "ETH 5m follow-BTC LS", "ETH", 5, 3, "bn_d", -100, 10, 30, cap=10, follow="BTC"),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
@@ -1254,7 +1258,13 @@ def on_move(a, trig, feed, bps, t0):
         threading.Thread(target=rec_capture, args=(a, trig, feed, bps, t0), daemon=True).start()
         sg = 1 if bps > 0 else -1
         up = sg > 0
-        rules = [r for r in RULES if r.asset == a and r.trig == trig]
+        rules = [r for r in RULES if r.asset == a and r.trig == trig and not r.follow]
+        for fr in [r for r in RULES if r.follow == a and r.trig == trig]:      # follow rules: this coin jumped -> trade another coin's market
+            with lock:
+                fm = [(k, dict(v)) for k, v in markets.items() if k[0] == fr.asset and k[1] == fr.tf and k[2] <= t0 < k[2] + k[1] * 60]
+            for (fa, ftf, fo), m in fm:                                        # own thread: never slows the BTC rules
+                threading.Thread(target=lambda fa=fa, ftf=ftf, fo=fo, m=m, fr=fr: eval_market(
+                    fa, ftf, fo, m, up, t0, feed, bps, fairs(fa, ftf, fo, t0), 0.0, 0.0, [fr], 0.0), daemon=True).start()
         tfs = {r.tf for r in rules}
         with lock:
             mk = [(k, dict(v)) for k, v in markets.items() if k[0] == a and k[1] in tfs and k[2] <= t0 < k[2] + k[1] * 60]
