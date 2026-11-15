@@ -101,6 +101,10 @@ RULES = [
     # ETH's book catches up. No fair filter. Worker alts data Nov 13-15 (book 1s after the jump, limit +10c): 91 trades, 33% won,
     # +$49.72 at $1, positive Fri / Sat / Sun - but mostly Saturday's BTC selloff. Needs weekdays.
     Rule("FB5", "ETH 5m follow-BTC LS", "ETH", 5, 3, "bn_d", -100, 10, 30, cap=10, follow="BTC"),
+    # Nov 15 (paper): ETH 15m follow-BTC, both fairs agree. When BTC jumps 2bp, buy the ETH 15m side in BTC's direction at 30-90c if
+    # the TWAP fair AND the Binance-candle fair (both our own vol, as in the worker's recorder) are >= 5c above the ask.
+    # Worker alts data Nov 13-15 (book 1s after, limit +10c): 68 trades, 76% won, +$15.80 at $1, +$1,219 at $100, positive Fri/Sat/Sun.
+    Rule("FB15B", "ETH 15m follow-BTC both fairs", "ETH", 15, 2, "tw_o", 5, 30, 90, cap=10, follow="BTC", fair2="bn_o", gap2=5),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
