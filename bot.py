@@ -105,6 +105,18 @@ RULES = [
     # the TWAP fair AND the Binance-candle fair (both our own vol, as in the worker's recorder) are >= 5c above the ask.
     # Worker alts data Nov 13-15 (book 1s after, limit +10c): 68 trades, 76% won, +$15.80 at $1, +$1,219 at $100, positive Fri/Sat/Sun.
     Rule("FB15B", "ETH 15m follow-BTC both fairs", "ETH", 15, 2, "tw_o", 5, 30, 90, cap=10, follow="BTC", fair2="bn_o", gap2=5),
+    # Nov 15 (paper) long-shot candidates from the deep search on real-time data (combo recorder Nov 13-15 + BTC recorder Nov 5-12).
+    # All limit +10c (never chase). Fair test starts when this file goes live.
+    # LS5H: BTC 5m, TWAP fair (Deribit vol) >= 10c above, 20-40c. Hist 24 tr 62% won +$14.40 · recent 21 tr 57% won +$15.65 (both sides)
+    Rule("LS5H", "BTC 5m LS high-win", "BTC", 5, 3, "tw_d", 10, 20, 40, cap=10),
+    # LS5O: BTC 5m, TWAP fair (own vol) >= 5c above, 10-40c. Hist 80 tr 48% +$27.10 · recent 134 tr 39% +$23.27. Needs speed (2s book ~0)
+    Rule("LS5O", "BTC 5m LS own-vol", "BTC", 5, 3, "tw_o", 5, 10, 40, cap=10),
+    # LS15O: same on BTC 15m. Hist 43 tr 49% +$29.69 · recent 60 tr 35% +$5.17. Not speed-sensitive
+    Rule("LS15O", "BTC 15m LS own-vol", "BTC", 15, 3, "tw_o", 5, 10, 40, cap=10),
+    # E15LA / E15LB: ETH 15m long shots on the Binance-candle fair (held on data after Sat 1:15pm). Read the ask at once (early=True),
+    # as in the recorder test. A: Deribit vol >= 10c, 10-30c (76 tr 34% +$28.04) · B: own vol >= 5c, 20-35c (111 tr 41% +$27.86)
+    Rule("E15LA", "ETH 15m LS Binance fair A", "ETH", 15, 2, "bn_d", 10, 10, 30, early=True, cap=10),
+    Rule("E15LB", "ETH 15m LS Binance fair B", "ETH", 15, 2, "bn_o", 5, 20, 35, early=True, cap=10),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
