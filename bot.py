@@ -547,7 +547,7 @@ def _push(a, venue, p, now=None, every=0.05):
         q.append((now, p))
 
 
-def _run_ws(name, url, on_msg, subs=None, ping=None, ping_every=15, timeout=30):
+def _run_ws(name, url, on_msg, subs=None, ping=None, ping_every=15, timeout=30, retry=5):
     while True:
         try:
             ws = websocket.create_connection(url, timeout=10)
@@ -566,7 +566,7 @@ def _run_ws(name, url, on_msg, subs=None, ping=None, ping_every=15, timeout=30):
                 on_msg(json.loads(raw))
         except Exception as e:
             _err(name, e)
-        time.sleep(5)
+        time.sleep(retry)
 
 
 def binance_book_worker(venue):
@@ -688,7 +688,12 @@ def chainlink_worker():
             if not q or ts > q[-1][0]:
                 q.append((ts, now, v))
                 _push(a, "cl", v, now, every=0)
-    _run_ws("chainlink", RTDS, on, subs, "PING", ping_every=5)
+    # Nov 14: Chainlink ticks about once a second, so 5s of silence means the line is dead -> drop it and reconnect at once
+    # (before: waited 30s for silence + 5s pause, so the price could be ~35s old). Two connections, so one drop never leaves a gap.
+    for i in (1, 2):
+        threading.Thread(target=_run_ws, args=(f"chainlink{i}", RTDS, on, subs, "PING", 5, 5, 0.5), daemon=True).start()
+    while True:
+        time.sleep(3600)
 
 
 def twap_feed_worker():
@@ -1010,6 +1015,7 @@ def check_trigger(a, venue, now):
         threading.Thread(target=on_move, args=(a, 2, venue, round(bps, 2), now), daemon=True).start()
 
 
+CL_STALE = 3.0        # seconds: TWAP-fair rules skip signals when the last Chainlink price is older than this
 ENTRY_DELAY = 0.30     # seconds after a 2bp jump at which the ETH / 1h / 4h rules read the ask (matches their research data)
 
 
@@ -1032,6 +1038,9 @@ def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
                 continue
             f = fu.get(r.fair)
             if f is None:
+                continue
+            if r.fair.startswith("tw") and (not cl[a] or time.time() - cl[a][-1][1] > CL_STALE):
+                bump(r.code, "cl_stale")                 # Nov 14: Chainlink feed down -> the TWAP fair is guesswork, skip (paper too)
                 continue
             fv = f if up else 100 - f
             gap = fv - a0
