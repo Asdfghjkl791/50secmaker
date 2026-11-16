@@ -117,6 +117,13 @@ RULES = [
     # as in the recorder test. A: Deribit vol >= 10c, 10-30c (76 tr 34% +$28.04) · B: own vol >= 5c, 20-35c (111 tr 41% +$27.86)
     Rule("E15LA", "ETH 15m LS Binance fair A", "ETH", 15, 2, "bn_d", 10, 10, 30, early=True, cap=10),
     Rule("E15LB", "ETH 15m LS Binance fair B", "ETH", 15, 2, "bn_o", 5, 20, 35, early=True, cap=10),
+    # Nov 16 (paper): P5O = P5 with the fair built on OUR measured volatility instead of Deribit's. It adapts by itself: when BTC is
+    # wilder than options assume (real/Deribit vol 0.9x on Nov 5-12, 1.28x from Nov 13) it asks for more before buying.
+    # Nov 5-13: +$2,088 at $100 (P5 +$3,423) · Nov 13-15: +$1,066 (P5 -$374) · worst day -$257 (P5 -$557) · 10 of 12 days up.
+    Rule("P5O", "BTC Plain D5 own-vol", "BTC", 5, 3, "tw_o", 5, 30, 90, cap=40),
+    # Nov 16 (paper): EBC15 = the 15m sibling of EBC5 on the Binance fair with our vol. Recorder Nov 13-15: 117 tr, 67% won, +$27.05
+    # ($100 +$2,414), both halves, Up and Down · early2 Nov 1-4/12-13: 119 tr, 57% won at 45c, +$16.81, 5 of 6 days up.
+    Rule("EBC15", "ETH D15-BC own-vol", "ETH", 15, 2, "bn_o", 5, 30, 90, bc=1.0, early=True, cap=10),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
@@ -125,6 +132,7 @@ PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
 lock = threading.RLock()
 px = {a: {} for a in ASSETS}                 # px[asset][venue] = deque((t, mid))
 px1s = {a: deque(maxlen=4000) for a in ASSETS}
+px60 = {a: deque(maxlen=720) for a in ASSETS}           # one Binance price a minute, 12h back: long-window volatility for 1h / 4h markets
 cl = {a: deque(maxlen=20000) for a in ASSETS}          # (chainlink_ts, received_ts, value)
 tw_feed = {a: deque(maxlen=20000) for a in ASSETS}     # Polymarket 60s TWAP feed (ts, value)
 ivs = {a: {"ts": 0, "iv": None} for a in ASSETS}   # recorder method (ETH rules, BTC 1h/4h)
@@ -197,7 +205,8 @@ def init_db():
         p_cost1 REAL, p_sh1 REAL, p_cost100 REAL, p_sh100 REAL, p_px REAL,
         outcome TEXT, won INTEGER, pnl REAL, p_pnl1 REAL, p_pnl100 REAL, settled_ts REAL, copy_checked INTEGER DEFAULT 0)""")
     dbx("CREATE INDEX IF NOT EXISTS trades_t0 ON trades (t0)")
-    for col in ("bk_age REAL", "a0_ts REAL", "a25_ts REAL", "t_build REAL", "ft_c REAL", "ft_m REAL", "ft_n INTEGER"):
+    for col in ("bk_age REAL", "a0_ts REAL", "a25_ts REAL", "t_build REAL", "ft_c REAL", "ft_m REAL", "ft_n INTEGER",
+                "volr REAL", "j1h INTEGER", "ar1h REAL"):
         try:
             dbx(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -232,7 +241,7 @@ def kv_set(k, v):
     _kvc[k] = (time.time(), str(v))
 
 
-HOT_KV = ("live_on", "live_rules", "stake", "paused", "quiet")
+HOT_KV = ("live_on", "live_rules", "stake", "paused", "quiet", "quiet_hours", "rule_loss")
 
 
 def kv_worker():
@@ -248,7 +257,52 @@ def kv_worker():
         time.sleep(1)
 
 
-RISK = {"ts": 0.0, "today": 0.0, "open": 0}
+RISK = {"ts": 0.0, "today": 0.0, "open": 0, "by_code": {}}
+
+
+def quiet_hours():
+    """(start_hour, end_hour) in Toronto time during which the 5-minute rules do not trade live, or None. Set with /quiethours"""
+    v = (kv_get("quiet_hours", "") or "").strip()
+    try:
+        a, b = v.split("-")
+        a, b = int(a), int(b)
+        return (a, b) if 0 <= a <= 23 and 1 <= b <= 24 and a != b else None
+    except Exception:
+        return None
+
+
+def in_quiet_hours(r, t=None):
+    qh = quiet_hours()
+    if not qh or r.tf != 5:
+        return False
+    h = datetime.fromtimestamp(t or time.time(), TZ).hour
+    a, b = qh
+    return (a <= h < b) if a < b else (h >= a or h < b)
+
+
+def rule_loss_cap():
+    try:
+        return max(0.0, float(kv_get("rule_loss", "0") or 0))
+    except Exception:
+        return 0.0
+
+
+def road(a, t0):
+    """road conditions at the moment of a trade, saved with it so 'slow down' levels can be tested later:
+    volr = our measured volatility / Deribit's (above 1 = wilder than options assume) · j1h = BTC 3bp jumps in the last hour ·
+    ar1h = size of the coin's move over the last hour (bp)"""
+    volr = j1h = ar1h = None
+    try:
+        so, sd = sigma(a), sigma_iv(a, 5)
+        volr = round(so / sd, 3) if (so and sd) else None
+        j1h = sum(1 for (ts, f) in list(FT) if t0 - 3600 <= ts <= t0)
+        pts = list(px1s[a])
+        if pts and pts[-1][0] - pts[0][0] >= 3000:
+            old = min(pts, key=lambda p: abs(p[0] - (t0 - 3600)))
+            ar1h = round(abs(pts[-1][1] / old[1] - 1) * 1e4, 1)
+    except Exception as e:
+        _err("road", e)
+    return volr, j1h, ar1h
 
 
 def risk_worker():
@@ -258,7 +312,9 @@ def risk_worker():
             t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
             td = dbq("SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (t_day,))[0]["s"]
             op = dbq("SELECT COUNT(*) n FROM trades WHERE mode='LIVE' AND status='HOLDING' AND t0 >= ?", (t_day - 86400,))[0]["n"]
-            RISK.update(ts=time.time(), today=float(td or 0), open=int(op or 0))
+            bc = {x["code"]: float(x["s"] or 0) for x in dbq(
+                "SELECT code, SUM(pnl) s FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ? GROUP BY code", (t_day,))}
+            RISK.update(ts=time.time(), today=float(td or 0), open=int(op or 0), by_code=bc)
         except Exception as e:
             _err("risk_worker", e)
         time.sleep(1)
@@ -607,6 +663,8 @@ def binance_book_worker(venue):
         _push(a, venue, p, now, every=0.02)
         if venue == "vis" and (not px1s[a] or now - px1s[a][-1][0] >= 1):
             px1s[a].append((now, p))
+            if not px60[a] or now - px60[a][-1][0] >= 60:
+                px60[a].append((now, p))
         check_trigger(a, venue, now)
     _run_ws("binance_" + venue, url, on)
 
@@ -903,6 +961,36 @@ def sigma(a):
     return max(2e-5, math.sqrt(sum(r) / len(r))) if len(r) >= 30 else None
 
 
+def sigma_long(a, window):
+    """Nov 16: our own volatility measured over the last `window` seconds from 1-minute prices (per-second units, like sigma()).
+    sigma() looks at 15 minutes, right for 5m/15m markets; an hour or four of market needs a longer look back."""
+    now = time.time()
+    pts = [p for p in list(px60[a]) if p[0] >= now - window]
+    r = [(math.log(y / x)) ** 2 for (t0, x), (t1, y) in zip(pts, pts[1:]) if 30 <= t1 - t0 <= 180 and x > 0 and y > 0]
+    span = sum(t1 - t0 for (t0, x), (t1, y) in zip(pts, pts[1:]) if 30 <= t1 - t0 <= 180)
+    if len(r) < 20 or span < 0.5 * window:
+        return None
+    return max(2e-5, math.sqrt(sum(r) / span))
+
+
+def seed_px60():
+    """fill the 1-minute price history from Binance at start-up, so the long-window volatility works at once after a restart"""
+    for a in ASSETS:
+        try:
+            j = requests.get(KLINES, params={"symbol": SYM[a].upper(), "interval": "1m", "limit": 300}, timeout=10).json()
+            rows = [(float(k[6]) / 1000, float(k[4])) for k in j if isinstance(k, list)][:-1]      # (close time, close), finished candles
+            if rows and not px60[a]:
+                px60[a].extend(rows)
+            elif rows:
+                first = px60[a][0][0]
+                old = [x for x in rows if x[0] < first - 30]
+                cur = list(px60[a])
+                px60[a].clear()
+                px60[a].extend(old + cur)
+        except Exception as e:
+            _err("seed_px60", e)
+
+
 def sigma_iv(a, tf=None):
     d = iv50 if (a == "BTC" and tf in (5, 15)) else (ivs.get(a) or {})
     if not d.get("iv") or time.time() - d["ts"] > 600:
@@ -981,6 +1069,8 @@ def fairs(a, tf, o, t):
         return out
     op = opens.get((a, tf, o)) or {}
     vols = {"o": sigma(a), "d": sigma_iv(a, tf)}
+    if tf >= 60:                                     # 1h / 4h: also a fair on our volatility over the last hour / four hours ("_l")
+        vols["l"] = sigma_long(a, tf * 60)
     pb, pc = last(a, "vis", t), (cl_now_1s(a, t) if (a == "BTC" and tf in (5, 15)) else cl_now(a, t))
     k, _ = tw_strike(a, tf, o)
     A, B = e - 62, e - 3
@@ -1118,7 +1208,7 @@ def rec_capture(a, trig, feed, bps, t0):
         if not mk:
             return
         base = {"bps": bps, "feed": feed, "m10": lead_mean(a, t0, -10, sg), "m2": lead_mean(a, t0, -2, sg),
-                "vis0": last(a, "vis", t0), "sig": sigma(a), "iv": (ivs.get(a) or {}).get("iv"), "iv50": iv50.get("iv") if a == "BTC" else None}
+                "vis0": last(a, "vis", t0), "sig": sigma(a), "sigl1": sigma_long(a, 3600), "sigl4": sigma_long(a, 14400), "iv": (ivs.get(a) or {}).get("iv"), "iv50": iv50.get("iv") if a == "BTC" else None}
         per = {}
         for (a_, tf, o), m in mk:
             fu = fairs(a, tf, o, t0)
@@ -1359,7 +1449,7 @@ def decide(r, c):
             done.add(key)
         base = a25 if a25 is not None else c["a0"]
         cap = min(99.0, base + r.cap)
-        live = live_on() and r.code in live_codes()
+        live = live_on() and r.code in live_codes() and not in_quiet_hours(r, t0)   # quiet hours: 5m rules trade on paper only
         stk = stake()
         head = f"{r.name} {c['side']} {c['tf'] if c['tf'] < 60 else c['tf'] // 60}{'m' if c['tf'] < 60 else 'h'} · ask {c['a0']:g}¢ fair {c['fair']:.0f}¢"
         why, ok, resp, note, tim = None, False, {}, "", {}
@@ -1372,11 +1462,13 @@ def decide(r, c):
                     ok, resp, note = False, {}, f"error: {str(e)[:150]}"
         lag = ((tim.get("resp") or time.time()) - t0) if tim else None
         fc, fm, fn = ft_stats(3 * 3600, t0) if c["a"] == "BTC" else (None, None, None)
+        volr, j1h, ar1h = road(c["a"], t0)
         rid = dbx("INSERT INTO trades (code, rule, asset, tf, o, side, mode, status, t0, feed, bps, ask0, a25, fair, gap, left_s, m10, m2, p05, cap, stake, token, cond, "
-                  "t_sent, t_resp, lag, bk_age, a0_ts, t_build, ft_c, ft_m, ft_n) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "t_sent, t_resp, lag, bk_age, a0_ts, t_build, ft_c, ft_m, ft_n, volr, j1h, ar1h) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (r.code, r.name, c["a"], c["tf"], c["o"], c["side"], "LIVE" if live else "PAPER", "SIGNAL", t0, c["feed"], c["bps"], c["a0"], a25,
                    c["fair"], c["gap"], c["left"], c["m10"], c["m2"], p05, cap, stk if live else 1.0, c["tok"], c["cond"],
-                   tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"], tim.get("build"), fc, fm, fn))
+                   tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"], tim.get("build"), fc, fm, fn, volr, j1h, ar1h))
         st["signals"] += 1
         threading.Thread(target=paper_twin, args=(r, c, rid, cap, live, key), daemon=True).start()
         if not live:
@@ -1469,6 +1561,9 @@ def risk_check(r, c, stk):
         return paused()
     if n_open >= MAX_OPEN:
         return f"{n_open} trades already open (max {MAX_OPEN})"
+    cap_r = rule_loss_cap()                          # Nov 16: one rule on a bad day can't use up the whole daily stop
+    if cap_r > 0 and RISK["by_code"].get(r.code, 0.0) <= -cap_r:
+        return f"paused for today: {r.code} is down {money(RISK['by_code'][r.code])} (rule limit ${cap_r:g}); it keeps trading on paper"
     # (Nov 12: the "other side held" block was removed - each rule now trades exactly as it was tested; one trade per rule per market)
     bal = st["balance"]
     if bal is not None and time.time() - st["balance_ts"] < 300 and bal < max(MIN_BALANCE, stk):
@@ -1696,6 +1791,15 @@ def status_text():
                      + f" · chainlink {age(a, 'cl')} · twap feed {'%.0fs' % (now - tw_feed[a][-1][0]) if tw_feed[a] else 'none'} · deribit iv {ivs[a].get('iv')}"
                      + (f" (5m/15m: {iv50.get('iv')})" if a == "BTC" else ""))
     lines.append(ft_line())
+    rd = []
+    for a in ASSETS:
+        v, j, ar = road(a, now)
+        rd.append(f"{a} real vs Deribit volatility {v:.2f}x" + (f" · 1h move {ar:.0f}bp" if ar is not None else "") if v else f"{a} vol -")
+    j1 = sum(1 for (ts, f) in list(FT) if now - 3600 <= ts <= now)
+    lines.append("road: " + " | ".join(rd) + f" | BTC 3bp jumps last hour {j1}  (above 1.0x = wilder than the Deribit fair assumes)")
+    qh, cr = quiet_hours(), rule_loss_cap()
+    lines.append("quiet hours (5m rules paper-only): " + (f"{qh[0]}:00-{qh[1]}:00 Toronto" if qh else "off") +
+                 " · per-rule daily loss limit: " + (f"${cr:g}" if cr > 0 else "off"))
     for a in ASSETS:
         g = [x for t, x in list(cl_gaps[a]) if t > now - 3600]
         if g:
@@ -1743,7 +1847,9 @@ def export():
 
 
 HELP = """COMBO bot commands
-/status — live on/off, cash, open trades, feeds, BTC jump follow-through meter
+/status — live on/off, cash, open trades, feeds, follow-through meter, road conditions
+/quiethours 18-21 — 5-minute rules trade on paper only in those Toronto hours (off to cancel)
+/rulestop 8 — a live rule down $8 on the day stops until midnight (off to cancel)
 /rules — every rule, live or paper
 /live on | /live off — all live rules on/off (/stop = off)
 /live CODE on|off — one rule (e.g. /live ELS5 on)
@@ -1829,6 +1935,38 @@ def handle(text):
             now = time.time()
             t_b = now
             tg(summary_text(now - n * 60, now, n), pre=True)
+    elif cmd == "/quiethours":
+        if not args:
+            qh = quiet_hours()
+            tg("quiet hours: " + (f"{qh[0]}:00-{qh[1]}:00 Toronto (5-minute rules trade on paper only)" if qh else "off") +
+               "\nset with /quiethours 18-21 · turn off with /quiethours off")
+        elif args[0].lower() == "off":
+            kv_set("quiet_hours", "")
+            tg("quiet hours OFF: the 5-minute rules trade live all day")
+        else:
+            kv_set("quiet_hours", args[0])
+            qh = quiet_hours()
+            if qh:
+                tg(f"quiet hours ON: live 5-minute rules (P5, LC5 ...) do not trade real money {qh[0]}:00-{qh[1]}:00 Toronto time. "
+                   f"They keep trading on paper then, so we can check the pause is still right.")
+            else:
+                kv_set("quiet_hours", "")
+                tg("couldn't read that. Use start-end hours, like /quiethours 18-21")
+    elif cmd == "/rulestop":
+        if not args:
+            cr = rule_loss_cap()
+            tg("per-rule daily loss limit: " + (f"${cr:g}" if cr > 0 else "off") + "\nset with /rulestop 8 · turn off with /rulestop off")
+        elif args[0].lower() == "off":
+            kv_set("rule_loss", "0")
+            tg("per-rule daily loss limit OFF (the overall daily stop still applies)")
+        else:
+            try:
+                v = float(args[0].replace("$", ""))
+                kv_set("rule_loss", str(v))
+                tg(f"per-rule daily loss limit ${v:g}: a live rule that is down ${v:g} on the day stops trading real money until midnight "
+                   f"(it keeps trading on paper). The overall daily stop ${DAILY_LOSS:g} still applies.")
+            except ValueError:
+                tg("use a number, like /rulestop 8")
     elif cmd == "/quiet":
         on_ = not args or args[0].lower() == "on"
         kv_set("quiet", "1" if on_ else "0")
@@ -1969,6 +2107,7 @@ def daily_worker():
 def main():
     init_db()
     ft_load()
+    threading.Thread(target=seed_px60, daemon=True).start()
     for x in dbq("SELECT code, asset, tf, o FROM trades WHERE t0 > ? AND (mode='SKIP' OR cost > 0 OR p_cost1 > 0 OR status IN ('SIGNAL','HOLDING'))",
                  (time.time() - 5 * 3600,)):
         done.add((x["code"], x["asset"], x["tf"], x["o"]))      # after a restart, never trade the same market twice
