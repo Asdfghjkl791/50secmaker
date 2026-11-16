@@ -97,10 +97,7 @@ RULES = [
     # Nov 14 (paper): P5 that doesn't chase. Same signal as live P5, limit = ask +10c instead of +40c. Since the Chainlink fix, P5 fills
     # where the price had already run >5c lost (-$4.20 on 130), but earlier the chased fills were winners -> settle it on new data.
     Rule("P5T", "BTC Plain D5 lim+10", "BTC", 5, 3, "tw_d", 5, 30, 90, cap=10),
-    # Nov 15 (paper): ETH 5m follow-BTC long shot. When BTC jumps 3bp, buy the cheap (10-30c) ETH 5m side in BTC's direction before
-    # ETH's book catches up. No fair filter. Worker alts data Nov 13-15 (book 1s after the jump, limit +10c): 91 trades, 33% won,
-    # +$49.72 at $1, positive Fri / Sat / Sun - but mostly Saturday's BTC selloff. Needs weekdays.
-    Rule("FB5", "ETH 5m follow-BTC LS", "ETH", 5, 3, "bn_d", -100, 10, 30, cap=10, follow="BTC"),
+    # (Nov 16: FB5, the ETH 5m follow-BTC long shot, removed - its profit was all Down bets in Saturday's selloff, lost every day since)
     # Nov 15 (paper): ETH 15m follow-BTC, both fairs agree. When BTC jumps 2bp, buy the ETH 15m side in BTC's direction at 30-90c if
     # the TWAP fair AND the Binance-candle fair (both our own vol, as in the worker's recorder) are >= 5c above the ask.
     # Worker alts data Nov 13-15 (book 1s after, limit +10c): 68 trades, 76% won, +$15.80 at $1, +$1,219 at $100, positive Fri/Sat/Sun.
@@ -241,7 +238,7 @@ def kv_set(k, v):
     _kvc[k] = (time.time(), str(v))
 
 
-HOT_KV = ("live_on", "live_rules", "stake", "paused", "quiet", "quiet_hours", "rule_loss")
+HOT_KV = ("live_on", "live_rules", "stake", "paused", "quiet", "quiet_hours", "half_hours", "rule_loss")
 
 
 def kv_worker():
@@ -260,9 +257,13 @@ def kv_worker():
 RISK = {"ts": 0.0, "today": 0.0, "open": 0, "by_code": {}}
 
 
-def quiet_hours():
-    """(start_hour, end_hour) in Toronto time during which the 5-minute rules do not trade live, or None. Set with /quiethours"""
-    v = (kv_get("quiet_hours", "") or "").strip()
+MIN_ORDER = 1.0      # Polymarket's smallest market buy ($)
+
+
+def quiet_hours(key="quiet_hours"):
+    """(start_hour, end_hour) in Toronto time, or None. quiet_hours: 5-minute rules trade on paper only (/quiethours).
+    half_hours: 5-minute rules trade at half stake (/halfhours)"""
+    v = (kv_get(key, "") or "").strip()
     try:
         a, b = v.split("-")
         a, b = int(a), int(b)
@@ -271,8 +272,8 @@ def quiet_hours():
         return None
 
 
-def in_quiet_hours(r, t=None):
-    qh = quiet_hours()
+def in_quiet_hours(r, t=None, key="quiet_hours"):
+    qh = quiet_hours(key)
     if not qh or r.tf != 5:
         return False
     h = datetime.fromtimestamp(t or time.time(), TZ).hour
@@ -1451,6 +1452,10 @@ def decide(r, c):
         cap = min(99.0, base + r.cap)
         live = live_on() and r.code in live_codes() and not in_quiet_hours(r, t0)   # quiet hours: 5m rules trade on paper only
         stk = stake()
+        if live and in_quiet_hours(r, t0, "half_hours"):  # half hours: 5m rules trade at half stake (below Polymarket's $1 minimum -> paper)
+            stk = round(stk / 2, 2)
+            if stk < MIN_ORDER - 1e-9:
+                live, stk = False, stake()
         head = f"{r.name} {c['side']} {c['tf'] if c['tf'] < 60 else c['tf'] // 60}{'m' if c['tf'] < 60 else 'h'} · ask {c['a0']:g}¢ fair {c['fair']:.0f}¢"
         why, ok, resp, note, tim = None, False, {}, "", {}
         if live:                                   # order first, bookkeeping after (every millisecond counts)
@@ -1797,8 +1802,9 @@ def status_text():
         rd.append(f"{a} real vs Deribit volatility {v:.2f}x" + (f" · 1h move {ar:.0f}bp" if ar is not None else "") if v else f"{a} vol -")
     j1 = sum(1 for (ts, f) in list(FT) if now - 3600 <= ts <= now)
     lines.append("road: " + " | ".join(rd) + f" | BTC 3bp jumps last hour {j1}  (above 1.0x = wilder than the Deribit fair assumes)")
-    qh, cr = quiet_hours(), rule_loss_cap()
+    qh, hh, cr = quiet_hours(), quiet_hours("half_hours"), rule_loss_cap()
     lines.append("quiet hours (5m rules paper-only): " + (f"{qh[0]}:00-{qh[1]}:00 Toronto" if qh else "off") +
+                 " · half hours (5m rules half stake): " + (f"{hh[0]}:00-{hh[1]}:00" if hh else "off") +
                  " · per-rule daily loss limit: " + (f"${cr:g}" if cr > 0 else "off"))
     for a in ASSETS:
         g = [x for t, x in list(cl_gaps[a]) if t > now - 3600]
@@ -1849,6 +1855,7 @@ def export():
 HELP = """COMBO bot commands
 /status — live on/off, cash, open trades, feeds, follow-through meter, road conditions
 /quiethours 18-21 — 5-minute rules trade on paper only in those Toronto hours (off to cancel)
+/halfhours 0-3 — 5-minute rules trade at half stake in those Toronto hours (off to cancel)
 /rulestop 8 — a live rule down $8 on the day stops until midnight (off to cancel)
 /rules — every rule, live or paper
 /live on | /live off — all live rules on/off (/stop = off)
@@ -1952,6 +1959,23 @@ def handle(text):
             else:
                 kv_set("quiet_hours", "")
                 tg("couldn't read that. Use start-end hours, like /quiethours 18-21")
+    elif cmd == "/halfhours":
+        if not args:
+            hh = quiet_hours("half_hours")
+            tg("half hours: " + (f"{hh[0]}:00-{hh[1]}:00 Toronto (5-minute rules trade at half stake)" if hh else "off") +
+               "\nset with /halfhours 0-3 · turn off with /halfhours off")
+        elif args[0].lower() == "off":
+            kv_set("half_hours", "")
+            tg("half hours OFF")
+        else:
+            kv_set("half_hours", args[0])
+            hh = quiet_hours("half_hours")
+            if hh:
+                tg(f"half hours ON: live 5-minute rules trade at half stake {hh[0]}:00-{hh[1]}:00 Toronto time "
+                   f"(now ${stake() / 2:g} a trade" + (", which is under Polymarket's $1 minimum, so those trades go to paper until the stake is $2+)" if stake() / 2 < MIN_ORDER else ")"))
+            else:
+                kv_set("half_hours", "")
+                tg("couldn't read that. Use start-end hours, like /halfhours 0-3")
     elif cmd == "/rulestop":
         if not args:
             cr = rule_loss_cap()
