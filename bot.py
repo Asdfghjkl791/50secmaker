@@ -710,10 +710,10 @@ def chainlink_worker():
                     cl_gaps[a].append((now, now - q[-1][1]))
                 q.append((ts, now, v))
                 _push(a, "cl", v, now, every=0)
-    # Nov 14: Chainlink ticks about once a second, so 5s of silence means the line is dead -> drop it and reconnect at once
-    # (before: waited 30s for silence + 5s pause, so the price could be ~35s old). Two connections, so one drop never leaves a gap.
+    # Nov 14: two connections + quick reconnect (before: 30s silence + 5s pause, price up to ~35s old).
+    # Nov 16: the feed comes in bursts with normal pauses up to ~11s, so treat 15s of silence as dead (5s caused needless reconnects).
     for i in (1, 2):
-        threading.Thread(target=_run_ws, args=(f"chainlink{i}", RTDS, on, subs, "PING", 5, 5, 0.5), daemon=True).start()
+        threading.Thread(target=_run_ws, args=(f"chainlink{i}", RTDS, on, subs, "PING", 5, 15, 0.5), daemon=True).start()
     while True:
         time.sleep(3600)
 
@@ -1049,7 +1049,9 @@ def check_trigger(a, venue, now):
         threading.Thread(target=on_move, args=(a, 2, venue, round(bps, 2), now), daemon=True).start()
 
 
-CL_STALE = 10.0       # seconds: TWAP-fair rules skip signals when the last Chainlink price is older than this
+CL_STALE = 20.0       # seconds: TWAP-fair rules skip signals when the last Chainlink price is older than this
+                      # Nov 16: the feed arrives in bursts (about 1 price/s on average, but 637 gaps >3s an hour, longest ~11s)
+                      # -> 10s skipped ~5% of normal signals. 20s still catches real outages (the 26-35s one on Nov 14).
 ENTRY_DELAY = 0.30     # seconds after a 2bp jump at which the ETH / 1h / 4h rules read the ask (matches their research data)
 
 
@@ -1700,7 +1702,7 @@ def status_text():
             lines.append(f"{a} chainlink last 1h: {len(g)} prices · longest gap {max(g):.1f}s · gaps over 3s: {sum(1 for x in g if x > 3)}")
     sk = {x["code"]: x["n"] for x in dbq("SELECT code, SUM(n) n FROM stats WHERE day=? AND k='cl_stale' GROUP BY code", (day_str(),))}
     if sk:
-        lines.append("skipped today (Chainlink >10s old): " + ", ".join(f"{k} {v}" for k, v in sorted(sk.items())))
+        lines.append("skipped today (Chainlink >20s old): " + ", ".join(f"{k} {v}" for k, v in sorted(sk.items())))
     if st["err"]:
         lines.append("last errors: " + " | ".join(f"{k}: {v}" for k, v in list(st["err"].items())[-5:]))
     return "\n".join(lines)
