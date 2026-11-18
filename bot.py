@@ -79,24 +79,19 @@ RULES = [
     Rule("G10C", "ETH D-15LS-G10C", "ETH", 15, 2, "tw_d", 10, 10, 35, hi_incl=False, left_max=600, conf="filter", cap=15, live=True),
     Rule("E15", "ETH D-15E", "ETH", 15, 2, "tw_d", 5, 15, 95, R=True, left_min=743, left_max=840, cap=5, live=True),
     Rule("EH1", "ETH H1-LS", "ETH", 60, 2, "bn_d", 10, 10, 30, hi_incl=False, R=True, cap=5, live=True),
-    Rule("TR5", "BTC D5-TR 30-90", "BTC", 5, 3, "tw_d", 5, 30, 90, R=True, cap=40),
     Rule("TROL", "BTC D-15TROL", "BTC", 15, 3, "tw_o", 5, 15, 95, R=True, trol=True, cap=40),
     Rule("L15", "BTC D-15L", "BTC", 15, 3, "tw_o", 8, 20, 90, left_max=600, cap=15),
     Rule("H4", "BTC H4-LS", "BTC", 240, 2, "tw_d", 10, 10, 30, hi_incl=False, R=True, cap=15),
-    Rule("ELS5", "ETH D5-LS", "ETH", 5, 2, "tw_d", 10, 10, 30, hi_incl=False, R=True, left_max=150, cap=20),
     Rule("EH4C", "ETH H4-LS-C", "ETH", 240, 2, "tw_d", 10, 10, 30, hi_incl=False, R=True, conf="first", cap=10),
-    # Nov 13 (paper): found on the worker's REAL-TIME early2 data. ETH 5m, 2bp jump, Binance-candle fair (Deribit vol) - ask >= 5c,
-    # ask 30-95c, and Binance keeps going >= 1bp further our way within 0.5s. Ask read at the jump (no 0.3s delay), order at ~0.5s.
-    Rule("EBC5", "ETH D5-BC", "ETH", 5, 2, "bn_d", 5, 30, 95, bc=1.0, early=True, cap=10),
     # Nov 13 (paper): BTC 15m long shot from real-time early2 data. 2bp BTC jump, Binance-candle fair (Deribit vol) - ask >= 10c,
     # ask 10-30c, no R check, ask read at the jump. Held up even with the order book 2s after the jump.
-    Rule("BLS15", "BTC D-15LS2", "BTC", 15, 2, "bn_d", 10, 10, 30, hi_incl=False, early=True, cap=10),
+    # Nov 17: narrowed to 15-25c. Paper Nov 13-17: 10-15c -$1,579 and 25-30c -$1,569 at $100, 15-25c +$1,930. Checked on separate
+    # BTC 15m history Nov 5-13: 15-25c 47 tr 38% won +$23.32 ($100 +$1,782, 2s book +$10.32), Up and Down both positive.
+    Rule("BLS15", "BTC D-15LS2 15-25c", "BTC", 15, 2, "bn_d", 10, 15, 25, early=True, cap=10),
     # Nov 14 (paper): LC5 + a second opinion. Same as live LC5, but the Binance-candle fair (Deribit vol) must ALSO be >= 5c above
     # the ask. On LC5's own live trades Nov 13-14 the "both agree" half made +$15.93, the "TWAP only" half -$4.00. Needs a fair test.
     Rule("LC5B", "ETH D5-LC both fairs", "ETH", 5, 2, "tw_d", 5, 30, 95, R=True, lc=True, cap=15, fair2="bn_d", gap2=5),
-    # Nov 14 (paper): P5 that doesn't chase. Same signal as live P5, limit = ask +10c instead of +40c. Since the Chainlink fix, P5 fills
-    # where the price had already run >5c lost (-$4.20 on 130), but earlier the chased fills were winners -> settle it on new data.
-    Rule("P5T", "BTC Plain D5 lim+10", "BTC", 5, 3, "tw_d", 5, 30, 90, cap=10),
+    # (Nov 17: TR5, P5T, EBC5 and ELS5 removed - all lost clearly on paper; P5O replaced P5 live)
     # (Nov 16: FB5, the ETH 5m follow-BTC long shot, removed - its profit was all Down bets in Saturday's selloff, lost every day since)
     # Nov 15 (paper): ETH 15m follow-BTC, both fairs agree. When BTC jumps 2bp, buy the ETH 15m side in BTC's direction at 30-90c if
     # the TWAP fair AND the Binance-candle fair (both our own vol, as in the worker's recorder) are >= 5c above the ask.
@@ -121,6 +116,18 @@ RULES = [
     # Nov 16 (paper): EBC15 = the 15m sibling of EBC5 on the Binance fair with our vol. Recorder Nov 13-15: 117 tr, 67% won, +$27.05
     # ($100 +$2,414), both halves, Up and Down · early2 Nov 1-4/12-13: 119 tr, 57% won at 45c, +$16.81, 5 of 6 days up.
     Rule("EBC15", "ETH D15-BC own-vol", "ETH", 15, 2, "bn_o", 5, 30, 90, bc=1.0, early=True, cap=10),
+    # Nov 17 (paper): the LS5H long-shot recipe on 1h and 4h markets - fair (Deribit vol) >= 10c above, 20-40c, limit +10c.
+    # 1h settles on the Binance candle -> Binance fair; 4h settles on the Chainlink TWAP -> TWAP fair. Will fire rarely.
+    Rule("LS1HB", "BTC 1h LS high-win", "BTC", 60, 2, "bn_d", 10, 20, 40, early=True, cap=10),
+    Rule("LS1HE", "ETH 1h LS high-win", "ETH", 60, 2, "bn_d", 10, 20, 40, early=True, cap=10),
+    Rule("LS4HB", "BTC 4h LS high-win", "BTC", 240, 2, "tw_d", 10, 20, 40, early=True, cap=10),
+    Rule("LS4HE", "ETH 4h LS high-win", "ETH", 240, 2, "tw_d", 10, 20, 40, early=True, cap=10),
+    # Nov 17 (paper): own-volatility long shots for 1h and 4h, using our volatility over the market's own length
+    # (last 1 hour for 1h markets, last 4 hours for 4h) instead of Deribit's - the version that adapts to wild vs calm markets.
+    Rule("LV1HB", "BTC 1h LS long-vol", "BTC", 60, 2, "bn_l", 5, 10, 40, early=True, cap=10),
+    Rule("LV1HE", "ETH 1h LS long-vol", "ETH", 60, 2, "bn_l", 5, 10, 40, early=True, cap=10),
+    Rule("LV4HB", "BTC 4h LS long-vol", "BTC", 240, 2, "tw_l", 5, 10, 40, early=True, cap=10),
+    Rule("LV4HE", "ETH 4h LS long-vol", "ETH", 240, 2, "tw_l", 5, 10, 40, early=True, cap=10),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
