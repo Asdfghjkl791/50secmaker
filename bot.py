@@ -68,7 +68,7 @@ class Rule:
     def __init__(self, code, name, asset, tf, trig, fair, gap, lo, hi, hi_incl=True, R=False, left_max=None, left_min=None,
                  conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False, fair2=None, gap2=None, follow=None,
                  lc_min=None, opp_max=None, same_min=None, same_max=None, first_age=None, bps_min=None,
-                 fade=False, fmin=None, fmax=None, dip=None, flat=None, persist=None):
+                 fade=False, fmin=None, fmax=None, dip=None, flat=None, persist=None, xask_min=None, cheap_age=None):
         # Nov 19 additions (all optional, None/False = not used, so the older rules behave exactly as before):
         #   fair=None      no fair-price test at all · fair="ad" = whichever TWAP fair (Deribit vol / our vol) scored better lately
         #   lc_min         other exchanges must move >= this many bp our way in the 0.5s after the jump (no R check)
@@ -80,6 +80,8 @@ class Rule:
         #   fmin / fmax    our fair for the side we buy must be above fmin / below fmax (50 = the side is ahead / behind)
         #   dip / flat     (min_age, max_age, cents): vs our side's ask that long ago, the ask is down by >= cents / moved < cents
         #   persist        (min_age, max_age): the fair gap must also have been there at the previous look that long ago
+        #   xask_min       the OTHER coin's same side (same market window) must be priced at least this high right now
+        #   cheap_age      our side must not have been above 35c at any jump in the last N seconds (a real underdog, not a flash)
         self.__dict__.update(locals())
         del self.__dict__["self"]
 
@@ -174,6 +176,15 @@ RULES = [
     Rule("LC5K", "ETH D5-LC clean", "ETH", 5, 2, "tw_d", 5, 30, 95, R=True, lc=True, cap=15, opp_max=1),
     # E5A: ETH 5m high-win. Adaptive fair >= 10c above, others confirm, clean. Recorder Nov 13-18: 86 tr, 78% won, +$16.41 at $1 (2s).
     Rule("E5A", "ETH 5m adaptive high-win", "ETH", 5, 2, "ad", 10, 30, 95, lc_min=0.1, opp_max=1, early=True),
+    # XC5 / XC15E (added Nov 19 evening, paper): the deep long shot. What separated cheap winners from cheap losers in the Nov 13-19
+    # recorder data: (1) other exchanges are already moving that side's way half a second after a Binance jump, (2) the OTHER coin's
+    # same side is still alive (25c+), and (3) the side is a real underdog, not a flash (not above 35c in the last 30s).
+    # Buying every 3-15c side lost ~25c per $1; with these three, cautious price, limit +3c:
+    #   BTC 5m (2bp jumps toward the side): 154 tr, 35 wins (23%) at ~10c, +$62 at $1, +$3,261 at $100, 6 of 7 days, all 3 periods up.
+    #   ETH 15m: 116 tr, 19 wins (16%), +$13 at $1, -$250 at $100: weak, watch only.
+    # Found and checked on the same 7 days, so the fair test starts when this goes live. Only ~45% of BTC signals can be filled.
+    Rule("XC5", "BTC 5m deep LS cross-coin", "BTC", 5, 2, None, 0, 3, 15, lc_min=0.3, xask_min=25, cheap_age=30, cap=3, early=True),
+    Rule("XC15E", "ETH 15m deep LS cross-coin", "ETH", 15, 2, None, 0, 3, 15, lc_min=0.3, xask_min=25, cheap_age=30, cap=3, early=True),
     # R15: ETH 15m early reversal. In the first 3 minutes buy the side the jump went AGAINST when it is 20-60c, its ask fell >= 3c
     #      in the last 30-90s and the Binance fair (our vol) still puts it >= 5c above the ask. Low win rate, big payoff.
     #      Tracker Oct 3-Nov 5: 915 tr 35% won +$9,880 at $100 · recorder Nov 13-18 (never searched): 77 tr 51% won, +$29.91 at $1.
@@ -193,7 +204,8 @@ RULES = [
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
 AD_KEYS = sorted({(r.asset, r.tf, r.trig) for r in RULES if r.fair == "ad"})          # what the adaptive scorer has to follow
-LOOK_KEYS = {(r.asset, r.tf, r.trig) for r in RULES if r.dip or r.flat or r.persist}  # markets whose earlier looks we keep
+LOOK_KEYS = {(r.asset, r.tf) for r in RULES if r.dip or r.flat or r.persist or r.cheap_age}  # markets whose earlier looks we keep
+CHEAP_PX = 35.0                               # cheap_age: "was it above this price recently?"
 
 # ── shared state ─────────────────────────────────────────────────────────────────
 lock = threading.RLock()
@@ -1338,6 +1350,21 @@ def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
                         or (r.same_min is not None and n_same < r.same_min) \
                         or (r.first_age is not None and (first is None or t0 - first < r.first_age)):
                     continue
+            if r.xask_min is not None:                 # the other coin's same side must still be alive
+                with lock:
+                    mo = markets.get(("ETH" if a == "BTC" else "BTC", tf, o))
+                xa = asks_of(mo["up" if rup else "dn"], 1) if mo else None
+                if not xa or xa[0][0] < r.xask_min:
+                    continue
+            if r.cheap_age is not None:                # a real underdog: not above 35c at any jump in the last N seconds
+                with lock:
+                    q = [x for x in LOOKS.get((a, tf, o), ()) if x[0] < t0]
+                if not q:
+                    continue
+                ix = 2 if rup else 3
+                hi_t = [x[0] for x in q if x[ix] is not None and x[ix] > CHEAP_PX]
+                if t0 - (hi_t[-1] if hi_t else q[0][0]) < r.cheap_age:
+                    continue
             bad = False
             for kind, spec in (("dip", r.dip), ("flat", r.flat), ("persist", r.persist)):
                 if not spec:
@@ -1625,7 +1652,7 @@ def on_move(a, trig, feed, bps, t0):
         m10, m2 = lead_mean(a, t0, -10, sg), lead_mean(a, t0, -2, sg)
         for (a_, tf, o), m in mk:
             fu = fairs(a, tf, o, t0)                                     # fair from prices at the jump
-            if (a, tf, trig) in LOOK_KEYS:                                # remember both sides' asks + fairs for the dip / flat / persist rules
+            if (a, tf) in LOOK_KEYS:                                      # remember both sides' asks + fairs for the dip / flat / persist rules
                 ua, da = asks_of(m["up"], 1), asks_of(m["dn"], 1)
                 with lock:
                     LOOKS.setdefault((a, tf, o), deque(maxlen=4000)).append(
