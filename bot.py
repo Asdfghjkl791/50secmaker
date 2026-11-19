@@ -146,6 +146,12 @@ RULES = [
     # P5A: P5 with the fair that has been more accurate over the last 24h of settled markets (Deribit vol or our vol), clean moves only.
     #      Nov 5-17: 556 tr, 76% won, +$47.84 at $1 (2s book), +$6,006 at $100, 11 of 13 days up (P5 +$23, P5O +$38 over the same days).
     Rule("P5A", "BTC 5m adaptive clean", "BTC", 5, 3, "ad", 5, 30, 90, opp_max=1),
+    # P5D / L15A (added Nov 19 afternoon, paper): the adaptive fair without the clean check, and on the late 15m rule. Cautious price, $1:
+    #   plain D5:  Deribit vol +$38.81 then -$33.89 · our vol +$12.94 then +$11.52 · adaptive +$38.81 then +$5.57 (Nov 5-13, Nov 13-19)
+    #   D-15L:     our vol +$7.24 then +$10.50 · Deribit -$6.29 then +$19.75 · adaptive +$2.38 then +$25.69 (79% won, 7 of 7 days)
+    # Adaptive is never the best single week, but it avoids each fixed fair's bad week.
+    Rule("P5D", "BTC 5m adaptive plain", "BTC", 5, 3, "ad", 5, 30, 90),
+    Rule("L15A", "BTC 15m late adaptive", "BTC", 15, 3, "ad", 8, 20, 90, left_max=600),
     # M5: BTC 5m near 50c. Own-vol TWAP fair >= 3c above, other exchanges confirm >= 0.5bp, NO earlier jump the other way.
     #      Nov 5-12: 45 tr 78% won · Nov 13-17: 66 tr 79% won · +$19.50 at $1 (2s), +$2,344 at $100.
     Rule("M5", "BTC 5m mid clean", "BTC", 5, 3, "tw_o", 3, 45, 65, lc_min=0.5, opp_max=0),
@@ -2117,7 +2123,7 @@ def status_text():
 def rules_text():
     lc = live_codes()
     return "📋 rules (code · name · LIVE/paper)\n" + "\n".join(f"{r.code:<4} {r.name} · {'LIVE' if r.code in lc else 'paper'} · limit +{r.cap:g}¢" for r in RULES) + \
-        "\n\nAdaptive fair in use now (P5A, E5A):\n" + ad_text() + "\n\n/live CODE on|off to switch one rule"
+        "\n\nAdaptive fair in use now (P5A, P5D, L15A, E5A):\n" + ad_text() + "\n\n/live CODE on|off to switch one rule"
 
 
 def trades_text(n=12):
