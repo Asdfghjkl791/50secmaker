@@ -160,6 +160,9 @@ RULES = [
     # E5S: ETH 5m. Jump >= 3bp and other exchanges follow >= 1bp within 0.5s, 30-95c, no fair test.
     #      early2 Nov 1-13: 273 tr 66% · recorder Nov 13-17: 302 tr 76% won, +$30 at $1 (2s), +$2,211 at $100.
     Rule("E5S", "ETH 5m strong confirm", "ETH", 5, 2, None, 0, 30, 95, bps_min=3, lc_min=1.0, early=True),
+    Rule("ELS5", "ETH 5m LS strong confirm", "ETH", 5, 2, None, 0, 20, 40, bps_min=3, lc_min=0.5, early=True),
+    # ^ ELS5 (added Nov 19, fair test from then): E5S's long-shot cousin. Recorder, cautious price: Nov 13-15 139 tr 45% won +$26.15 at $1,
+    #   Nov 16-19 80 tr 48% won +$14.44. Older data (weaker stand-in confirm) about break-even, so unproven.
     # LC5K: live LC5 exactly, plus the clean check (<= 1 earlier ETH jump the other way). Recorder Nov 13-18: LC5 +$1,081 at $100,
     #      with the check +$2,250 on half the trades, 6 of 6 days up. Compare it with LC5 day by day.
     Rule("LC5K", "ETH D5-LC clean", "ETH", 5, 2, "tw_d", 5, 30, 95, R=True, lc=True, cap=15, opp_max=1),
@@ -269,7 +272,9 @@ def init_db():
     dbx("CREATE INDEX IF NOT EXISTS trades_t0 ON trades (t0)")
     for col in ("bk_age REAL", "a0_ts REAL", "a25_ts REAL", "t_build REAL", "ft_c REAL", "ft_m REAL", "ft_n INTEGER",
                 "volr REAL", "j1h INTEGER", "ar1h REAL",
-                "fk TEXT", "n_same INTEGER", "n_opp INTEGER"):     # Nov 19: which fair was used, earlier jumps same way / other way
+                "fk TEXT", "n_same INTEGER", "n_opp INTEGER",
+                "q_cost1 REAL", "q_sh1 REAL", "q_cost100 REAL", "q_sh100 REAL", "q_px REAL", "q_pnl1 REAL", "q_pnl100 REAL",   # old 1s-book paper price
+                "t_hdr REAL", "pm_lag REAL"):     # Nov 19: which fair was used, earlier jumps same way / other way
         try:
             dbx(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -535,7 +540,7 @@ def init_clob():
         tg(f"⚠️ couldn't connect to Polymarket for trading: {str(e)[:200]}")
 
 
-def fast_post(c, order, ot):
+def fast_post(c, order, ot, tim=None):
     try:
         import py_clob_client_v2.client as cm
         owner = c.creds.api_key or ""
@@ -543,6 +548,8 @@ def fast_post(c, order, ot):
                    else cm.order_to_json_v1(order, owner, ot, False, False))
         ser = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         headers = c._l2_headers("POST", cm.POST_ORDER, body=payload, serialized_body=ser)
+        if tim is not None:
+            tim["hdr"] = time.time()               # everything up to here is our own work; after it we wait for Polymarket
         return c._post(f"{c.host}{cm.POST_ORDER}", headers=headers, data=ser)
     except (AttributeError, ImportError, TypeError) as e:
         log.warning(f"[LIVE] fast_post fallback: {e}")
@@ -559,11 +566,11 @@ def buy(token, dollars, limit_c, tim):
                                                            order_type=OrderType.FAK))
         t1 = time.time()
         try:
-            resp = fast_post(clob(), order, OrderType.FAK) or {}
+            resp = fast_post(clob(), order, OrderType.FAK, tim) or {}
         except Exception as e:
             resp = {"success": False, "errorMsg": str(e)[:200]}
         t2 = time.time()
-    tim.update(build=t1 - t0, sent=t1, resp=t2)
+    tim.update(build=t1 - t0, sent=t1, resp=t2, hdr=(tim["hdr"] - t1) if tim.get("hdr") else None)
     log.info(f"[LIVE] buy build {t1 - t0:.2f}s post {t2 - t1:.2f}s resp {str(resp)[:300]}")
     if not isinstance(resp, dict):
         resp = {"success": False, "errorMsg": str(resp)[:200]}
@@ -917,6 +924,10 @@ def pm_handle(data):
         if not isinstance(m, dict):
             continue
         st["pm_msg"] = time.time()
+        try:                                       # Nov 19: how far behind Polymarket's own clock each book message arrives (seconds)
+            st["pm_lag"] = st["pm_msg"] - float(m["timestamp"]) / 1000.0
+        except Exception:
+            pass
         et = m.get("event_type")
         with lock:
             if et == "book":
@@ -1327,7 +1338,7 @@ def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
             tok, opp = (m["up"], m["dn"]) if rup else (m["dn"], m["up"])
             ctx = dict(a=a, tf=tf, o=o, tok=tok, opp=opp, up=rup, side="UP" if rup else "DOWN", t0=t0, feed=feed, bps=bps, a0=a0,
                        fair=None if fv is None else round(fv, 2), gap=None if gap is None else round(gap, 2), left=round(left, 1),
-                       m10=m10, m2=m2, cond=m.get("cond"), a0_ts=a0_ts, bk_age=bk_age, late=bool(delay), sg=sg,
+                       m10=m10, m2=m2, cond=m.get("cond"), a0_ts=a0_ts, bk_age=bk_age, late=bool(delay), sg=sg, pm_lag=st.get("pm_lag"),
                        fk=fk if tested else None, n_same=n_same, n_opp=n_opp)
             threading.Thread(target=decide, args=(r, ctx), daemon=True).start()
         except Exception as e:
@@ -1351,7 +1362,7 @@ def rec_capture(a, trig, feed, bps, t0):
             mk = [(k, dict(v)) for k, v in markets.items() if k[0] == a and k[2] <= t0 < k[2] + k[1] * 60]
         if not mk:
             return
-        base = {"bps": bps, "feed": feed, "m10": lead_mean(a, t0, -10, sg), "m2": lead_mean(a, t0, -2, sg),
+        base = {"pm_lag0": round(st["pm_lag"], 3) if st.get("pm_lag") is not None else None, "bps": bps, "feed": feed, "m10": lead_mean(a, t0, -10, sg), "m2": lead_mean(a, t0, -2, sg),
                 "vis0": last(a, "vis", t0), "sig": sigma(a), "sigl1": sigma_long(a, 3600), "sigl4": sigma_long(a, 14400), "iv": (ivs.get(a) or {}).get("iv"), "iv50": iv50.get("iv") if a == "BTC" else None}
         per = {}
         for (a_, tf, o), m in mk:
@@ -1374,7 +1385,8 @@ def rec_capture(a, trig, feed, bps, t0):
                         snap[side + "b"] = sorted(((p, round(z, 1)) for p, z in (b.get("bids") or {}).items()), reverse=True)[:3]
                     d["s"][f"{off:g}"] = snap
         base.update(p05=lead_mean(a, t0, 0.5, sg), p1=lead_mean(a, t0, 1.0, sg), vis05=last(a, "vis", t0 + 0.5),
-                    vis1=last(a, "vis", t0 + 1.0), vis2=last(a, "vis", t0 + 2.0), pm_age=round(time.time() - st["pm_msg"], 2))
+                    vis1=last(a, "vis", t0 + 1.0), vis2=last(a, "vis", t0 + 2.0), pm_age=round(time.time() - st["pm_msg"], 2),
+                    pm_lag2=round(st["pm_lag"], 3) if st.get("pm_lag") is not None else None)
         for (tf, o), d in per.items():
             d.pop("up_tok"), d.pop("dn_tok")
             blob = zlib.compress(json.dumps({**base, **d}, separators=(",", ":")).encode())
@@ -1678,6 +1690,8 @@ def decide(r, c):
         head = f"{r.name} {c['side']} {c['tf'] if c['tf'] < 60 else c['tf'] // 60}{'m' if c['tf'] < 60 else 'h'} · ask {c['a0']:g}¢" + \
                (f" fair {c['fair']:.0f}¢" if c["fair"] is not None else "")
         why, ok, resp, note, tim = None, False, {}, "", {}
+        snap = {}
+        threading.Thread(target=twin_snap, args=(c, snap), daemon=True).start()   # paper price is photographed on time, order or no order
         if live:                                   # order first, bookkeeping after (every millisecond counts)
             why = risk_check(r, c, stk)
             if not why:
@@ -1691,14 +1705,14 @@ def decide(r, c):
         fc, fm, fn = ft_stats(3 * 3600, t0) if c["a"] == "BTC" else (None, None, None)
         volr, j1h, ar1h = road(c["a"], t0)
         rid = dbx("INSERT INTO trades (code, rule, asset, tf, o, side, mode, status, t0, feed, bps, ask0, a25, fair, gap, left_s, m10, m2, p05, cap, stake, token, cond, "
-                  "t_sent, t_resp, lag, bk_age, a0_ts, t_build, ft_c, ft_m, ft_n, volr, j1h, ar1h, fk, n_same, n_opp) "
-                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "t_sent, t_resp, lag, bk_age, a0_ts, t_build, ft_c, ft_m, ft_n, volr, j1h, ar1h, fk, n_same, n_opp, t_hdr, pm_lag) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (r.code, r.name, c["a"], c["tf"], c["o"], c["side"], "LIVE" if live else "PAPER", "SIGNAL", t0, c["feed"], c["bps"], c["a0"], a25,
                    c["fair"], c["gap"], c["left"], c["m10"], c["m2"], p05, cap, stk if live else 1.0, c["tok"], c["cond"],
                    tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"], tim.get("build"), fc, fm, fn, volr, j1h, ar1h,
-                   c.get("fk"), c.get("n_same"), c.get("n_opp")))
+                   c.get("fk"), c.get("n_same"), c.get("n_opp"), tim.get("hdr"), c.get("pm_lag")))
         st["signals"] += 1
-        threading.Thread(target=paper_twin, args=(r, c, rid, cap, live, key), daemon=True).start()
+        threading.Thread(target=paper_twin, args=(r, c, rid, cap, live, key, snap), daemon=True).start()
         if not live:
             return
         if why:
@@ -1749,16 +1763,46 @@ def decide(r, c):
         _err("decide_" + r.code, e)
 
 
-def paper_twin(r, c, rid, cap, live, key):
-    """what the paper rule pays: the book 1s after the jump (0.5s on 15m), up to the limit, for $1 and $100"""
+TWIN_OFF = 2.0        # Nov 19: the paper twin prices off the book 2s after the jump (was 1s; 0.5s on 15m) ...
+TWIN_ADD = 1.0        # ... plus 1c, and the price is rounded UP to the next whole cent. Fees are rounded up to the next cent as before.
+                      # Why: on 1,200+ real fills (Nov 12-19) the 1s book was too kind (P5O paper +$24.51, real +$11.78; LC5 paper +$3.40,
+                      # real -$9.22). The 2s book matched real money (P5O +$12.74, LC5 -$8.80); +1c keeps paper a little BELOW real.
+
+
+def cautious(cost, sh):
+    """the cautious paper fill: same dollars, price 1c worse and rounded up to the next cent -> (cost, shares, price)"""
+    if cost <= 0 or sh <= 0:
+        return 0.0, 0.0, None
+    px = min(99.0, float(math.ceil(cost / sh * 100 + TWIN_ADD - 1e-9)))
+    return cost, cost / (px / 100), px
+
+
+def twin_snap(c, snap):
+    """photographs our side's asks 1s (0.5s on 15m) and 2s after the jump. Started BEFORE any live order goes out, so a slow
+    order no longer makes the paper price late (it did before Nov 19: the twin of a live trade waited for the order's answer)."""
     try:
-        off = 0.5 if c["tf"] == 15 else 1.0
-        time.sleep(max(0.0, c["t0"] + off - time.time()))
-        lad = asks_of(c["tok"], 25)
-        c1, s1 = walk(lad, 1.0, cap)
-        c100, s100 = walk(lad, 100.0, cap)
-        dbx("UPDATE trades SET p_cost1=?, p_sh1=?, p_cost100=?, p_sh100=?, p_px=? WHERE id=?",
-            (c1, s1, c100, s100, (c1 / s1 * 100) if s1 > 0 else None, rid))
+        for k, off in (("old", 0.5 if c["tf"] == 15 else 1.0), ("new", TWIN_OFF)):
+            time.sleep(max(0.0, c["t0"] + off - time.time()))
+            snap[k] = asks_of(c["tok"], 25)
+    except Exception as e:
+        _err("twin_snap", e)
+    snap["done"] = True
+
+
+def paper_twin(r, c, rid, cap, live, key, snap):
+    """what the paper rule pays for $1 and $100, up to the limit. p_ columns = the cautious price (2s book, +1c, rounded up);
+    q_ columns = the old 1s-book price, kept only so the two can be compared in /export."""
+    try:
+        t_end = time.time() + 6
+        while not snap.get("done") and time.time() < t_end:
+            time.sleep(0.02)
+        old, new = snap.get("old") or [], snap.get("new") or []
+        q1, qs1 = walk(old, 1.0, cap)
+        q100, qs100 = walk(old, 100.0, cap)
+        c1, s1, px1 = cautious(*walk(new, 1.0, cap))
+        c100, s100, _ = cautious(*walk(new, 100.0, cap))
+        dbx("UPDATE trades SET p_cost1=?, p_sh1=?, p_cost100=?, p_sh100=?, p_px=?, q_cost1=?, q_sh1=?, q_cost100=?, q_sh100=?, q_px=? WHERE id=?",
+            (c1, s1, c100, s100, px1, q1, qs1, q100, qs100, (q1 / qs1 * 100) if qs1 > 0 else None, rid))
         if not live:
             if c1 <= 0:
                 dbx("UPDATE trades SET status='MISSED', note='paper: price ran past the limit' WHERE id=?", (rid,))
@@ -1829,8 +1873,10 @@ def settler():
                 status = "SETTLED" if x["status"] == "HOLDING" else x["status"]
                 if x["mode"] == "PAPER" and x["status"] == "HOLDING":
                     pnl = p1
-                dbx("UPDATE trades SET outcome=?, won=?, pnl=?, p_pnl1=?, p_pnl100=?, status=?, settled_ts=? WHERE id=?",
-                    (oc, won, pnl, p1, p100, status, now, x["id"]))
+                q1 = ((x["q_sh1"] if won else 0) - x["q_cost1"] - fee_of(x["q_sh1"], x["q_cost1"])) if (x.get("q_cost1") or 0) > 0 else None
+                q100 = ((x["q_sh100"] if won else 0) - x["q_cost100"] - fee_of(x["q_sh100"], x["q_cost100"])) if (x.get("q_cost100") or 0) > 0 else None
+                dbx("UPDATE trades SET outcome=?, won=?, pnl=?, p_pnl1=?, p_pnl100=?, q_pnl1=?, q_pnl100=?, status=?, settled_ts=? WHERE id=?",
+                    (oc, won, pnl, p1, p100, q1, q100, status, now, x["id"]))
                 if x["mode"] == "LIVE" and pnl is not None and not quiet():
                     t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
                     td = dbq("SELECT COALESCE(SUM(pnl),0) s, COUNT(*) n FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (t_day,))[0]
@@ -1931,7 +1977,7 @@ def _range(which):
 
 def pnl_text(t_from, t_to, label):
     rows = dbq("SELECT * FROM trades WHERE t0 >= ? AND t0 < ? AND mode IN ('LIVE','PAPER') ORDER BY t0", (t_from, t_to))
-    lines = [f"📊 {label} — live = real money, twin = what the paper rule made ($1 / $100 a trade)"]
+    lines = [f"📊 {label} — live = real money, twin = cautious paper ($1 / $100 a trade: book 2s after the jump, +1¢, rounded up)"]
     tl = {"n": 0, "w": 0, "pnl": 0.0, "open": 0}
     tp = {"n": 0, "w": 0, "p1": 0.0, "p100": 0.0}
     for r in RULES:
