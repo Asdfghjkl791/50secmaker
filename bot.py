@@ -699,23 +699,40 @@ def _push(a, venue, p, now=None, every=0.05):
 
 def _run_ws(name, url, on_msg, subs=None, ping=None, ping_every=15, timeout=30, retry=5):
     while True:
+        alive = [True]
         try:
             ws = websocket.create_connection(url, timeout=10)
             ws.settimeout(timeout)
             for s in (subs or []):
                 ws.send(s if isinstance(s, str) else json.dumps(s))
             log.info(f"{name} connected")
-            lp = time.time()
+            if ping:
+                # Nov 19: pings now go out on their own clock. Before, a ping was only sent right after a message arrived, so a quiet
+                # feed never got one. Polymarket's price feed requires a PING every 5s; without it we only got the prices sent at
+                # connect, then silence until the 15s timeout and a reconnect (seen in the logs all day, every day).
+                def pinger(ws=ws, alive=alive):
+                    msg = ping if isinstance(ping, str) else json.dumps(ping)
+                    while alive[0]:
+                        time.sleep(ping_every)
+                        if not alive[0]:
+                            break
+                        try:
+                            ws.send(msg)
+                        except Exception:
+                            break
+                threading.Thread(target=pinger, daemon=True).start()
             while True:
-                if ping and time.time() - lp > ping_every:
-                    ws.send(ping if isinstance(ping, str) else json.dumps(ping))
-                    lp = time.time()
                 raw = ws.recv()
                 if not raw or raw in ("pong", "PONG") or raw[0] not in "{[":
                     continue
                 on_msg(json.loads(raw))
         except Exception as e:
             _err(name, e)
+        alive[0] = False
+        try:
+            ws.close()
+        except Exception:
+            pass
         time.sleep(retry)
 
 
@@ -1362,7 +1379,7 @@ def rec_capture(a, trig, feed, bps, t0):
             mk = [(k, dict(v)) for k, v in markets.items() if k[0] == a and k[2] <= t0 < k[2] + k[1] * 60]
         if not mk:
             return
-        base = {"pm_lag0": round(st["pm_lag"], 3) if st.get("pm_lag") is not None else None, "bps": bps, "feed": feed, "m10": lead_mean(a, t0, -10, sg), "m2": lead_mean(a, t0, -2, sg),
+        base = {"cl_age": round(t0 - cl[a][-1][1], 2) if cl[a] else None, "pm_lag0": round(st["pm_lag"], 3) if st.get("pm_lag") is not None else None, "bps": bps, "feed": feed, "m10": lead_mean(a, t0, -10, sg), "m2": lead_mean(a, t0, -2, sg),
                 "vis0": last(a, "vis", t0), "sig": sigma(a), "sigl1": sigma_long(a, 3600), "sigl4": sigma_long(a, 14400), "iv": (ivs.get(a) or {}).get("iv"), "iv50": iv50.get("iv") if a == "BTC" else None}
         per = {}
         for (a_, tf, o), m in mk:
