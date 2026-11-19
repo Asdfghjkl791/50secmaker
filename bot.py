@@ -66,7 +66,20 @@ LEAD_V = ("bybit", "okx", "hl", "kraken", "bitstamp", "cb")
 # ── the rules ────────────────────────────────────────────────────────────────────
 class Rule:
     def __init__(self, code, name, asset, tf, trig, fair, gap, lo, hi, hi_incl=True, R=False, left_max=None, left_min=None,
-                 conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False, fair2=None, gap2=None, follow=None):
+                 conf=None, trol=False, lc=False, cap=10, live=False, bc=None, early=False, fair2=None, gap2=None, follow=None,
+                 lc_min=None, opp_max=None, same_min=None, same_max=None, first_age=None, bps_min=None,
+                 fade=False, fmin=None, fmax=None, dip=None, flat=None, persist=None):
+        # Nov 19 additions (all optional, None/False = not used, so the older rules behave exactly as before):
+        #   fair=None      no fair-price test at all · fair="ad" = whichever TWAP fair (Deribit vol / our vol) scored better lately
+        #   lc_min         other exchanges must move >= this many bp our way in the 0.5s after the jump (no R check)
+        #   opp_max        at most this many earlier jumps the OTHER way in this market (0 = none: a clean first move)
+        #   same_min/max   earlier jumps the SAME way in this market (same_max=0 = this is the first; same_min=1 = a second push)
+        #   first_age      the first same-way jump must be at least this many seconds old
+        #   bps_min        the jump itself must be at least this big (bp)
+        #   fade           buy the side the jump went AGAINST (the side that just fell)
+        #   fmin / fmax    our fair for the side we buy must be above fmin / below fmax (50 = the side is ahead / behind)
+        #   dip / flat     (min_age, max_age, cents): vs our side's ask that long ago, the ask is down by >= cents / moved < cents
+        #   persist        (min_age, max_age): the fair gap must also have been there at the previous look that long ago
         self.__dict__.update(locals())
         del self.__dict__["self"]
 
@@ -128,9 +141,50 @@ RULES = [
     Rule("LV1HE", "ETH 1h LS long-vol", "ETH", 60, 2, "bn_l", 5, 10, 40, early=True, cap=10),
     Rule("LV4HB", "BTC 4h LS long-vol", "BTC", 240, 2, "tw_l", 5, 10, 40, early=True, cap=10),
     Rule("LV4HE", "ETH 4h LS long-vol", "ETH", 240, 2, "tw_l", 5, 10, 40, early=True, cap=10),
+    # ── Nov 19 (paper): the rules found on Nov 18. Numbers are from the data they were FOUND on, so expect less on paper. ──
+    # All limit +10c. "clean" = few or no earlier jumps the other way in this market (whipsaw markets are where the old rules lose).
+    # P5A: P5 with the fair that has been more accurate over the last 24h of settled markets (Deribit vol or our vol), clean moves only.
+    #      Nov 5-17: 556 tr, 76% won, +$47.84 at $1 (2s book), +$6,006 at $100, 11 of 13 days up (P5 +$23, P5O +$38 over the same days).
+    Rule("P5A", "BTC 5m adaptive clean", "BTC", 5, 3, "ad", 5, 30, 90, opp_max=1),
+    # M5: BTC 5m near 50c. Own-vol TWAP fair >= 3c above, other exchanges confirm >= 0.5bp, NO earlier jump the other way.
+    #      Nov 5-12: 45 tr 78% won · Nov 13-17: 66 tr 79% won · +$19.50 at $1 (2s), +$2,344 at $100.
+    Rule("M5", "BTC 5m mid clean", "BTC", 5, 3, "tw_o", 3, 45, 65, lc_min=0.5, opp_max=0),
+    # LS5C: LS5O + first clean jump (first jump its way, at most one the other way). 80 tr, 57.5% won at ~30c, +$28.55 at $1 (2s).
+    Rule("LS5C", "BTC 5m LS first clean", "BTC", 5, 3, "tw_o", 5, 10, 40, same_max=0, opp_max=1),
+    # S15: BTC 15m. On 15m the FIRST jump is noise; the second push the same way (>=10s later, <=1 jump against) is the signal.
+    #      Binance fair (our vol) >= 5c above, 40-80c. Oct 29-Nov 17: 418 tr, 74% won, +$40 at $1 (2s), +$4,858 at $100, 3 periods.
+    Rule("S15", "BTC 15m second push", "BTC", 15, 3, "bn_o", 5, 40, 80, same_min=1, first_age=10, opp_max=1),
+    # LL15: BTC 15m late long shot. Jump toward the cheap side with <= 4.5 min left, 20-35c, no fair test.
+    #      Oct 29-Nov 17: 155 tr, 43% won at 27c, +$41.80 at $1 (2s), +$5,098 at $100, 3 periods.
+    Rule("LL15", "BTC 15m late long shot", "BTC", 15, 3, None, 0, 20, 35, left_max=270),
+    # E5S: ETH 5m. Jump >= 3bp and other exchanges follow >= 1bp within 0.5s, 30-95c, no fair test.
+    #      early2 Nov 1-13: 273 tr 66% · recorder Nov 13-17: 302 tr 76% won, +$30 at $1 (2s), +$2,211 at $100.
+    Rule("E5S", "ETH 5m strong confirm", "ETH", 5, 2, None, 0, 30, 95, bps_min=3, lc_min=1.0, early=True),
+    # LC5K: live LC5 exactly, plus the clean check (<= 1 earlier ETH jump the other way). Recorder Nov 13-18: LC5 +$1,081 at $100,
+    #      with the check +$2,250 on half the trades, 6 of 6 days up. Compare it with LC5 day by day.
+    Rule("LC5K", "ETH D5-LC clean", "ETH", 5, 2, "tw_d", 5, 30, 95, R=True, lc=True, cap=15, opp_max=1),
+    # E5A: ETH 5m high-win. Adaptive fair >= 10c above, others confirm, clean. Recorder Nov 13-18: 86 tr, 78% won, +$16.41 at $1 (2s).
+    Rule("E5A", "ETH 5m adaptive high-win", "ETH", 5, 2, "ad", 10, 30, 95, lc_min=0.1, opp_max=1, early=True),
+    # R15: ETH 15m early reversal. In the first 3 minutes buy the side the jump went AGAINST when it is 20-60c, its ask fell >= 3c
+    #      in the last 30-90s and the Binance fair (our vol) still puts it >= 5c above the ask. Low win rate, big payoff.
+    #      Tracker Oct 3-Nov 5: 915 tr 35% won +$9,880 at $100 · recorder Nov 13-18 (never searched): 77 tr 51% won, +$29.91 at $1.
+    Rule("R15", "ETH 15m early reversal", "ETH", 15, 2, "bn_o", 5, 20, 60, fade=True, fmax=50, left_min=720, left_max=876,
+         dip=(30, 90, 3), early=True),
+    Rule("R15C", "ETH 15m early reversal 40-60c", "ETH", 15, 2, "bn_o", 5, 40, 60, fade=True, fmax=50, left_min=720, left_max=876,
+         dip=(30, 90, 3), early=True),
+    # The 1h / 4h rules below were found on Aug-Oct tracker data and were FLAT on the recorder's Nov 13-17 (few trades): watch only.
+    # L1H: BTC 1h, minutes 30-50, the side that is ahead, long-vol fair >= 5c above now and at the previous look 45-150s ago.
+    Rule("L1H", "BTC 1h leader underpriced", "BTC", 60, 2, "bn_l", 5, 20, 80, fmin=50, left_min=600, left_max=1800,
+         persist=(45, 150), early=True),
+    # D4H: BTC 4h favourite dip. Leader at 75-95c, its ask fell >= 3c over the last 6-12 min, long-vol fair still >= 3c above.
+    Rule("D4H", "BTC 4h favourite dip", "BTC", 240, 2, "tw_l", 3, 75, 95, fmin=50, dip=(360, 720, 3), early=True),
+    # F4H: ETH 4h steady favourite. Leader at 75-95c, ask moved < 3c over the last 6-12 min, long-vol fair >= 8c above.
+    Rule("F4H", "ETH 4h steady favourite", "ETH", 240, 2, "tw_l", 8, 75, 95, fmin=50, flat=(360, 720, 3), early=True),
 ]
 RULE = {r.code: r for r in RULES}
 PLAN = {a: sorted({r.tf for r in RULES if r.asset == a}) for a in ASSETS}
+AD_KEYS = sorted({(r.asset, r.tf, r.trig) for r in RULES if r.fair == "ad"})          # what the adaptive scorer has to follow
+LOOK_KEYS = {(r.asset, r.tf, r.trig) for r in RULES if r.dip or r.flat or r.persist}  # markets whose earlier looks we keep
 
 # ── shared state ─────────────────────────────────────────────────────────────────
 lock = threading.RLock()
@@ -152,6 +206,10 @@ done = set()                                 # (code, asset, tf, o) traded / dec
 dlock = threading.Lock()
 order_lock = threading.Lock()
 _outcomes = {}
+JH = {}                                      # (asset, trig) -> deque((t0, direction)): every jump, for the "clean move" rules
+LOOKS = {}                                   # (asset, tf, o) -> deque((t0, direction, up ask, down ask, fairs)): what a market looked like at each jump
+AD = {}                                      # (asset, tf) -> {"pick", "tw_d", "tw_o", "n", "ts"}: which TWAP fair scored better over the last 24h
+AD_DEFAULT = "tw_d"                          # until 40 settled samples exist, the adaptive rules use the Deribit-vol fair (as tested)
 
 
 def _err(k, e):
@@ -210,7 +268,8 @@ def init_db():
         outcome TEXT, won INTEGER, pnl REAL, p_pnl1 REAL, p_pnl100 REAL, settled_ts REAL, copy_checked INTEGER DEFAULT 0)""")
     dbx("CREATE INDEX IF NOT EXISTS trades_t0 ON trades (t0)")
     for col in ("bk_age REAL", "a0_ts REAL", "a25_ts REAL", "t_build REAL", "ft_c REAL", "ft_m REAL", "ft_n INTEGER",
-                "volr REAL", "j1h INTEGER", "ar1h REAL"):
+                "volr REAL", "j1h INTEGER", "ar1h REAL",
+                "fk TEXT", "n_same INTEGER", "n_opp INTEGER"):     # Nov 19: which fair was used, earlier jumps same way / other way
         try:
             dbx(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -1153,36 +1212,82 @@ CL_STALE = 20.0       # seconds: TWAP-fair rules skip signals when the last Chai
 ENTRY_DELAY = 0.30     # seconds after a 2bp jump at which the ETH / 1h / 4h rules read the ask (matches their research data)
 
 
+def jump_hist(a, trig, o, t0, sg):
+    """earlier jumps of this coin inside this market: (how many the same way, how many the other way, time of the first same-way one)"""
+    with lock:
+        q = [x for x in JH.get((a, trig), ()) if o <= x[0] < t0]
+    same = [t for t, g in q if g == sg]
+    return len(same), len(q) - len(same), (min(same) if same else None)
+
+
+def look_back(a, tf, o, t0, lo, hi, sg, up):
+    """the latest earlier look at this market that is at least lo seconds old (sg: only jumps that way; None = any jump) and has an ask
+    for the side we want; None if that look is older than hi seconds. Same lookup the research used on the recorder."""
+    with lock:
+        q = list(LOOKS.get((a, tf, o), ()))
+    for x in reversed(q):
+        if x[0] <= t0 - lo and (sg is None or x[1] == sg) and (x[2] if up else x[3]) is not None:
+            return x if t0 - x[0] <= hi else None
+    return None
+
+
 def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
     try:
         if delay:
             time.sleep(max(0.0, t0 + delay - time.time()))
-        tok, opp = (m["up"], m["dn"]) if up else (m["dn"], m["up"])
         if time.time() - st["pm_msg"] > 3:            # no Polymarket data for 3s: prices can't be trusted, skip (paper too)
             bump("ALL", "pm_stale")
             return
-        la = asks_of(tok, 1)
-        if not la:
+        asks = {}
+
+        def side_ask(u):                               # best ask of the UP / DOWN token, read once per market per jump
+            if u not in asks:
+                tk = m["up"] if u else m["dn"]
+                la = asks_of(tk, 1)
+                ts = time.time()
+                asks[u] = (la[0][0], ts, round(ts - book_ts.get(tk, 0), 3)) if la else None
+            return asks[u]
+
+        if side_ask(up) is None and not any(r.fade for r in rules):
             return
-        a0, a0_ts = la[0][0], time.time()
-        bk_age = round(a0_ts - book_ts.get(tok, 0), 3)
         left = o + tf * 60 - t0
-        for r in rules:
+        sg = 1 if up else -1
+        cl_old = not cl[a] or time.time() - cl[a][-1][1] > CL_STALE
+        hist = {}
+    except Exception as e:
+        _err("eval_market", e)
+        return
+    for r in rules:
+        try:                                           # Nov 19: one rule's error can no longer stop the rules after it
             if r.tf != tf or (r.code, a, tf, o) in done:
                 continue
-            f = fu.get(r.fair)
-            if f is None:
+            if r.bps_min is not None and abs(bps) < r.bps_min:
                 continue
-            if r.fair.startswith("tw") and (not cl[a] or time.time() - cl[a][-1][1] > CL_STALE):
-                bump(r.code, "cl_stale")                 # Nov 14: Chainlink feed down -> the TWAP fair is guesswork, skip (paper too)
+            rup = (not up) if r.fade else up           # fade rules buy the side the jump went against
+            fk = AD.get((a, tf), {}).get("pick", AD_DEFAULT) if r.fair == "ad" else r.fair
+            tested = fk is not None
+            if not tested:                             # no fair test: still store a fair for the record
+                fk = "tw_o" if a == "BTC" else "tw_d"
+            f = fu.get(fk)
+            if tested:
+                if f is None:
+                    continue
+                if fk.startswith("tw") and cl_old:
+                    bump(r.code, "cl_stale")             # Nov 14: Chainlink feed down -> the TWAP fair is guesswork, skip (paper too)
+                    continue
+            sa = side_ask(rup)
+            if sa is None:
                 continue
-            fv = f if up else 100 - f
-            gap = fv - a0
-            if not in_range(r, a0) or gap < r.gap:
+            a0, a0_ts, bk_age = sa
+            fv = None if f is None else (f if rup else 100 - f)
+            gap = None if fv is None else fv - a0
+            if not in_range(r, a0) or (tested and gap < r.gap):
+                continue
+            if tested and ((r.fmin is not None and not fv > r.fmin) or (r.fmax is not None and not fv < r.fmax)):
                 continue
             if r.fair2:                                # second fair price must agree too (paper rule LC5B)
                 f2 = fu.get(r.fair2)
-                if f2 is None or (f2 if up else 100 - f2) - a0 < r.gap2:
+                if f2 is None or (f2 if rup else 100 - f2) - a0 < r.gap2:
                     continue
             if (r.left_max is not None and left > r.left_max) or (r.left_min is not None and left < r.left_min):
                 continue
@@ -1190,12 +1295,43 @@ def eval_market(a, tf, o, m, up, t0, feed, bps, fu, m10, m2, rules, delay):
                 continue
             if r.trol and not (m2 is not None and m2 <= 1.15):
                 continue
-            ctx = dict(a=a, tf=tf, o=o, tok=tok, opp=opp, up=up, side="UP" if up else "DOWN", t0=t0, feed=feed, bps=bps, a0=a0,
-                       fair=round(fv, 2), gap=round(gap, 2), left=round(left, 1), m10=m10, m2=m2, cond=m.get("cond"),
-                       a0_ts=a0_ts, bk_age=bk_age, late=bool(delay))
+            n_same = n_opp = None
+            if r.opp_max is not None or r.same_min is not None or r.same_max is not None or r.first_age is not None:
+                if r.trig not in hist:
+                    hist[r.trig] = jump_hist(a, r.trig, o, t0, sg)
+                n_same, n_opp, first = hist[r.trig]
+                if (r.opp_max is not None and n_opp > r.opp_max) or (r.same_max is not None and n_same > r.same_max) \
+                        or (r.same_min is not None and n_same < r.same_min) \
+                        or (r.first_age is not None and (first is None or t0 - first < r.first_age)):
+                    continue
+            bad = False
+            for kind, spec in (("dip", r.dip), ("flat", r.flat), ("persist", r.persist)):
+                if not spec:
+                    continue
+                lk = look_back(a, tf, o, t0, spec[0], spec[1], None if r.fade else sg, rup)
+                if lk is None:
+                    bad = True
+                    break
+                pa = lk[2] if rup else lk[3]
+                if kind == "dip":
+                    bad = a0 - pa > -spec[2]
+                elif kind == "flat":
+                    bad = abs(a0 - pa) >= spec[2]
+                else:
+                    pf = lk[4].get(fk)
+                    bad = pf is None or (pf if rup else 100 - pf) - pa < r.gap
+                if bad:
+                    break
+            if bad:
+                continue
+            tok, opp = (m["up"], m["dn"]) if rup else (m["dn"], m["up"])
+            ctx = dict(a=a, tf=tf, o=o, tok=tok, opp=opp, up=rup, side="UP" if rup else "DOWN", t0=t0, feed=feed, bps=bps, a0=a0,
+                       fair=None if fv is None else round(fv, 2), gap=None if gap is None else round(gap, 2), left=round(left, 1),
+                       m10=m10, m2=m2, cond=m.get("cond"), a0_ts=a0_ts, bk_age=bk_age, late=bool(delay), sg=sg,
+                       fk=fk if tested else None, n_same=n_same, n_opp=n_opp)
             threading.Thread(target=decide, args=(r, ctx), daemon=True).start()
-    except Exception as e:
-        _err("eval_market", e)
+        except Exception as e:
+            _err("eval_" + r.code, e)
 
 
 def in_range(r, ask):
@@ -1265,6 +1401,67 @@ def rec_outcome_worker():
         except Exception as e:
             _err("rec_outcomes", e)
         time.sleep(60)
+
+
+def ad_update(seen, last_id, now):
+    """one scoring pass of the adaptive fair (see ad_worker)"""
+    import zlib
+    ocs = {(x["asset"], x["tf"], x["o"]): x["outcome"] for x in dbq("SELECT asset, tf, o, outcome FROM outcomes WHERE o > ? AND o < ?",
+                                                                     (now - 27 * 3600, now))}
+    for k in AD_KEYS:
+        a, tf, trig = k
+        for x in dbq("SELECT id, t0, o, up, data FROM rec WHERE id > ? AND t0 > ? AND t0 <= ? AND asset=? AND tf=? AND trig=? ORDER BY id",
+                     (last_id[k], now - 26 * 3600, now, a, tf, trig)):
+            last_id[k] = max(last_id[k], x["id"])
+            kk = (x["o"], x["up"])
+            if kk in seen[k] and seen[k][kk][0] <= x["t0"]:
+                continue                               # only the first jump per market and side counts
+            fr = json.loads(zlib.decompress(x["data"])).get("fair") or {}
+            seen[k][kk] = (x["t0"], fr.get("tw_d"), fr.get("tw_o"))
+        for kk in [kk for kk in seen[k] if kk[0] + tf * 60 < now - 26 * 3600]:
+            seen[k].pop(kk, None)
+        err = {"tw_d": [], "tw_o": []}
+        for (o, up), (t_, fd, fo) in seen[k].items():
+            end = o + tf * 60
+            oc = ocs.get((a, tf, o))
+            if oc not in ("UP", "DOWN") or not (now - 86400 <= end <= now):
+                continue
+            w = 1.0 if oc == "UP" else 0.0
+            if fd is not None:
+                err["tw_d"].append((fd / 100.0 - w) ** 2)
+            if fo is not None:
+                err["tw_o"].append((fo / 100.0 - w) ** 2)
+        sc = {f: (sum(v) / len(v) if len(v) >= 40 else None) for f, v in err.items()}
+        pick = "tw_o" if (sc["tw_d"] is not None and sc["tw_o"] is not None and sc["tw_o"] < sc["tw_d"]) else AD_DEFAULT
+        AD[(a, tf)] = {"pick": pick, "tw_d": sc["tw_d"], "tw_o": sc["tw_o"], "n": min(len(err["tw_d"]), len(err["tw_o"])), "ts": now}
+
+
+def ad_worker():
+    """adaptive fair (Nov 19): for each market type an "ad" rule trades, score both TWAP fairs on the last 24h of SETTLED markets
+    (first jump per market and side, squared error of the fair vs what happened) and use the one that was closer to the truth.
+    It needs 40 settled samples of each; before that the Deribit-vol fair is used. Reads the recorder table, so it survives restarts."""
+    seen = {k: {} for k in AD_KEYS}                    # (asset, tf, trig) -> {(o, up): (t0, Deribit-vol fair, own-vol fair)}
+    last_id = {k: 0 for k in AD_KEYS}
+    while True:
+        try:
+            ad_update(seen, last_id, time.time())
+        except Exception as e:
+            _err("ad_worker", e)
+        time.sleep(30)
+
+
+def ad_text():
+    out = []
+    for a, tf, trig in AD_KEYS:
+        d = AD.get((a, tf))
+        if not d:
+            out.append(f"{a} {tf}m: starting up -> Deribit vol")
+        elif d["tw_d"] is None or d["tw_o"] is None:
+            out.append(f"{a} {tf}m: Deribit vol (only {d['n']} settled samples in 24h, needs 40)")
+        else:
+            out.append(f"{a} {tf}m: {'our vol' if d['pick'] == 'tw_o' else 'Deribit vol'} "
+                       f"(error score: Deribit {d['tw_d']:.3f}, ours {d['tw_o']:.3f}, {d['n']} samples, lower = better)")
+    return "\n".join(out)
 
 
 def rec_export(all_=False):
@@ -1374,7 +1571,11 @@ def on_move(a, trig, feed, bps, t0):
         threading.Thread(target=rec_capture, args=(a, trig, feed, bps, t0), daemon=True).start()
         sg = 1 if bps > 0 else -1
         up = sg > 0
-        rules = [r for r in RULES if r.asset == a and r.trig == trig and not r.follow]
+        with lock:                                                             # every jump is remembered (the "clean move" rules count them)
+            JH.setdefault((a, trig), deque(maxlen=5000)).append((t0, sg))
+        lc_ = live_codes()
+        rules = sorted((r for r in RULES if r.asset == a and r.trig == trig and not r.follow),
+                       key=lambda r: r.code not in lc_)                      # live rules are looked at first, paper rules after
         for fr in [r for r in RULES if r.follow == a and r.trig == trig]:      # follow rules: this coin jumped -> trade another coin's market
             with lock:
                 fm = [(k, dict(v)) for k, v in markets.items() if k[0] == fr.asset and k[1] == fr.tf and k[2] <= t0 < k[2] + k[1] * 60]
@@ -1389,6 +1590,11 @@ def on_move(a, trig, feed, bps, t0):
         m10, m2 = lead_mean(a, t0, -10, sg), lead_mean(a, t0, -2, sg)
         for (a_, tf, o), m in mk:
             fu = fairs(a, tf, o, t0)                                     # fair from prices at the jump
+            if (a, tf, trig) in LOOK_KEYS:                                # remember both sides' asks + fairs for the dip / flat / persist rules
+                ua, da = asks_of(m["up"], 1), asks_of(m["dn"], 1)
+                with lock:
+                    LOOKS.setdefault((a, tf, o), deque(maxlen=4000)).append(
+                        (t0, sg, ua[0][0] if ua else None, da[0][0] if da else None, fu))
             if trig == 2:                                                 # ETH + 1h/4h rules: the recorder they were found on read the ask
                 late_r = [r for r in rules if not r.early]
                 now_r = [r for r in rules if r.early]                   # rules found on real-time data read the ask at the jump
@@ -1439,6 +1645,12 @@ def decide(r, c):
             if p05 is None or p05 <= 0.1:
                 bump(r.code, "lc_fail")
                 return
+        if r.lc_min is not None:                     # other exchanges must follow the jump by >= lc_min bp within 0.5s (no R check)
+            time.sleep(max(0.0, t0 + 0.55 - time.time()))
+            p05 = lead_mean(c["a"], t0, 0.5, c.get("sg") or (1 if c["up"] else -1))
+            if p05 is None or p05 < r.lc_min:
+                bump(r.code, "lc_fail")
+                return
         if r.bc is not None:                         # Binance must keep going our way by >= bc bp within 0.5s of the jump
             time.sleep(max(0.0, t0 + 0.5 - time.time()))
             sg_ = 1 if c["up"] else -1
@@ -1463,7 +1675,8 @@ def decide(r, c):
             stk = round(stk / 2, 2)
             if stk < MIN_ORDER - 1e-9:
                 live, stk = False, stake()
-        head = f"{r.name} {c['side']} {c['tf'] if c['tf'] < 60 else c['tf'] // 60}{'m' if c['tf'] < 60 else 'h'} · ask {c['a0']:g}¢ fair {c['fair']:.0f}¢"
+        head = f"{r.name} {c['side']} {c['tf'] if c['tf'] < 60 else c['tf'] // 60}{'m' if c['tf'] < 60 else 'h'} · ask {c['a0']:g}¢" + \
+               (f" fair {c['fair']:.0f}¢" if c["fair"] is not None else "")
         why, ok, resp, note, tim = None, False, {}, "", {}
         if live:                                   # order first, bookkeeping after (every millisecond counts)
             why = risk_check(r, c, stk)
@@ -1473,14 +1686,17 @@ def decide(r, c):
                 except Exception as e:
                     ok, resp, note = False, {}, f"error: {str(e)[:150]}"
         lag = ((tim.get("resp") or time.time()) - t0) if tim else None
+        if not live:                               # paper bookkeeping waits until 0.4s after the jump, out of the way of any live order
+            time.sleep(max(0.0, t0 + 0.4 - time.time()))   # (the paper price is read later anyway: 1s after the jump, 0.5s on 15m)
         fc, fm, fn = ft_stats(3 * 3600, t0) if c["a"] == "BTC" else (None, None, None)
         volr, j1h, ar1h = road(c["a"], t0)
         rid = dbx("INSERT INTO trades (code, rule, asset, tf, o, side, mode, status, t0, feed, bps, ask0, a25, fair, gap, left_s, m10, m2, p05, cap, stake, token, cond, "
-                  "t_sent, t_resp, lag, bk_age, a0_ts, t_build, ft_c, ft_m, ft_n, volr, j1h, ar1h) "
-                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "t_sent, t_resp, lag, bk_age, a0_ts, t_build, ft_c, ft_m, ft_n, volr, j1h, ar1h, fk, n_same, n_opp) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (r.code, r.name, c["a"], c["tf"], c["o"], c["side"], "LIVE" if live else "PAPER", "SIGNAL", t0, c["feed"], c["bps"], c["a0"], a25,
                    c["fair"], c["gap"], c["left"], c["m10"], c["m2"], p05, cap, stk if live else 1.0, c["tok"], c["cond"],
-                   tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"], tim.get("build"), fc, fm, fn, volr, j1h, ar1h))
+                   tim.get("sent"), tim.get("resp"), lag, c["bk_age"], c["a0_ts"], tim.get("build"), fc, fm, fn, volr, j1h, ar1h,
+                   c.get("fk"), c.get("n_same"), c.get("n_opp")))
         st["signals"] += 1
         threading.Thread(target=paper_twin, args=(r, c, rid, cap, live, key), daemon=True).start()
         if not live:
@@ -1594,8 +1810,14 @@ def settler():
         try:
             now = time.time()
             rows = dbq("SELECT * FROM trades WHERE outcome IS NULL AND mode IN ('LIVE','PAPER') AND o + tf*60 < ? AND o + tf*60 > ?", (now - 60, now - 3 * 86400))
+            asked = {}                                # Nov 19: one result lookup per market per pass (was one per trade row)
             for x in rows:
-                oc = outcome(x["asset"], x["tf"], x["o"])
+                mk_ = (x["asset"], x["tf"], x["o"])
+                if mk_ not in asked:
+                    if mk_ not in _outcomes:
+                        time.sleep(0.2)                # only real web lookups are spaced out
+                    asked[mk_] = outcome(*mk_)
+                oc = asked[mk_]
                 if not oc:
                     continue
                 won = 1 if oc == x["side"] else 0
@@ -1613,10 +1835,14 @@ def settler():
                     t_day = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
                     td = dbq("SELECT COALESCE(SUM(pnl),0) s, COUNT(*) n FROM trades WHERE mode='LIVE' AND status='SETTLED' AND t0 >= ?", (t_day,))[0]
                     tg(f"{'✅' if won else '❌'} {x['rule']} {x['side']} at {x['buy_px']:.0f}¢ · {money(pnl)} · today {money(td['s'])} ({td['n']} trades)")
-                time.sleep(0.2)
             with dlock:
                 for k in [k for k in list(done) if k[3] + k[2] * 60 < now - 600]:
                     done.discard(k)
+            with lock:                                # memory housekeeping: finished markets' looks, week-old results
+                for k in [k for k in list(LOOKS) if k[2] + k[1] * 60 < now - 600]:
+                    LOOKS.pop(k, None)
+            for k in [k for k in list(_outcomes) if k[2] + k[1] * 60 < now - 7 * 86400]:
+                _outcomes.pop(k, None)
         except Exception as e:
             _err("settler", e)
         time.sleep(20)
@@ -1828,7 +2054,7 @@ def status_text():
 def rules_text():
     lc = live_codes()
     return "📋 rules (code · name · LIVE/paper)\n" + "\n".join(f"{r.code:<4} {r.name} · {'LIVE' if r.code in lc else 'paper'} · limit +{r.cap:g}¢" for r in RULES) + \
-        "\n\n/live CODE on|off to switch one rule"
+        "\n\nAdaptive fair in use now (P5A, E5A):\n" + ad_text() + "\n\n/live CODE on|off to switch one rule"
 
 
 def trades_text(n=12):
@@ -2142,11 +2368,13 @@ def main():
     for x in dbq("SELECT code, asset, tf, o FROM trades WHERE t0 > ? AND (mode='SKIP' OR cost > 0 OR p_cost1 > 0 OR status IN ('SIGNAL','HOLDING'))",
                  (time.time() - 5 * 3600,)):
         done.add((x["code"], x["asset"], x["tf"], x["o"]))      # after a restart, never trade the same market twice
+    for x in dbq("SELECT t0, asset, trig, bps FROM moves WHERE t0 > ? ORDER BY t0", (time.time() - 4.5 * 3600,)):
+        JH.setdefault((x["asset"], x["trig"]), deque(maxlen=5000)).append((x["t0"], 1 if x["bps"] > 0 else -1))   # jump memory survives a restart
     if LIVE_START and kv_get("live_on") is None:
         kv_set("live_on", "1")
     workers = [market_worker, open_worker, pm_worker, chainlink_worker, twap_feed_worker, deribit_worker, settler, balance_worker,
                copier_worker, telegram_worker, daily_worker, warm_worker, summary_worker, rec_outcome_worker,
-               kv_worker, risk_worker, keepalive_worker]
+               kv_worker, risk_worker, keepalive_worker, ad_worker]
     for fn in workers:
         threading.Thread(target=fn, daemon=True, name=fn.__name__).start()
     for v in ("vis", "spot", "fut"):
