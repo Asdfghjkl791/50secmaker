@@ -168,9 +168,7 @@ RULES = [
     # E5S: ETH 5m. Jump >= 3bp and other exchanges follow >= 1bp within 0.5s, 30-95c, no fair test.
     #      early2 Nov 1-13: 273 tr 66% · recorder Nov 13-17: 302 tr 76% won, +$30 at $1 (2s), +$2,211 at $100.
     Rule("E5S", "ETH 5m strong confirm", "ETH", 5, 2, None, 0, 30, 95, bps_min=3, lc_min=1.0, early=True),
-    Rule("ELS5", "ETH 5m LS strong confirm", "ETH", 5, 2, None, 0, 20, 40, bps_min=3, lc_min=0.5, early=True),
-    # ^ ELS5 (added Nov 19, fair test from then): E5S's long-shot cousin. Recorder, cautious price: Nov 13-15 139 tr 45% won +$26.15 at $1,
-    #   Nov 16-19 80 tr 48% won +$14.44. Older data (weaker stand-in confirm) about break-even, so unproven.
+    # (ELS5, the ETH 5m long shot added Nov 19, was removed Nov 20: 16 wins in 79 paper trades, 20% against ~45% in research.)
     # LC5K: live LC5 exactly, plus the clean check (<= 1 earlier ETH jump the other way). Recorder Nov 13-18: LC5 +$1,081 at $100,
     #      with the check +$2,250 on half the trades, 6 of 6 days up. Compare it with LC5 day by day.
     Rule("LC5K", "ETH D5-LC clean", "ETH", 5, 2, "tw_d", 5, 30, 95, R=True, lc=True, cap=15, opp_max=1),
@@ -229,6 +227,7 @@ order_lock = threading.Lock()
 _outcomes = {}
 JH = {}                                      # (asset, trig) -> deque((t0, direction)): every jump, for the "clean move" rules
 LOOKS = {}                                   # (asset, tf, o) -> deque((t0, direction, up ask, down ask, fairs)): what a market looked like at each jump
+LIVE_SIDE = {}                               # (asset, tf, o) -> side the first LIVE fill in that market took (Nov 20: opposite-side guard)
 AD = {}                                      # (asset, tf) -> {"pick", "tw_d", "tw_o", "n", "ts"}: which TWAP fair scored better over the last 24h
 AD_DEFAULT = "tw_d"                          # until 40 settled samples exist, the adaptive rules use the Deribit-vol fair (as tested)
 
@@ -327,7 +326,7 @@ def kv_set(k, v):
     _kvc[k] = (time.time(), str(v))
 
 
-HOT_KV = ("live_on", "live_rules", "stake", "paused", "quiet", "quiet_hours", "half_hours", "rule_loss")
+HOT_KV = ("live_on", "live_rules", "stake", "paused", "quiet", "quiet_hours", "half_hours", "rule_loss", "opp_block")
 
 
 def kv_worker():
@@ -368,6 +367,10 @@ def in_quiet_hours(r, t=None, key="quiet_hours"):
     h = datetime.fromtimestamp(t or time.time(), TZ).hour
     a, b = qh
     return (a <= h < b) if a < b else (h >= a or h < b)
+
+
+def opp_block_on():
+    return kv_get("opp_block", "1") != "0"
 
 
 def rule_loss_cap():
@@ -1742,13 +1745,29 @@ def decide(r, c):
         why, ok, resp, note, tim = None, False, {}, "", {}
         snap = {}
         threading.Thread(target=twin_snap, args=(c, snap), daemon=True).start()   # paper price is photographed on time, order or no order
+        opp_blocked = False
         if live:                                   # order first, bookkeeping after (every millisecond counts)
             why = risk_check(r, c, stk)
+            mk_ = (c["a"], c["tf"], c["o"])
+            mine = False
+            if not why and opp_block_on():         # Nov 20: two live rules never hold opposite sides of one market (memory only, no database)
+                with dlock:
+                    held = LIVE_SIDE.get(mk_)
+                    if held is None:
+                        LIVE_SIDE[mk_] = c["side"]
+                        mine = True
+                    elif held != c["side"]:
+                        why = f"paused in this market: another live rule already holds {held}"
+                        opp_blocked = True
             if not why:
                 try:
                     ok, resp, note = buy(c["tok"], stk, cap, tim)
                 except Exception as e:
                     ok, resp, note = False, {}, f"error: {str(e)[:150]}"
+                if not ok and mine:                # our order did not fill: free the market for the other rules
+                    with dlock:
+                        if LIVE_SIDE.get(mk_) == c["side"]:
+                            LIVE_SIDE.pop(mk_, None)
         lag = ((tim.get("resp") or time.time()) - t0) if tim else None
         if not live:                               # paper bookkeeping waits until 0.4s after the jump, out of the way of any live order
             time.sleep(max(0.0, t0 + 0.4 - time.time()))   # (the paper price is read later anyway: 1s after the jump, 0.5s on 15m)
@@ -1770,7 +1789,7 @@ def decide(r, c):
             bump(r.code, "blocked")
             if not why.startswith("paused") and not quiet():
                 tg(f"⛔ {head} · skipped: {why}")
-            if r.conf != "first":
+            if r.conf != "first" and not opp_blocked:   # blocked by the opposite-side guard: done with this market, no retries
                 with dlock:
                     done.discard(key)
             return
@@ -1886,7 +1905,7 @@ def risk_check(r, c, stk):
     cap_r = rule_loss_cap()                          # Nov 16: one rule on a bad day can't use up the whole daily stop
     if cap_r > 0 and RISK["by_code"].get(r.code, 0.0) <= -cap_r:
         return f"paused for today: {r.code} is down {money(RISK['by_code'][r.code])} (rule limit ${cap_r:g}); it keeps trading on paper"
-    # (Nov 12: the "other side held" block was removed - each rule now trades exactly as it was tested; one trade per rule per market)
+    # (Nov 12: the "other side held" block was removed. Nov 20: back as a guard between LIVE rules only, in decide(); /oppblock off removes it)
     bal = st["balance"]
     if bal is not None and time.time() - st["balance_ts"] < 300 and bal < max(MIN_BALANCE, stk):
         return f"cash ${bal:.2f} below the floor ${MIN_BALANCE:g}"
@@ -1934,6 +1953,9 @@ def settler():
             with dlock:
                 for k in [k for k in list(done) if k[3] + k[2] * 60 < now - 600]:
                     done.discard(k)
+            with dlock:
+                for k in [k for k in list(LIVE_SIDE) if k[2] + k[1] * 60 < now - 600]:
+                    LIVE_SIDE.pop(k, None)
             with lock:                                # memory housekeeping: finished markets' looks, week-old results
                 for k in [k for k in list(LOOKS) if k[2] + k[1] * 60 < now - 600]:
                     LOOKS.pop(k, None)
@@ -2134,7 +2156,8 @@ def status_text():
     qh, hh, cr = quiet_hours(), quiet_hours("half_hours"), rule_loss_cap()
     lines.append("quiet hours (5m rules paper-only): " + (f"{qh[0]}:00-{qh[1]}:00 Toronto" if qh else "off") +
                  " · half hours (5m rules half stake): " + (f"{hh[0]}:00-{hh[1]}:00" if hh else "off") +
-                 " · per-rule daily loss limit: " + (f"${cr:g}" if cr > 0 else "off"))
+                 " · per-rule daily loss limit: " + (f"${cr:g}" if cr > 0 else "off")
+                 + " · opposite-side guard: " + ("on" if opp_block_on() else "off"))
     for a in ASSETS:
         g = [x for t, x in list(cl_gaps[a]) if t > now - 3600]
         if g:
@@ -2186,9 +2209,10 @@ HELP = """COMBO bot commands
 /quiethours 18-21 — 5-minute rules trade on paper only in those Toronto hours (off to cancel)
 /halfhours 0-3 — 5-minute rules trade at half stake in those Toronto hours (off to cancel)
 /rulestop 8 — a live rule down $8 on the day stops until midnight (off to cancel)
+/oppblock on|off — stop two live rules holding opposite sides of one market (on by default)
 /rules — every rule, live or paper
 /live on | /live off — all live rules on/off (/stop = off)
-/live CODE on|off — one rule (e.g. /live ELS5 on)
+/live CODE on|off — one rule (e.g. /live P5A on)
 /stake 1 — dollars per live trade (max MAX_STAKE)
 /resume — clear a pause (loss limit / errors)
 /pnl [today|yday|week|all] — live + paper twin per rule
@@ -2320,6 +2344,12 @@ def handle(text):
                    f"(it keeps trading on paper). The overall daily stop ${DAILY_LOSS:g} still applies.")
             except ValueError:
                 tg("use a number, like /rulestop 8")
+    elif cmd == "/oppblock":
+        if args and args[0].lower() in ("on", "off"):
+            kv_set("opp_block", "1" if args[0].lower() == "on" else "0")
+        tg("opposite-side guard " + ("ON: if one live rule holds a side of a market, another live rule can't buy the other side "
+                                     "(it still trades it on paper)" if opp_block_on() else "OFF: live rules can hold both sides of one market")
+           + "\n/oppblock on | /oppblock off")
     elif cmd == "/quiet":
         on_ = not args or args[0].lower() == "on"
         kv_set("quiet", "1" if on_ else "0")
@@ -2466,6 +2496,8 @@ def main():
         done.add((x["code"], x["asset"], x["tf"], x["o"]))      # after a restart, never trade the same market twice
     for x in dbq("SELECT t0, asset, trig, bps FROM moves WHERE t0 > ? ORDER BY t0", (time.time() - 4.5 * 3600,)):
         JH.setdefault((x["asset"], x["trig"]), deque(maxlen=5000)).append((x["t0"], 1 if x["bps"] > 0 else -1))   # jump memory survives a restart
+    for x in dbq("SELECT asset, tf, o, side FROM trades WHERE mode='LIVE' AND cost > 0 AND outcome IS NULL AND t0 > ? ORDER BY t0", (time.time() - 5 * 3600,)):
+        LIVE_SIDE.setdefault((x["asset"], x["tf"], x["o"]), x["side"])                   # open live positions survive a restart too
     if LIVE_START and kv_get("live_on") is None:
         kv_set("live_on", "1")
     workers = [market_worker, open_worker, pm_worker, chainlink_worker, twap_feed_worker, deribit_worker, settler, balance_worker,
